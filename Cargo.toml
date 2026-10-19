@@ -1,14 +1,12 @@
-[package]
-name = "rapt"
-version = "0.1.0"
-edition = "2024"
-description = "Pure async Rust client and library for querying the Ubuntu archive"
-license = "GPL-3.0-only"
-repository = "https://github.com/canonical/rapt"
-keywords = ["ubuntu", "apt", "packages", "archive", "debian"]
-categories = ["command-line-utilities"]
+[workspace]
+resolver = "2"
+members = [
+    "rapt",
+    "robigus"
+]
 
-[dependencies]
+[workspace.dependencies]
+# standard dependencies
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
@@ -20,7 +18,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 xz2 = "0.1"
 
-[dev-dependencies]
+# dev-dependencies
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"

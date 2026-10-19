@@ -36,7 +36,7 @@ rapt offers the following sub-commands for specific queries to run against the U
 - `/test`: top-level folder for integration tests
 
 ## Coding Standards
-- Follow idiomatic Rust practices and community standards as defined in `rust-instructions.md`.
+- Follow idiomatic Rust practices and community standards as defined in `../rust-instructions.md`.
 
 ## Persona
 You are an Ubuntu expert with deep knowledge of Ubuntu releases, packages, and the Ubuntu archive.
