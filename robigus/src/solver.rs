@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 /// To unify Rust SemVer (which tolerates multiple major versions side-by-side in a DAG) and Debian/APT (which enforces single-instance installation per system namespace and uses epoch/upstream/revision ordering), the solver abstraction must separate three layers:
 /// Version Ordering & Matching (VersionScheme): Ecosystem-specific comparison mechanics.
 /// Metadata Provider (DependencyProvider): Lazily fetching package candidates and dependency edges across crates.io, apt, git, and local disks.
@@ -7,12 +8,11 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Display;
 use std::sync::Arc;
-use async_trait::async_trait;
 
 // Reuse the foundational identity primitives from the data model
 use crate::model::{
-    Dependency, DependencyKind, Ecosystem, PackageId, PackageVersion, 
-    Resolve, ResolvedNode, SourceId, VersionConstraint,
+    Dependency, DependencyKind, Ecosystem, PackageId, PackageVersion, Resolve, ResolvedNode,
+    SourceId, VersionConstraint,
 };
 
 // 1. Unified Version Ordering and Constraint Evaluation
@@ -34,10 +34,7 @@ impl ConstraintChecker for VersionConstraint {
         match (self, version) {
             (VersionConstraint::Any, _) => true,
             (VersionConstraint::SemVer(req), PackageVersion::SemVer(ver)) => req.matches(ver),
-            (
-                VersionConstraint::Debian { op, target_version },
-                PackageVersion::Debian { .. },
-            ) => {
+            (VersionConstraint::Debian { op, target_version }, PackageVersion::Debian { .. }) => {
                 // Evaluates upstream epoch:upstream-revision comparison
                 compare_debian_constraint(version, op, target_version)
             }
@@ -82,7 +79,7 @@ pub enum ConflictDomain {
 }
 
 pub trait ConflictPolicy: Send + Sync {
-    /// Maps a package to its isolation domain. Packages in the same domain 
+    /// Maps a package to its isolation domain. Packages in the same domain
     /// with conflicting versions trigger backtracking or a solver error.
     fn domain_for(&self, pkg: &PackageId) -> ConflictDomain;
 }
@@ -116,10 +113,16 @@ pub struct CandidateSummary {
 #[async_trait]
 pub trait DependencyProvider: Send + Sync {
     /// Yields all versions available for a given package query, sorted newest-to-oldest.
-    async fn find_candidates(&self, dependency: &Dependency) -> Result<Vec<CandidateSummary>, ResolveError>;
+    async fn find_candidates(
+        &self,
+        dependency: &Dependency,
+    ) -> Result<Vec<CandidateSummary>, ResolveError>;
 
     /// Fetches the manifest / direct dependencies for a chosen candidate.
-    async fn get_dependencies(&self, candidate: &PackageId) -> Result<Vec<Dependency>, ResolveError>;
+    async fn get_dependencies(
+        &self,
+        candidate: &PackageId,
+    ) -> Result<Vec<Dependency>, ResolveError>;
 }
 
 // 4. CDCL / PubGrub Solver Interface
@@ -127,7 +130,10 @@ pub trait DependencyProvider: Send + Sync {
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
     #[error("No viable candidate found for requirement: {req:?}")]
-    Unsatisfiable { req: Dependency, traceback: Vec<String> },
+    Unsatisfiable {
+        req: Dependency,
+        traceback: Vec<String>,
+    },
 
     #[error("Conflict detected in domain {domain:?}: {a} and {b} cannot coexist")]
     Conflict {
@@ -192,7 +198,7 @@ impl DependencyResolver for ModularSolver {
 
             // 1. Fetch viable candidates from the registry/APT/git provider
             let candidates = provider.find_candidates(&current_req).await?;
-            
+
             // 2. Filter candidates matching the version constraint
             let matching_candidate = candidates
                 .into_iter()
@@ -247,5 +253,3 @@ impl DependencyResolver for ModularSolver {
         })
     }
 }
-
-

@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use regex::Regex;
+use ubuntu_info_rust::Archive;
 
-use crate::archive::DEFAULT_ARCHIVE_URL;
 use crate::error::{RaptError, Result};
 use crate::models::{BinaryPackage, CacheStats, SeriesCache};
 use crate::types::{PackageTarget, QueryFilter};
@@ -467,7 +467,7 @@ impl<'a> RaptQuery<'a> {
             for src in srcs {
                 let label = format!(
                     "{} {}/main Sources",
-                    DEFAULT_ARCHIVE_URL,
+                    Archive::PRIMARY_URL,
                     self.filter.series()
                 );
                 rows.push((src.package().to_string(), src.version().to_string(), label));

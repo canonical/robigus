@@ -8,4 +8,8 @@ async-trait = "0.1.92"
 semver = { version = "1.0.28", features = ["serde"] }
 serde.workspace = true
 thiserror.workspace = true
+ubuntu-info-rust = { workspace = true }
 url = { version = "2.5.8", features = ["serde"] }
+
+[dev-dependencies]
+serde_json.workspace = true

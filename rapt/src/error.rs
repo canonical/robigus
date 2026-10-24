@@ -10,6 +10,10 @@ pub enum RaptError {
     #[error("target series is required: use --series <SERIES>")]
     MissingSeries,
 
+    /// An unknown Ubuntu series was specified.
+    #[error("invalid series '{0}': expected a known Ubuntu code name or version")]
+    InvalidSeries(String),
+
     /// Mutually exclusive filter flags were both specified.
     #[error("mutually exclusive flags: cannot specify both --{0} and --not-{0}")]
     MutuallyExclusiveFilter(String),
@@ -26,22 +30,6 @@ pub enum RaptError {
         /// Actual count passed.
         actual: usize,
     },
-
-    /// An invalid pocket was specified.
-    #[error(
-        "invalid pocket '{0}': expected one of release, proposed, updates, security, backports"
-    )]
-    InvalidPocket(String),
-
-    /// An invalid component was specified.
-    #[error("invalid component '{0}': expected one of main, universe, restricted, multiverse")]
-    InvalidComponent(String),
-
-    /// An invalid architecture was specified.
-    #[error(
-        "invalid architecture '{0}': expected one of amd64, arm64, armhf, ppc64el, s390x, riscv64"
-    )]
-    InvalidArchitecture(String),
 
     /// A regular expression pattern was invalid.
     #[error("invalid regular expression '{pattern}': {source}")]

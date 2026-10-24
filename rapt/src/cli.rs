@@ -1,10 +1,35 @@
 //! The rapt command-line client arguments and subcommands definitions.
 
 use clap::{Args, Parser, Subcommand};
+use ubuntu_info_rust::ParseError;
 
 use crate::types::{
     Architecture, Component, PackageTarget, Pocket, QueryFilter, QueryFilterBuilder,
 };
+
+/// Parses a pocket name case-insensitively.
+fn parse_pocket(value: &str) -> std::result::Result<Pocket, String> {
+    value
+        .to_ascii_lowercase()
+        .parse()
+        .map_err(|err: ParseError| err.to_string())
+}
+
+/// Parses a component name case-insensitively.
+fn parse_component(value: &str) -> std::result::Result<Component, String> {
+    value
+        .to_ascii_lowercase()
+        .parse()
+        .map_err(|err: ParseError| err.to_string())
+}
+
+/// Parses an architecture name case-insensitively.
+fn parse_arch(value: &str) -> std::result::Result<Architecture, String> {
+    value
+        .to_ascii_lowercase()
+        .parse()
+        .map_err(|err: ParseError| err.to_string())
+}
 
 /// rapt: Ubuntu archive command-line client and query tool.
 #[derive(Debug, Parser)]
@@ -20,6 +45,7 @@ pub struct Cli {
         long,
         value_name = "POCKET",
         value_delimiter = ',',
+        value_parser = parse_pocket,
         global = true
     )]
     pub pocket: Option<Vec<Pocket>>,
@@ -30,6 +56,7 @@ pub struct Cli {
         long,
         value_name = "POCKET",
         value_delimiter = ',',
+        value_parser = parse_pocket,
         global = true
     )]
     pub not_pocket: Option<Vec<Pocket>>,
@@ -40,6 +67,7 @@ pub struct Cli {
         long,
         value_name = "COMPONENT",
         value_delimiter = ',',
+        value_parser = parse_component,
         global = true
     )]
     pub component: Option<Vec<Component>>,
@@ -50,12 +78,20 @@ pub struct Cli {
         long,
         value_name = "COMPONENT",
         value_delimiter = ',',
+        value_parser = parse_component,
         global = true
     )]
     pub not_component: Option<Vec<Component>>,
 
-    /// Target CPU architectures (amd64, arm64, armhf, ppc64el, s390x, riscv64).
-    #[arg(short, long, value_name = "ARCH", value_delimiter = ',', global = true)]
+    /// Target CPU architectures (amd64, amd64v3, arm64, armhf, i386, ppc64el, riscv64, s390x).
+    #[arg(
+        short,
+        long,
+        value_name = "ARCH",
+        value_delimiter = ',',
+        value_parser = parse_arch,
+        global = true
+    )]
     pub arch: Option<Vec<Architecture>>,
 
     /// Inverse filter for architectures: all architectures except those specified.
@@ -64,6 +100,7 @@ pub struct Cli {
         long,
         value_name = "ARCH",
         value_delimiter = ',',
+        value_parser = parse_arch,
         global = true
     )]
     pub not_arch: Option<Vec<Architecture>>,

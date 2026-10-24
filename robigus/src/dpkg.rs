@@ -31,9 +31,9 @@ impl DpkgVersion {
         // 1. Extract Epoch (optional: digits preceding the first colon ':')
         let (epoch, rest) = if let Some(colon_pos) = s.find(':') {
             let epoch_str = &s[..colon_pos];
-            let epoch_num = epoch_str
-                .parse::<u32>()
-                .map_err(|_| format!("Invalid epoch '{}': must be an unsigned integer", epoch_str))?;
+            let epoch_num = epoch_str.parse::<u32>().map_err(|_| {
+                format!("Invalid epoch '{}': must be an unsigned integer", epoch_str)
+            })?;
             (epoch_num, &s[colon_pos + 1..])
         } else {
             (0, s)
@@ -89,7 +89,11 @@ impl fmt::Display for DpkgVersion {
 fn char_order(c: Option<char>) -> i32 {
     match c {
         Some('~') => -1,
-        None => 0, // End of string / empty character
+        None => 0,
+        // Digits are compared numerically in a later step, but they can still
+        // appear opposite a non-digit in the character loop. Debian's `order()`
+        // gives digits rank 0 so that, for example, `1.0` sorts before `1.a`.
+        Some(ch) if ch.is_ascii_digit() => 0,
         Some(ch) if ch.is_ascii_alphabetic() => ch as i32,
         Some(ch) => (ch as i32) + 256,
     }
@@ -188,7 +192,6 @@ impl PartialOrd for DpkgVersion {
     }
 }
 
-
 /// Verification and Test Suite
 /// This test suite covers common edge cases, including epoch dominance, tilde priority over releases, alphanumeric segment switching, leading zeros, and revision checks.
 #[cfg(test)]
@@ -212,13 +215,7 @@ mod tests {
     fn assert_version_eq(a: &str, b: &str) {
         let v1: DpkgVersion = a.parse().unwrap();
         let v2: DpkgVersion = b.parse().unwrap();
-        assert_eq!(
-            v1.cmp(&v2),
-            Ordering::Equal,
-            "Expected '{}' == '{}'",
-            a,
-            b
-        );
+        assert_eq!(v1.cmp(&v2), Ordering::Equal, "Expected '{}' == '{}'", a, b);
     }
 
     #[test]
@@ -250,7 +247,15 @@ mod tests {
         // Letters sort before symbols/punctuation
         assert_version_order("1.0a", "1.0.");
         assert_version_order("1.0a", "1.0+");
-        assert_version_order("1.0+", "1.0-1");
+        assert_version_order("1.0-1", "1.0+");
+    }
+
+    #[test]
+    fn test_digit_vs_non_digit() {
+        // A digit sorts before letters and punctuation, but after '~'.
+        assert_version_order("1.0", "1.a");
+        assert_version_order("1.0", "1.+");
+        assert_version_order("1.~", "1.0");
     }
 
     #[test]
@@ -261,6 +266,3 @@ mod tests {
         assert_version_order("1.0-0ubuntu1~22.04.1", "1.0-0ubuntu1");
     }
 }
-
-
-

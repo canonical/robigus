@@ -9,7 +9,7 @@ pub mod parser;
 pub mod query;
 pub mod types;
 
-pub use archive::{ArchiveClient, DEFAULT_ARCHIVE_URL, DEFAULT_PORTS_URL};
+pub use archive::ArchiveClient;
 pub use cache::CacheManager;
 pub use cli::{Cli, Commands};
 pub use error::{RaptError, Result};

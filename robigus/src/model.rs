@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
+use ubuntu_info_rust::{Architecture, Component, Suite};
 use url::Url;
 
 // 1. Source Identification
@@ -16,12 +17,15 @@ pub enum SourceKind {
     Git { url: Url, reference: GitReference },
     /// Local filesystem path
     Path { path: PathBuf },
-    /// Ubuntu / Debian APT repository archive
+    /// Ubuntu APT repository archive
     Apt {
         mirror_url: Url,
-        suite: String,           // e.g., "noble", "jammy"
-        components: Vec<String>, // e.g., ["main", "universe"]
-        arch: String,            // e.g., "amd64", "arm64"
+        /// Series and pocket, e.g. `noble` or `noble-updates`.
+        suite: Suite,
+        /// Archive components, e.g. `main` and `universe`.
+        components: BTreeSet<Component>,
+        /// Machine architecture, e.g. `amd64` or `arm64`.
+        arch: Architecture,
     },
 }
 
@@ -204,9 +208,55 @@ pub struct ResolvedNode {
     pub active_features: BTreeSet<String>,
 }
 
-/// The fully resolved DAG, isomorphic to Cargo.lock but cross-ecosystem.
+/// The fully resolved DAG, isomorphic to Cargo.lock but cross-distribution.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Resolve {
     pub nodes: BTreeMap<PackageId, ResolvedNode>,
     pub root: Option<PackageId>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ubuntu_info_rust::{Pocket, SeriesInfo};
+
+    fn apt_source(suite: Suite, arch: Architecture) -> SourceKind {
+        SourceKind::Apt {
+            mirror_url: Url::parse("http://archive.ubuntu.com/ubuntu").unwrap(),
+            suite,
+            components: [Component::Main, Component::Universe].into_iter().collect(),
+            arch,
+        }
+    }
+
+    #[test]
+    fn apt_source_round_trips_through_serde() {
+        let suite = Suite::new(
+            SeriesInfo::from_short_name("noble").unwrap(),
+            Pocket::Updates,
+        );
+        let source = apt_source(suite, Architecture::Amd64);
+
+        let json = serde_json::to_string(&source).unwrap();
+        let decoded: SourceKind = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded, source);
+    }
+
+    #[test]
+    fn apt_source_ordering_is_consistent() {
+        let noble = Suite::new(
+            SeriesInfo::from_short_name("noble").unwrap(),
+            Pocket::Release,
+        );
+        let jammy = Suite::new(
+            SeriesInfo::from_short_name("jammy").unwrap(),
+            Pocket::Release,
+        );
+
+        let noble_source = apt_source(noble, Architecture::Amd64);
+        let jammy_source = apt_source(jammy, Architecture::Amd64);
+
+        assert!(jammy_source < noble_source);
+    }
 }
