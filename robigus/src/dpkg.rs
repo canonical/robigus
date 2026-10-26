@@ -108,8 +108,9 @@ fn compare_parts(mut a: &str, mut b: &str) -> Ordering {
             let ac = a.chars().next();
             let bc = b.chars().next();
 
-            let a_is_digit = ac.map_or(false, |c| c.is_ascii_digit());
-            let b_is_digit = bc.map_or(false, |c| c.is_ascii_digit());
+            // WP-1.1: clippy unnecessary_map_or
+            let a_is_digit = ac.is_some_and(|c| c.is_ascii_digit());
+            let b_is_digit = bc.is_some_and(|c| c.is_ascii_digit());
 
             // Break if both sides have reached digits or are exhausted
             if (a_is_digit || ac.is_none()) && (b_is_digit || bc.is_none()) {

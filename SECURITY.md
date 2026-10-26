@@ -1,12 +1,20 @@
 # Security Policy
 
+This policy covers every crate in this repository (`robigus` and `rapt`).
+
+## Supported Versions
+
+| Version | Supported |
+|---|---|
+| `main` (unreleased) | ✅ |
+
 ## Reporting a Vulnerability
 
 Please do not open public GitHub issues for security vulnerabilities. Doing so exposes the risk to the entire user base before a patch can be issued.
 
 ### How to report
 If you discover a security vulnerability within this project, please report it privately by:
-* Opening a report via our [GitHub Private Vulnerability Reporting](https://github.com/canonical/rapt/security/advisories/new) interface.
+* Opening a report via our [GitHub Private Vulnerability Reporting](https://github.com/canonical/robigus/security/advisories/new) interface.
 
 ### What to include
 To help us triage the issue quickly, please include:

@@ -2,20 +2,20 @@
 name = "robigus"
 version = "0.1.0"
 edition = "2024"
-description = "Rust libraries and tools for packaging automation"
-license = "GPL-3.0-or-later"
+rust-version.workspace = true
+description = "Dependency graph analysis for planning Ubuntu packaging of upstream software"
+license = "GPL-3.0-only"
 repository = "https://github.com/canonical/robigus"
-keywords = "ubuntu, packaging, automation"
-categories = "automation, ubuntu"
-rust-version = "1.93"
+keywords = ["ubuntu", "debian", "packaging", "dependencies", "cargo"]
+categories = ["development-tools", "development-tools::build-utils"]
 
 [dependencies]
-async-trait = "0.1.92"
-semver = { version = "1.0.28", features = ["serde"] }
+async-trait = "0.1"
+semver = { version = "1", features = ["serde"] }
 serde.workspace = true
 thiserror.workspace = true
 ubuntu-info-rust = { workspace = true }
-url = { version = "2.5.8", features = ["serde"] }
+url = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -11,8 +11,7 @@ use std::sync::Arc;
 
 // Reuse the foundational identity primitives from the data model
 use crate::model::{
-    Dependency, DependencyKind, Ecosystem, PackageId, PackageVersion, Resolve, ResolvedNode,
-    SourceId, VersionConstraint,
+    Dependency, Ecosystem, PackageId, PackageVersion, Resolve, ResolvedNode, VersionConstraint,
 };
 
 // 1. Unified Version Ordering and Constraint Evaluation
@@ -127,6 +126,9 @@ pub trait DependencyProvider: Send + Sync {
 
 // 4. CDCL / PubGrub Solver Interface
 
+// TODO(WP-1.2): this enum is reworked as part of the solver cleanup; the
+// large-variant lint is tolerated until then.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
     #[error("No viable candidate found for requirement: {req:?}")]
@@ -189,7 +191,8 @@ impl DependencyResolver for ModularSolver {
     ) -> Result<Resolve, ResolveError> {
         let mut resolved_nodes: BTreeMap<PackageId, ResolvedNode> = BTreeMap::new();
         let mut domain_assignments: HashMap<(String, ConflictDomain), PackageId> = HashMap::new();
-        let mut work_queue: Vec<Dependency> = root_dependencies.iter().cloned().collect();
+        // WP-1.1: clippy iter_cloned_collect
+        let mut work_queue: Vec<Dependency> = root_dependencies.to_vec();
 
         while let Some(current_req) = work_queue.pop() {
             if !self.is_active(&current_req) {
@@ -229,7 +232,8 @@ impl DependencyResolver for ModularSolver {
             domain_assignments.insert(domain_key, cand_id.clone());
 
             let child_deps = provider.get_dependencies(&cand_id).await?;
-            let mut dep_ids = BTreeSet::new();
+            // WP-1.1: clippy unused_mut (the set is never populated; WP-1.2 replaces this sketch)
+            let dep_ids = BTreeSet::new();
 
             for child in &child_deps {
                 if self.is_active(child) {
