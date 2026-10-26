@@ -9,7 +9,8 @@ Written in pure async Rust, `rapt` performs network requests directly against th
 - **Library crate (`rapt`)**: Provides ergonomic Rust abstractions around Ubuntu package and archive queries, including parsers for RFC 822 / Deb822 index files (`Packages` and `Sources`), query filtering, and cache management.
 - **CLI binary (`rapt`)**: Command-line interface with sub-commands inspired by `apt-cache` and `madison`, formatted for terminal display and scripted workflows.
 - **Local Caching**: Index data is cached locally per Ubuntu series (e.g. `resolute.json`) and kept fresh (re-queried if older than 1 hour or when explicitly running `update`).
-- **Archive Mirrors**: Queries `http://archive.ubuntu.com/ubuntu` for `amd64` and `http://ports.ubuntu.com/ubuntu-ports` for other architectures (`arm64`, `armhf`, `ppc64el`, `s390x`, `riscv64`).
+- **Ubuntu Metadata**: Series, pockets, components, architectures, and archive locations come from the [`ubuntu-info-rust`](https://crates.io/crates/ubuntu-info-rust) crate, which is the source of truth for Ubuntu distribution information.
+- **Archive Mirrors**: Uses the archive locations from `ubuntu-info-rust`: `http://archive.ubuntu.com/ubuntu` for `amd64`, `amd64v3`, and `i386`; `http://security.ubuntu.com/ubuntu` for the security pocket on those architectures; and `http://ports.ubuntu.com/ubuntu-ports` for `arm64`, `armhf`, `ppc64el`, `s390x`, and `riscv64`.
 
 ## Installation & Build
 
@@ -33,6 +34,8 @@ All queries require a target Ubuntu series specified via `-s` / `--series`:
 rapt -s noble <COMMAND> [OPTIONS]
 ```
 
+The series may be given as a short code name (`noble`), a full code name (`Noble Numbat`), or a version (`24.04`, `24.04 LTS`). It is validated and normalized to the short code name before use.
+
 ### Global Query Filter Options
 
 Filter which pockets, components, and architectures are queried:
@@ -44,7 +47,7 @@ Filter which pockets, components, and architectures are queried:
 | `-q` | `--not-pocket` | Exclude specific pockets (inverse filter) | Accepts 1 to 4 pockets |
 | `-c` | `--component` | Include specific components | `main`, `universe`, `restricted`, `multiverse` |
 | `-d` | `--not-component` | Exclude specific components (inverse filter) | Accepts 1 to 3 components |
-| `-a` | `--arch` | Include specific CPU architectures | `amd64`, `arm64`, `armhf`, `ppc64el`, `s390x`, `riscv64` |
+| `-a` | `--arch` | Include specific CPU architectures | `amd64`, `amd64v3`, `arm64`, `armhf`, `i386`, `ppc64el`, `s390x`, `riscv64` |
 | `-b` | `--not-arch` | Exclude specific architectures (inverse filter) | Accepts 1 to 5 architectures |
 
 *Note: Positive and inverse filter flags (e.g. `--pocket` and `--not-pocket` / `-q`) are mutually exclusive.*

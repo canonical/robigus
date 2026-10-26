@@ -4,54 +4,35 @@ use std::io::Read;
 
 use flate2::read::GzDecoder;
 use reqwest::Client;
+use ubuntu_info_rust::{Architecture, Archive, Component, Pocket, SeriesInfo, Suite};
 use xz2::read::XzDecoder;
 
 use crate::error::{RaptError, Result};
 use crate::models::{BinaryPackage, PackageOrigin, SeriesCache, SourcePackage};
 use crate::parser::{parse_binary_package, parse_rfc822_paragraphs, parse_source_package};
-use crate::types::{Architecture, Component, Pocket, QueryFilter};
-
-/// Default primary Ubuntu archive URL.
-pub const DEFAULT_ARCHIVE_URL: &str = "http://archive.ubuntu.com/ubuntu";
-
-/// Default ports Ubuntu archive URL for architectures other than amd64.
-pub const DEFAULT_PORTS_URL: &str = "http://ports.ubuntu.com/ubuntu-ports";
+use crate::types::QueryFilter;
 
 /// Network client for communicating with the Ubuntu archive.
 #[derive(Debug, Clone)]
 pub struct ArchiveClient {
     client: Client,
-    archive_url: String,
-    ports_url: String,
 }
 
 impl Default for ArchiveClient {
     fn default() -> Self {
-        Self::new(DEFAULT_ARCHIVE_URL, DEFAULT_PORTS_URL)
+        Self::new()
     }
 }
 
 impl ArchiveClient {
     /// Creates a new `ArchiveClient`.
     #[must_use]
-    pub fn new(archive_url: impl Into<String>, ports_url: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         Self {
             client: Client::builder()
                 .user_agent("rapt/0.1.0 (Ubuntu archive client)")
                 .build()
                 .unwrap_or_default(),
-            archive_url: archive_url.into(),
-            ports_url: ports_url.into(),
-        }
-    }
-
-    /// Selects the appropriate base URL for the given architecture.
-    #[must_use]
-    pub fn base_url_for_arch(&self, arch: Architecture) -> &str {
-        if arch.is_ports() {
-            &self.ports_url
-        } else {
-            &self.archive_url
         }
     }
 
@@ -77,29 +58,27 @@ impl ArchiveClient {
         component: Component,
         arch: Architecture,
     ) -> Result<Vec<BinaryPackage>> {
-        let base_url = self.base_url_for_arch(arch);
-        let suite = pocket.suite_for_series(series);
+        let suite = suite_for(series, pocket)?;
+        let archive = archive_for(pocket, arch);
+        let dists_url = archive.dists_url(&suite, component, arch);
 
         // Try Packages.xz first, fallback to Packages.gz
-        let url_xz = format!(
-            "{base_url}/dists/{suite}/{}/binary-{}/Packages.xz",
-            component.as_str(),
-            arch.as_str()
-        );
-
+        let url_xz = format!("{dists_url}Packages.xz");
         let uncompressed_text = match self.fetch_decompressed(&url_xz).await {
             Ok(text) => text,
             Err(_) => {
-                let url_gz = format!(
-                    "{base_url}/dists/{suite}/{}/binary-{}/Packages.gz",
-                    component.as_str(),
-                    arch.as_str()
-                );
+                let url_gz = format!("{dists_url}Packages.gz");
                 self.fetch_decompressed(&url_gz).await?
             }
         };
 
-        let origin = PackageOrigin::new(pocket, component, arch, base_url, &suite);
+        let origin = PackageOrigin::new(
+            pocket,
+            component,
+            arch,
+            archive.base_url(),
+            suite.to_string(),
+        );
         let paragraphs = parse_rfc822_paragraphs(&uncompressed_text);
         let mut packages = Vec::with_capacity(paragraphs.len());
 
@@ -119,8 +98,8 @@ impl ArchiveClient {
         pocket: Pocket,
         component: Component,
     ) -> Result<Vec<SourcePackage>> {
-        let base_url = &self.archive_url;
-        let suite = pocket.suite_for_series(series);
+        let suite = suite_for(series, pocket)?;
+        let base_url = archive_for_pocket(pocket).base_url();
 
         let url_xz = format!(
             "{base_url}/dists/{suite}/{}/source/Sources.xz",
@@ -210,6 +189,33 @@ impl ArchiveClient {
     }
 }
 
+/// Resolves a series name to a `Suite` for the given pocket.
+fn suite_for(series: &str, pocket: Pocket) -> Result<Suite> {
+    let series = SeriesInfo::from_short_name(series)
+        .or_else(|| SeriesInfo::from_code_name(series))
+        .or_else(|| SeriesInfo::from_version(series))
+        .ok_or_else(|| RaptError::InvalidSeries(series.to_string()))?;
+    Ok(Suite::new(series, pocket))
+}
+
+/// Selects the archive that hosts the given pocket and architecture.
+fn archive_for(pocket: Pocket, arch: Architecture) -> Archive {
+    if pocket == Pocket::Security {
+        arch.security_archive()
+    } else {
+        arch.archive()
+    }
+}
+
+/// Selects the archive that hosts source indices for the given pocket.
+fn archive_for_pocket(pocket: Pocket) -> Archive {
+    if pocket == Pocket::Security {
+        Archive::Security
+    } else {
+        Archive::Primary
+    }
+}
+
 /// Decompresses raw bytes based on URL extension or magic header.
 pub fn decompress_bytes(bytes: &[u8], url_hint: &str) -> Result<String> {
     if url_hint.ends_with(".xz") || (bytes.len() >= 6 && &bytes[0..6] == b"\xFD7zXZ\x00") {
@@ -230,5 +236,53 @@ pub fn decompress_bytes(bytes: &[u8], url_hint: &str) -> Result<String> {
         // Plain text
         String::from_utf8(bytes.to_vec())
             .map_err(|e| RaptError::Decompression(format!("invalid UTF-8 data: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn security_pocket_uses_the_security_archive() {
+        assert_eq!(
+            archive_for(Pocket::Security, Architecture::Amd64),
+            Archive::Security
+        );
+        assert_eq!(
+            archive_for(Pocket::Security, Architecture::Arm64),
+            Archive::Ports
+        );
+        assert_eq!(
+            archive_for(Pocket::Updates, Architecture::Amd64),
+            Archive::Primary
+        );
+        assert_eq!(
+            archive_for(Pocket::Updates, Architecture::Arm64),
+            Archive::Ports
+        );
+    }
+
+    #[test]
+    fn suite_resolution_accepts_series_forms() {
+        for input in ["resolute", "Resolute Raccoon", "26.04"] {
+            let suite = suite_for(input, Pocket::Security).unwrap();
+            assert_eq!(suite.to_string(), "resolute-security");
+        }
+        assert!(suite_for("not-a-series", Pocket::Release).is_err());
+    }
+
+    #[test]
+    fn dists_url_uses_the_expected_archive() {
+        let suite = suite_for("resolute", Pocket::Security).unwrap();
+        let url = archive_for(Pocket::Security, Architecture::Amd64).dists_url(
+            &suite,
+            Component::Main,
+            Architecture::Amd64,
+        );
+        assert_eq!(
+            url,
+            "http://security.ubuntu.com/ubuntu/dists/resolute-security/main/binary-amd64/"
+        );
     }
 }

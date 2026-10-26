@@ -1,14 +1,6 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+// WP-1.1: these modules were private, which left every `pub` item unreachable
+// and failed the clippy `-D warnings` gate. They are public to match the
+// library-API direction in spec §15; WP-1.2 refines the public surface.
+pub mod dpkg;
+pub mod model;
+pub mod solver;

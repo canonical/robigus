@@ -21,7 +21,7 @@ fn make_pkg(
         component,
         arch,
         "http://archive.ubuntu.com/ubuntu",
-        format!("resolute{}", pocket.suite_suffix()),
+        format!("resolute{}", pocket.suffix()),
     );
 
     let mut dep_groups = Vec::new();

@@ -1,0 +1,125 @@
+# cargo-deny configuration: dependency policy for the robigus workspace.
+# Run locally with `cargo deny check`; enforced in CI by the cargo-deny job.
+
+[graph]
+# Check the same feature set CI builds with.
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Explicit for auditability; this is also the default.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# GPL-3.0-only is the project license (spec §18); GPL-3.0-or-later is
+# compatible and covers ubucargo (Phase 3).
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "OpenSSL",
+    "Zlib",
+]
+
+# Data-only licenses are accepted per crate rather than blanket, so a future
+# dependency cannot silently ship code under them. Extend this list when a new
+# crate legitimately needs one of these licenses.
+[[licenses.exceptions]]
+allow = ["CDLA-Permissive-2.0"]
+name = "webpki-root-certs"
+
+# ICU4X family and friends: Unicode data tables and support crates.
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "icu_collections"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "icu_locale_core"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "icu_normalizer"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "icu_normalizer_data"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "icu_properties"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "icu_properties_data"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "icu_provider"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "litemap"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "potential_utf"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "tinystr"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "unicode-ident"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "writeable"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "yoke"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "yoke-derive"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "zerofrom"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "zerofrom-derive"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "zerotrie"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "zerovec"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "zerovec-derive"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

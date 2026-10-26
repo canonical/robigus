@@ -5,230 +5,11 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use ubuntu_info_rust::SeriesInfo;
+
+pub use ubuntu_info_rust::{Architecture, Component, Pocket};
 
 use crate::error::{RaptError, Result};
-
-/// Ubuntu archive pocket types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Pocket {
-    /// Initial release pocket.
-    Release,
-    /// Pre-release proposed updates pocket.
-    Proposed,
-    /// Stable maintenance updates pocket.
-    Updates,
-    /// Critical security updates pocket.
-    Security,
-    /// Backports of newer software pocket.
-    Backports,
-}
-
-impl Pocket {
-    /// Returns all available pockets.
-    #[must_use]
-    pub fn all() -> &'static [Pocket] {
-        &[
-            Pocket::Release,
-            Pocket::Proposed,
-            Pocket::Updates,
-            Pocket::Security,
-            Pocket::Backports,
-        ]
-    }
-
-    /// Returns the pocket name as a lowercase string slice.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Pocket::Release => "release",
-            Pocket::Proposed => "proposed",
-            Pocket::Updates => "updates",
-            Pocket::Security => "security",
-            Pocket::Backports => "backports",
-        }
-    }
-
-    /// Formats the pocket as a suite suffix relative to the series name.
-    /// E.g. `Release` -> "", `Updates` -> "-updates", `Security` -> "-security".
-    #[must_use]
-    pub const fn suite_suffix(self) -> &'static str {
-        match self {
-            Pocket::Release => "",
-            Pocket::Proposed => "-proposed",
-            Pocket::Updates => "-updates",
-            Pocket::Security => "-security",
-            Pocket::Backports => "-backports",
-        }
-    }
-
-    /// Constructs the suite name for a given series name.
-    /// E.g. ("resolute", `Pocket::Updates`) -> "resolute-updates".
-    #[must_use]
-    pub fn suite_for_series(self, series: &str) -> String {
-        format!("{series}{}", self.suite_suffix())
-    }
-}
-
-impl fmt::Display for Pocket {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl FromStr for Pocket {
-    type Err = RaptError;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "release" => Ok(Pocket::Release),
-            "proposed" => Ok(Pocket::Proposed),
-            "updates" => Ok(Pocket::Updates),
-            "security" => Ok(Pocket::Security),
-            "backports" => Ok(Pocket::Backports),
-            other => Err(RaptError::InvalidPocket(other.to_string())),
-        }
-    }
-}
-
-/// Ubuntu archive repository components.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Component {
-    /// Canonical-supported free/open-source software.
-    Main,
-    /// Community-maintained free/open-source software.
-    Universe,
-    /// Proprietary device drivers and restricted hardware software.
-    Restricted,
-    /// Software restricted by copyright or legal issues.
-    Multiverse,
-}
-
-impl Component {
-    /// Returns all available components.
-    #[must_use]
-    pub fn all() -> &'static [Component] {
-        &[
-            Component::Main,
-            Component::Universe,
-            Component::Restricted,
-            Component::Multiverse,
-        ]
-    }
-
-    /// Returns the component name as a string slice.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Component::Main => "main",
-            Component::Universe => "universe",
-            Component::Restricted => "restricted",
-            Component::Multiverse => "multiverse",
-        }
-    }
-}
-
-impl fmt::Display for Component {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl FromStr for Component {
-    type Err = RaptError;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "main" => Ok(Component::Main),
-            "universe" => Ok(Component::Universe),
-            "restricted" => Ok(Component::Restricted),
-            "multiverse" => Ok(Component::Multiverse),
-            other => Err(RaptError::InvalidComponent(other.to_string())),
-        }
-    }
-}
-
-/// Target CPU architectures supported by the Ubuntu archive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Architecture {
-    /// 64-bit x86 architecture.
-    Amd64,
-    /// 64-bit ARM architecture (AArch64).
-    Arm64,
-    /// 32-bit ARM hard-float architecture.
-    Armhf,
-    /// 64-bit PowerPC Little Endian architecture.
-    Ppc64el,
-    /// IBM System/390x 64-bit mainframe architecture.
-    S390x,
-    /// 64-bit RISC-V architecture.
-    Riscv64,
-}
-
-impl Architecture {
-    /// Returns all supported architectures.
-    #[must_use]
-    pub fn all() -> &'static [Architecture] {
-        &[
-            Architecture::Amd64,
-            Architecture::Arm64,
-            Architecture::Armhf,
-            Architecture::Ppc64el,
-            Architecture::S390x,
-            Architecture::Riscv64,
-        ]
-    }
-
-    /// Returns the architecture name as a string slice.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Architecture::Amd64 => "amd64",
-            Architecture::Arm64 => "arm64",
-            Architecture::Armhf => "armhf",
-            Architecture::Ppc64el => "ppc64el",
-            Architecture::S390x => "s390x",
-            Architecture::Riscv64 => "riscv64",
-        }
-    }
-
-    /// Whether this architecture is served by ports.ubuntu.com rather than archive.ubuntu.com.
-    #[must_use]
-    pub const fn is_ports(self) -> bool {
-        match self {
-            Architecture::Amd64 => false,
-            Architecture::Arm64
-            | Architecture::Armhf
-            | Architecture::Ppc64el
-            | Architecture::S390x
-            | Architecture::Riscv64 => true,
-        }
-    }
-}
-
-impl fmt::Display for Architecture {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl FromStr for Architecture {
-    type Err = RaptError;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "amd64" => Ok(Architecture::Amd64),
-            "arm64" => Ok(Architecture::Arm64),
-            "armhf" => Ok(Architecture::Armhf),
-            "ppc64el" => Ok(Architecture::Ppc64el),
-            "s390x" => Ok(Architecture::S390x),
-            "riscv64" => Ok(Architecture::Riscv64),
-            other => Err(RaptError::InvalidArchitecture(other.to_string())),
-        }
-    }
-}
 
 /// Parsed package specifier consisting of a package name and an optional package version number.
 /// Typically parsed from `PKG` or `PKG=PKG_VERSION_NUMBER`.
@@ -309,6 +90,15 @@ impl QueryFilter {
     #[must_use]
     pub fn series(&self) -> &str {
         &self.series
+    }
+
+    /// Returns the `ubuntu-info-rust` metadata for the target series.
+    ///
+    /// The series is validated when the filter is built, so this always returns
+    /// `Some` for filters produced by [`QueryFilterBuilder::build`].
+    #[must_use]
+    pub fn series_info(&self) -> Option<&'static SeriesInfo> {
+        SeriesInfo::from_short_name(&self.series)
     }
 
     /// Returns the set of pockets to query.
@@ -419,10 +209,19 @@ impl QueryFilterBuilder {
 
     /// Validates filter arguments and builds a `QueryFilter`.
     pub fn build(self) -> Result<QueryFilter> {
-        let series = self.series.trim().to_string();
+        let series = self.series.trim();
         if series.is_empty() {
             return Err(RaptError::MissingSeries);
         }
+
+        // Resolve the series through `ubuntu-info-rust` so that short code names,
+        // full code names, and version numbers are all accepted and normalized to
+        // the canonical short code name used in archive suites.
+        let series_info = SeriesInfo::from_short_name(series)
+            .or_else(|| SeriesInfo::from_code_name(series))
+            .or_else(|| SeriesInfo::from_version(series))
+            .ok_or_else(|| RaptError::InvalidSeries(series.to_string()))?;
+        let series = series_info.code_name_short.to_string();
 
         // Validate pockets
         let pockets = match (self.pocket, self.not_pocket) {
@@ -438,7 +237,7 @@ impl QueryFilterBuilder {
                 }
             }
             (None, Some(list)) => {
-                let all_pockets = Pocket::all();
+                let all_pockets = Pocket::ALL;
                 let count = list.len();
                 if count < 1 || count > all_pockets.len() - 1 {
                     return Err(RaptError::InvalidInverseFilterCount {
@@ -471,7 +270,7 @@ impl QueryFilterBuilder {
                 }
             }
             (None, Some(list)) => {
-                let all_components = Component::all();
+                let all_components = Component::ALL;
                 let count = list.len();
                 if count < 1 || count > all_components.len() - 1 {
                     return Err(RaptError::InvalidInverseFilterCount {
@@ -504,7 +303,7 @@ impl QueryFilterBuilder {
                 }
             }
             (None, Some(list)) => {
-                let all_archs = Architecture::all();
+                let all_archs = Architecture::ALL;
                 let count = list.len();
                 if count < 1 || count > all_archs.len() - 1 {
                     return Err(RaptError::InvalidInverseFilterCount {
@@ -539,11 +338,25 @@ fn default_pockets() -> BTreeSet<Pocket> {
 }
 
 fn default_components() -> BTreeSet<Component> {
-    Component::all().iter().copied().collect()
+    Component::ALL.into_iter().collect()
 }
 
+/// The architectures rapt queries when no `--arch` filter is given.
+///
+/// `amd64v3` and `i386` are available through `ubuntu-info-rust` and can be
+/// requested explicitly, but they are not part of the default set because they
+/// are not present in every series and pocket.
 fn default_architectures() -> BTreeSet<Architecture> {
-    Architecture::all().iter().copied().collect()
+    [
+        Architecture::Amd64,
+        Architecture::Arm64,
+        Architecture::Armhf,
+        Architecture::Ppc64el,
+        Architecture::S390x,
+        Architecture::Riscv64,
+    ]
+    .into_iter()
+    .collect()
 }
 
 #[cfg(test)]
@@ -607,5 +420,30 @@ mod tests {
         let target2: PackageTarget = "curl=8.18.0-1ubuntu2".parse().unwrap();
         assert_eq!(target2.name(), "curl");
         assert_eq!(target2.version(), Some("8.18.0-1ubuntu2"));
+    }
+
+    #[test]
+    fn test_series_is_normalized() {
+        for input in ["resolute", "Resolute Raccoon", "26.04", "26.04 LTS"] {
+            let filter = QueryFilter::builder(input).build().unwrap();
+            assert_eq!(filter.series(), "resolute", "input: {input}");
+            assert_eq!(filter.series_info().map(|info| info.version), Some("26.04"));
+        }
+    }
+
+    #[test]
+    fn test_unknown_series_is_rejected() {
+        let err = QueryFilter::builder("not-a-series").build().unwrap_err();
+        assert!(matches!(err, RaptError::InvalidSeries(ref s) if s == "not-a-series"));
+    }
+
+    #[test]
+    fn test_architectures_accept_ubuntu_info_variants() {
+        let filter = QueryFilter::builder("resolute")
+            .architectures(vec![Architecture::Amd64v3, Architecture::I386])
+            .build()
+            .unwrap();
+        assert!(filter.contains_arch(Architecture::Amd64v3));
+        assert!(filter.contains_arch(Architecture::I386));
     }
 }
