@@ -24,7 +24,7 @@ Ubuntu archive mapping (M4) and packaging plans (M5) are explicitly out of scope
 ## 2. Ground rules
 
 - **Spec sections are binding.** Each work package below cites the `AGENTS.md` sections it implements.
-- **Edition 2024, MSRV 1.85, GPL-3.0-only.** `#![forbid(unsafe_code)]` at the crate root; the only scoped `#[allow(unsafe_code)]` lives in `sandbox.rs`.
+- **Edition 2024, MSRV 1.93.1 (the default Rust toolchain on Ubuntu 26.04 LTS), GPL-3.0-only.** `#![forbid(unsafe_code)]` at the crate root; the only scoped `#[allow(unsafe_code)]` lives in `sandbox.rs`.
 - **Errors, never panics.** All library errors are typed (`thiserror`); the CLI renders them with `miette`. No `unwrap`/`expect` outside tests.
 - **Determinism.** Analyzers MUST produce identical output for identical inputs: `BTreeMap`/`BTreeSet` ordering everywhere, sorted fixture output, redacted snapshots.
 - **Fail closed.** If the sandbox cannot be established, nothing runs (exit 4). There is no `none` mode.
@@ -116,11 +116,11 @@ Goal (spec §21): predicate AST and parser (including `cfg` atoms), model extens
 
 Tasks:
 
-- [ ] `robigus/Cargo.toml`: add `description`, `license = "GPL-3.0-only"`, `repository`, `keywords`, `categories`, `rust-version = "1.85"`.
+- [ ] `robigus/Cargo.toml`: add `description`, `license = "GPL-3.0-only"`, `repository`, `keywords`, `categories`, `rust-version = "1.93.1"`.
 - [ ] Workspace `Cargo.toml`: add shared deps — `petgraph`, `rusqlite` (bundled), `tokio-rusqlite`, `rusqlite_migration`, `tracing`, `tracing-subscriber`, `miette`, `sha2`, `tar`, `zstd`, `walkdir`, `ignore`, `toml`, `gix`, `cargo_metadata`, `toml_edit`; dev-deps `insta`, `proptest`, `wiremock`. (`reqwest`, `clap`, `flate2`, `xz2`, `chrono`, `regex`, `serde*`, `thiserror`, `tokio`, `ubuntu-info-rust` already exist.)
 - [ ] Add `deny.toml` and a `cargo deny` CI job (licenses must accept GPL-3.0-only family; advisories on).
 - [ ] Add a robigus `SECURITY.md` with its own reporting path (the workspace one points at `rapt`).
-- [ ] CI: add an MSRV job pinned to 1.85; trigger workflows on pushes as well as PRs; reserve a nightly fuzz job (wired up once targets exist in WP-1.2/WP-1.3).
+- [ ] CI: add an MSRV job pinned to 1.93.1; trigger workflows on pushes as well as PRs; reserve a nightly fuzz job (wired up once targets exist in WP-1.2/WP-1.3).
 - [ ] Baseline: `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo doc --locked --no-deps --all-features` clean.
 
 Acceptance: CI green on PR and push; `cargo deny check` passes; manifest carries all §18 metadata.
@@ -485,7 +485,7 @@ Tests: fixture with a known divergence between methods.
 
 | Item | Where | Notes |
 |---|---|---|
-| MSRV CI job (1.85) | WP-1.1 | Fails fast on newer-only APIs |
+| MSRV CI job (1.93.1) | WP-1.1 | Fails fast on newer-only APIs |
 | `cargo deny` (licenses + advisories) | WP-1.1 | `deny.toml`; GPL-3.0-only family |
 | Nightly fuzz CI job | after WP-1.2/WP-1.3 | `cargo-fuzz` targets: predicate parser, dpkg comparator |
 | Sandbox-capable CI job | WP-1.7 | Runner must allow user namespaces; skip with explicit reason otherwise |
@@ -564,7 +564,7 @@ Roughly one work package per PR; each PR must keep the full CI gate green.
 - [ ] Sandbox: fail-closed verified (exit 4 with diagnostics); bwrap and native backends pass the sandbox suite; allowlist proxy blocks non-allowlisted hosts.
 - [ ] Offline mode produces declared-but-unresolved graphs with `network_mode = "offline"`.
 - [ ] LLM sub-agents: opt-in only, anchor-verified, capped at L3, injection-resistant (tested).
-- [ ] CI green on PR and push: fmt, clippy `-D warnings`, doc, test, audit, deny, MSRV 1.85; nightly fuzz running.
+- [ ] CI green on PR and push: fmt, clippy `-D warnings`, doc, test, audit, deny, MSRV 1.93.1; nightly fuzz running.
 - [ ] `robigus/Cargo.toml` carries full §18 metadata; robigus `SECURITY.md` exists.
 - [ ] rustdoc complete for the public API; README quickstart.
 - [ ] Tag `v0.1.0`.

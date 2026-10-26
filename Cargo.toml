@@ -1,7 +1,8 @@
 [workspace]
 # Resolver 3 adds MSRV-aware dependency resolution, keeping the lockfile
-# compatible with the workspace's rust-version 1.85. The workspace itself has
-# no edition key, so this must be stated explicitly.
+# compatible with the workspace's rust-version 1.93.1 (the default Rust
+# toolchain on Ubuntu 26.04 LTS). The workspace has no edition key, so this
+# must be stated explicitly.
 resolver = "3"
 members = [
     "rapt",
@@ -9,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-rust-version = "1.85"
+rust-version = "1.93.1"
 
 [workspace.dependencies]
 # Shared dependencies (pre-existing)

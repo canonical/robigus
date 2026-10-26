@@ -731,7 +731,7 @@ pub fn establish_sandbox(preference: SandboxPreference)
 - **Integration tests** with `assert_cmd`, `predicates`, and `tempfile`.
 - **HTTP mocking** with `wiremock` for registry and archive interactions.
 - **Sandbox tests** verifying that analysis cannot reach non-allowlisted hosts or write outside its workspace.
-- **CI** MUST run `cargo fmt -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo doc --locked --no-deps --all-features`, `cargo test --locked --all-targets --all-features`, `cargo audit`, `cargo deny` (licenses and advisories), and an MSRV job pinned to 1.85; CI MUST trigger on pushes as well as pull requests.
+- **CI** MUST run `cargo fmt -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo doc --locked --no-deps --all-features`, `cargo test --locked --all-targets --all-features`, `cargo audit`, `cargo deny` (licenses and advisories), and an MSRV job pinned to 1.93.1; CI MUST trigger on pushes as well as pull requests.
 
 ## 17. Security
 
@@ -747,9 +747,9 @@ pub fn establish_sandbox(preference: SandboxPreference)
 ## 18. Coding Standards
 
 - Follow idiomatic Rust as defined in `../rust-instructions.md`.
-- Edition 2024; MSRV 1.85.
+- Edition 2024; MSRV 1.93.1 (the default Rust toolchain on Ubuntu 26.04 LTS).
 - License: GPL-3.0-only (matching `rapt`; `ubucargo` is GPL-3.0-or-later and compatible).
-- Include `description`, `license`, `repository`, `keywords`, `categories`, and `rust-version = "1.85"` in `robigus/Cargo.toml` (an M1 checklist item; the manifest currently lacks them).
+- Include `description`, `license`, `repository`, `keywords`, `categories`, and `rust-version = "1.93.1"` in `robigus/Cargo.toml`.
 - Use `thiserror` for library errors and `miette` for CLI diagnostics; `DpkgVersion::parse` and every parser MUST return typed errors, never `String`.
 - Use `tracing` for structured logging; never use `println!` for diagnostics in library code.
 - Avoid `unwrap` and `expect` in library code; return `Result`.
