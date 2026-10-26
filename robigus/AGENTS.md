@@ -18,7 +18,7 @@ robigus is written in pure async Rust. It accepts a target software project as a
 | 2. Ubuntu archive mapping | Determine which dependencies (or acceptable version adjustments) exist in the Ubuntu archive. | `rapt`, `ubuntu-info-rust`, Contents indices |
 | 3. Packaging plan | Classify dependencies as archive-satisfiable or needing packaging, and generate packaging templates for the latter. | `rapt`, `ubucargo` |
 
-Phase 1 is the only phase in scope for the first release. Phases 2 and 3 are specified here so that Phase 1's data model and APIs do not preclude them. `ubucargo` is not yet a workspace member; it will be added when Phase 3 begins.
+**v1 comprises Milestones M1–M3 only** (§21): target software project analysis, dependency graph discovery and expansion, and persistence of the full dependency graph. Ubuntu archive mapping (M4) and the packaging plan (M5) are Phase 2/3 work and are **not** part of the first release. Phases 2 and 3 are specified here so that Phase 1's data model and APIs do not preclude them. `ubucargo` is not yet a workspace member; it will be added when Phase 3 begins.
 
 ### 1.2 Non-goals for v1
 
@@ -27,37 +27,40 @@ Phase 1 is the only phase in scope for the first release. Phases 2 and 3 are spe
 - robigus does not perform global cross-ecosystem version solving in Phase 1. It records the graph produced by ecosystem-native tooling and defers version selection to Phase 2/3.
 - Platforms other than Linux are recorded but not expanded (see §4.4).
 - Ecosystems other than Rust/Cargo and the C/C++/assembly used by Rust projects are out of scope for v1.
+- Ubuntu archive mapping and packaging plans (M4/M5) are out of scope for v1.
 
 ## 2. Terminology
 
 - **Target software project (TSP)**: the upstream project being analyzed.
-- **Dependency graph**: a directed graph whose root is the TSP and whose nodes are packages/artifacts; edges are dependency relationships.
+- **Dependency graph**: a directed graph whose roots are the TSP (one or more, for example workspace members) and whose nodes are packages/artifacts; edges are dependency relationships.
 - **Dependency mapping plan**: the per-node strategy used to discover and expand a node's dependencies (which analyzer, which inputs, which validation), persisted in the `analysis_plan` table.
 - **Configuration**: a concrete combination of architecture, platform, enabled features, build profiles, environment, and Ubuntu series used to evaluate predicates.
 - **Predicate**: a Boolean expression over configuration atoms that determines whether a dependency edge is active.
+- **Requirement**: the *declared* dependency need (crate name, pkg-config module, header, soname, tool) together with its version constraint, independent of any resolved node.
 - **Evidence**: the method, location, and confidence supporting a discovered node or edge.
+- **Analysis status**: the per-node state of the analysis (`Not_Started`, `Started`, `Complete`, `Error`; §5.1).
 
 ## 3. Dependency Categories
 
-Dependencies are categorized by how they are used:
+Dependencies are categorized by how they are used. An edge carries a **set** of categories (`kinds`), not a single one, because a dependency may appear in multiple categories. For example, `gcc` may be both a dev-dependency (to compile tests) and a dependency (to compile the TSP).
 
 - **dependencies** — needed to build or compile the TSP.
 - **dev-dependencies** — needed only for compiling and running tests, examples, and benchmarks.
 - **runtime-dependencies** — needed in the execution environment when the TSP runs, including interpreters, configuration files, data files, and similar components separate from the TSP itself.
 - **build-dependencies** — required by build scripts (for example `build.rs`) or code generation (for example `.l`/`.lex`/`.flex` and `.y` files) before compiling the main package.
 
-A dependency may appear in multiple categories. For example, `gcc` may be both a dev-dependency (to compile tests) and a dependency (to compile the TSP).
-
 ### 3.1 Mapping to Debian/Ubuntu packaging
 
 | robigus category | Debian/Ubuntu field(s) |
 |---|---|
-| dependencies | `Build-Depends` (build) and `Depends` (runtime of produced artifacts) |
+| dependencies | `Build-Depends` (build); additionally `Depends` when the provider node ships an artifact that the built output consumes at runtime |
 | dev-dependencies | `Build-Depends` excluded under the `nocheck` build profile (`<!nocheck>`); test-runtime dependencies via `debian/tests/control` |
 | build-dependencies | `Build-Depends`, `Build-Depends-Arch`, `Build-Depends-Indep`, with `:native`/`:any` qualifiers for cross builds |
 | runtime-dependencies | `Depends`, `Recommends`, `Suggests` |
 
-The model MUST represent all four categories. The existing `DependencyKind` enum MUST gain a `Runtime` variant.
+The `Build-Depends` versus `Depends` decision is made in Phase 2/3 from the edge's kind set together with the **provider node's recorded `Target`s** and the ecosystem's linking conventions: a Rust crate compiled into the TSP is `Build-Depends` only, while a node providing a shared library that is linked dynamically contributes `Depends` as well. No separate per-edge linkage attribute is stored; the provider's targets are the source of truth.
+
+The model MUST represent all four categories as a set per edge. The existing `DependencyKind` enum MUST gain a `Runtime` variant, and its `Normal` doc comment ("Needed for compilation and runtime") MUST be corrected: `Normal` means compiled/linked into the TSP; runtime needs are `Runtime`.
 
 ## 4. Dependency Predicates
 
@@ -67,13 +70,17 @@ Dependencies are annotated with predicates describing the conditions under which
 
 | Atom | Meaning | Example |
 |---|---|---|
-| `feature("name")` | Cargo feature is enabled | `feature("serde")` |
-| `arch("name")` | Target machine architecture | `arch("amd64")` |
-| `platform("name")` | Target OS/environment | `platform("linux")` |
+| `feature("name")` | Feature `name` enabled on the **current package** | `feature("serde")` |
+| `feature("pkg/name")` | Feature `name` enabled on package `pkg` (qualified form for cross-package references) | `feature("serde/derive")` |
+| `cfg("key" = "value")` | Cargo `cfg` key/value pair: `target_os`, `target_family`, `target_env`, `target_vendor`, `target_pointer_width`, `target_feature`, or custom `--cfg` keys | `cfg("target_env" = "musl")` |
+| `arch("name")` | Machine architecture; `all` expands to the Ubuntu-supported set (§4.4) | `arch("amd64")` |
+| `platform("name")` | Target OS/environment; only `linux` is expanded | `platform("linux")` |
 | `build-profile("name")` | Debian build profile is active | `build-profile("nocheck")` |
 | `env("NAME" = "value")` | Environment variable condition | `env("CC" = "clang")` |
 | `series("name")` | Ubuntu series | `series("noble")` |
 | `true` / `false` | Constants | `true` |
+
+Cargo `cfg(...)` predicates (for example from `[target.'cfg(...)'.dependencies]`) are stored **verbatim** as `cfg` atoms — `cfg(unix)` becomes `cfg("target_family" = "unix")`, `cfg(target_arch = "x86_64")` becomes `cfg("target_arch" = "x86_64")` — so that no information is lost. Debian architecture qualifiers are stored as `arch` atoms. `arch("amd64")` and `cfg("target_arch" = "x86_64")` evaluate identically against a `Configuration`, and the store MUST NOT rewrite between the two forms.
 
 ### 4.2 Grammar
 
@@ -85,6 +92,7 @@ disjunction = conjunction { "||" conjunction } ;
 conjunction = unary { "&&" unary } ;
 unary       = "!" unary | "(" predicate ")" | atom ;
 atom        = "feature" "(" string ")"
+            | "cfg" "(" string "=" string ")"
             | "arch" "(" string ")"
             | "platform" "(" string ")"
             | "build-profile" "(" string ")"
@@ -93,23 +101,24 @@ atom        = "feature" "(" string ")"
             | "true" | "false" ;
 ```
 
-Precedence: `!` binds tighter than `&&`, which binds tighter than `||`. An empty predicate is equivalent to `true`.
+Precedence: `!` binds tighter than `&&`, which binds tighter than `||`. An empty predicate is equivalent to `true`. Package-qualified features (`feature("pkg/name")`) are ordinary string atoms; the `/` carries no grammar meaning.
 
 ### 4.3 Representation and evaluation
 
 - The in-memory representation MUST be a typed AST (`Predicate` enum), not a string.
 - Predicates MUST be serialized with `serde` for persistence and interchange.
-- The store MUST persist a canonical form (negation normal form, then CNF) alongside the AST so that edges can be indexed and matched efficiently.
+- The store MUST persist the AST (in a deterministic **canonical serialization**: constant folding, de-duplication of identical operands, and sorted operands under `&&`/`||`) used for equality, deduplication, and display. Canonicalization is a pure syntax transformation and MUST NOT alter semantics.
+- No CNF or DNF is persisted. Equivalence and matching are done by AST equality and query-time evaluation. DNF MAY be computed on demand for enumeration and reporting, with a size guard (node or term cap) so pathological inputs cannot blow up.
 - Evaluation MUST be lazy and memoized per `Configuration`; robigus MUST NOT enumerate the full cross-product of architectures, platforms, features, and profiles.
-- DNF MAY be computed on demand for enumeration and reporting.
 - The predicate parser MUST be fuzz-tested and property-tested (see §16).
 
 ### 4.4 Architecture and platform enumeration
 
-- robigus tracks only the machine architectures defined by the `ubuntu-info-rust` crate.
-- Other architectures are recorded structurally with a `supported = false` marker and displayed with an `_unsupported` suffix (for example `mips_unsupported`). The `_unsupported` suffix is a display convention only; it MUST NOT be the internal representation.
-- robigus tracks only the `linux` platform. Other platforms are recorded with `supported = false` and displayed with an `_unsupported` suffix (for example `windows_unsupported`).
-- Unsupported architectures and platforms are recorded but not expanded.
+- The internal representation is `MachineArch`: `Ubuntu(Architecture)` (from the `ubuntu-info-rust` crate), `All`, or `Unsupported(String)`.
+- `All` is stored as-is and expands, at evaluation time, to every machine architecture defined by `ubuntu-info-rust`.
+- The default analysis set is every `ubuntu-info-rust` architecture **except** `i386`: `amd64`, `amd64v3`, `arm64`, `armhf`, `ppc64el`, `riscv64`, `s390x`. `i386` is supported and can be enabled through configuration, but is not analyzed by default. This default is robigus's own; `rapt`'s query defaults are independent.
+- Architectures outside the `ubuntu-info-rust` set are recorded as `Unsupported(name)` stubs — evidence that they were detected — and are never expanded. They display with an `_unsupported` suffix (for example `mips_unsupported`); the suffix is a display convention only and MUST NOT be the internal representation.
+- robigus tracks only the `linux` platform. Other platforms are recorded as `Unsupported` stubs (for example `windows_unsupported`) and are not expanded.
 
 ### 4.5 Examples
 
@@ -123,6 +132,7 @@ Precedence: `!` binds tighter than `&&`, which binds tighter than `||`. An empty
   `feature("asm") && arch("arm64") && env("CC" = "clang")`
 - Debian build-profile mapping: a test-only dependency is needed when `nocheck` is not active, i.e. `!build-profile("nocheck")`.
 - Debian architecture qualifiers map directly: `foo [amd64 !arm64]` becomes `arch("amd64") && !arch("arm64")`.
+- Cargo target-specific dependency: `[target.'cfg(any(target_os = "linux", target_family = "unix"))'.dependencies]` becomes `cfg("target_os" = "linux") || cfg("target_family" = "unix")`.
 
 ## 5. Dependency Graph Model
 
@@ -130,18 +140,59 @@ Precedence: `!` binds tighter than `&&`, which binds tighter than `||`. An empty
 
 A node is a concrete package instance identified by `PackageId` (name + version + source + ecosystem). The TSP is the root node; a project may have multiple roots (for example workspace members).
 
+```rust
+pub struct Node {
+    pub id: PackageId,
+    /// Workspace-relative source directory, if the node exists in the analysis tree.
+    pub path: Option<PathBuf>,
+    pub status: AnalysisStatus,
+    /// Features unified across the graph (Cargo resolver v2 semantics, §9).
+    pub active_features: BTreeSet<String>,
+    pub targets: Vec<Target>,
+    pub provides: Vec<Provide>,   // virtual packages: name + optional version
+    pub conflicts: Vec<Conflict>, // name + optional version constraint
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnalysisStatus { NotStarted, Started, Complete, Error }
+// Serialized exactly as "Not_Started", "Started", "Complete", "Error".
+```
+
+Analysis-status semantics:
+
+- `Not_Started` — initial state; no analysis has been performed for this node.
+- `Started` — analysis work has started but is not complete. The status MUST be persisted **before** work begins so an interrupted run can resume (§7.7).
+- `Complete` — the node's analysis is complete. A node MAY be marked `Complete` only when every dependency edge it discovered resolves to a node that is also `Complete`. Edges with no target (unresolved requirements, §5.2) are exempt: they have no node to complete in Phase 1.
+- `Error` — an error occurred that must be resolved before the analysis can complete; the failure is recorded in the node's `analysis_plan` rows.
+
 ### 5.2 Edges
 
-An edge is a dependency relationship from a dependent node to a dependency node. Each edge carries:
+An edge is a dependency relationship from a dependent node to a dependency node.
 
-- `kind`: normal, development, build, or runtime;
-- `requirement`: the raw requirement (crate name, pkg-config module, header, soname, and so on);
-- `version_req`: the version constraint, if any;
-- `predicate`: the Boolean activation condition;
-- `confidence`: 0–100;
-- `evidence`: one or more evidence records.
+```rust
+pub struct Edge {
+    pub from: PackageId,
+    /// `None` = unresolved requirement preserved for Phase 2.
+    pub to: Option<PackageId>,
+    pub requirement: Requirement,
+    /// Set of categories; a dependency may serve several (§3).
+    pub kinds: BTreeSet<DependencyKind>,
+    /// Activation condition; default `true`.
+    pub predicate: Predicate,
+    pub confidence: u8,          // 0..=100
+    pub evidence: Vec<Evidence>,
+}
 
-An edge whose dependency cannot be resolved to a concrete node (for example a system library not yet mapped) has a null target and retains its requirement. This is how Phase 1 preserves information for Phase 2.
+pub struct Requirement {
+    pub kind: RequirementKind,   // Crate | PkgConfig | Header | Soname | Tool | Generic
+    pub name: String,            // crate name, pkg-config module, header path, soname, tool name
+    pub version_req: Option<VersionConstraint>,
+}
+```
+
+An edge whose dependency cannot be resolved to a concrete node (for example a system library not yet mapped) has `to = None` and retains its requirement. This is how Phase 1 preserves information for Phase 2.
+
+Merge policy: when two discoveries produce the same edge identity (same `from`, `to`, `requirement`, and `predicate`), their `kinds` sets are unioned, their evidence is merged, and the confidence is the maximum of the two. Conflicting discoveries are retained and reported rather than silently discarded.
 
 ### 5.3 Evidence and confidence
 
@@ -154,6 +205,7 @@ pub enum EvidenceMethod {
     SourceScan,
     Documentation,
     BuildObservation,
+    LlmSubAgent,
     HumanOverride,
 }
 
@@ -163,21 +215,40 @@ pub struct Evidence {
     pub location: Option<SourceLocation>,
     pub detail: Option<String>,
 }
+
+pub struct SourceLocation {
+    /// Workspace-relative file path.
+    pub path: PathBuf,
+    pub start_line: Option<u64>,
+    pub end_line: Option<u64>,
+}
 ```
 
-Merge policy: retain all evidence; an edge's confidence is the maximum of its evidence; conflicting discoveries are retained and reported rather than silently discarded.
+Confidence is tiered on an L0–L4 ladder so that caps (for example for LLM evidence, §7.6) are enforceable:
+
+| Tier | Confidence range | Meaning |
+|---|---|---|
+| L0 | 0–19 | Unsupported guess; MUST NOT be persisted as sole evidence |
+| L1 | 20–39 | Documentation or naming heuristic only |
+| L2 | 40–59 | Source scan with unverified anchors |
+| L3 | 60–79 | Verified anchor or sandboxed tool output, not independently cross-checked |
+| L4 | 80–100 | Cross-validated: two independent methods agree |
+
+Merge policy: retain all evidence; an edge's confidence is the maximum of its evidence. `check` MUST validate that persisted evidence respects tier caps (in particular `LlmSubAgent` evidence MUST NOT exceed L3).
 
 ### 5.4 Required model changes
 
-The existing `model.rs` MUST be extended:
+The existing `model.rs` MUST be extended as follows before M1 closes:
 
-- Add `DependencyKind::Runtime`.
-- Add `Provides` and `Conflicts` relationships (virtual packages matter for Ubuntu).
-- Unify `PackageVersion::Debian` with `dpkg::DpkgVersion` rather than duplicating parsing and ordering.
+- Add `DependencyKind::Runtime`; convert `Dependency.kind` (and edges) to a kind **set** (`BTreeSet<DependencyKind>`).
 - Replace `Dependency.platform: Option<String>` with a `Predicate`.
-- Add `Evidence` and `confidence` to edges.
-- Make `Resolve.root` support multiple roots (`BTreeSet<PackageId>`).
-- Model Cargo feature syntax (`dep:foo`, `foo?/bar`) explicitly or abstract it behind a feature-expression type.
+- Model Cargo feature syntax with a `FeatureExpr` type (`Simple("foo")`, optional-dependency `foo?`, dependency-feature `foo/bar`, `foo?/bar`, `dep:foo`); `Dependency.features` becomes `BTreeSet<FeatureExpr>`.
+- Replace `Resolve`/`ResolvedNode` with a `DependencyGraph` backed by `petgraph` (node weight = `Node`, edge weight = `Edge`) plus a `PackageId → NodeIndex` index. The current `ResolvedNode.dependencies: BTreeSet<PackageId>` cannot carry `kind`, `requirement`, `predicate`, or `evidence`. `Resolve.root` becomes `BTreeSet<PackageId>` (multiple roots).
+- Unify `PackageVersion::Debian` with `dpkg::DpkgVersion` — one parser, one ordering. First fix `DpkgVersion`: it derives `Eq` structurally while `Ord` compares semantically, so `1.02 != 1.2` under `==` while comparing `Equal` under `Ord` — a broken `Ord`/`Eq` contract that corrupts sorted containers. `PartialEq` MUST agree with `Ord`. Identity ordering (as used by `Ord` on `PackageId`) and semantic version ordering MUST remain separate concerns.
+- Delete or replace `solver.rs`'s `debian_compare_versions` stub (currently always `Equal`); it must not survive the solver rework (§9).
+- Add `SourceKind::Tarball { url, digest }` so tarball inputs (§7.1) are representable; `SourceKind::Path` MUST record a deterministic tree digest so local-path analyses are reproducible.
+- Give `DpkgVersion::parse` a typed `thiserror` error instead of `String`.
+- Make `PackageId`'s `Display` include ecosystem and source so logs and reports are unambiguous.
 
 ## 6. Architecture
 
@@ -201,15 +272,15 @@ flowchart TD
 - **Acquisition** (`fetch`): fetch repositories, tarballs, and registry artifacts; verify digests; cache by content hash.
 - **Detection** (`detect`): identify languages, build systems, test systems, and analyzers with a confidence score.
 - **Analyzers** (`analyzers`): per-ecosystem discovery of direct dependencies and artifacts.
-- **Expansion** (`resolve`): recursive work queue over nodes, deduplication, cycle detection, and analysis-plan selection.
-- **Store** (`store`): SQLite persistence, schema migration, integrity checking, import/export.
+- **Expansion** (`expand`): recursive work queue over nodes, deduplication, cycle detection (SCC), analysis-plan selection, per-node status tracking, and resumability.
+- **Store** (`store`): SQLite persistence, schema migration, integrity checking, export.
 - **Mapping** (`mapping`, Phase 2): Ubuntu archive lookup and dependency-to-package mapping.
 - **Plan** (`plan`, Phase 3): packaging classification and template generation.
 
 ### 6.2 Async model
 
-- All public APIs are `async` and run on `tokio`.
-- Network I/O uses `reqwest`; git uses `gix`; both are driven from async tasks.
+- All public APIs are `async` and run on `tokio`. The one deliberate exception is `ProjectAnalyzer::detect`, which is synchronous by design: it is pure marker inspection over an in-memory `ProjectTree` with no I/O (§7.5).
+- Network I/O uses `reqwest`; git uses `gix`. `gix` operations are blocking and MUST run inside `spawn_blocking`.
 - Blocking work (SQLite, archive extraction, CPU-bound parsing) MUST run in `tokio::task::spawn_blocking`.
 - CPU-bound analysis MAY use `rayon` inside a blocking task.
 - Analyzers are `Send + Sync` and may run concurrently, subject to a configurable concurrency limit.
@@ -225,7 +296,8 @@ flowchart TD
 | Checksums | `sha2` | 1 |
 | Rust metadata | `cargo_metadata`, `toml_edit` | 1 |
 | Graph algorithms | `petgraph` | 1 |
-| SQLite | `rusqlite` (bundled), `tokio-rusqlite` | 1 |
+| Core types | `serde`, `thiserror`, `semver`, `url`, `async-trait`, `ubuntu-info-rust` | 1 |
+| SQLite | `rusqlite` (bundled), `tokio-rusqlite`, `rusqlite_migration` | 1 |
 | CLI | `clap` | 1 |
 | Logging | `tracing`, `tracing-subscriber` | 1 |
 | Diagnostics | `miette` | 1 |
@@ -250,29 +322,32 @@ flowchart TD
 
 ### 7.2 Acquisition and extraction
 
-- Fetch into a content-addressed cache keyed by URL and digest.
-- Verify checksums when the source provides them.
+- Fetch into a content-addressed cache keyed by URL and digest (`--cache <PATH>`, default under the XDG cache directory).
+- **Checksum provenance**: registry `.crate` artifacts MUST be verified against the checksum recorded in the registry index (mandatory, never optional). Git sources MUST record the exact resolved commit; when a lockfile pins it, that revision is used. A bare tarball URL has no trusted digest unless one is supplied via configuration or CLI; robigus records the computed SHA-256 and marks the provenance `unverified` in metadata.
+- Path inputs: a deterministic tree digest (hash over the canonical, sorted file list and contents) MUST be computed so local-path analyses are reproducible.
 - Extract with `tar` plus `flate2`/`xz2`/`zstd`.
 - Extraction MUST reject absolute paths, `..` traversal, symlinks escaping the destination, device nodes, and setuid/setgid entries; it MUST enforce entry-count and total-size limits (decompression-bomb protection).
 - Never execute anything during extraction.
 
 ### 7.3 Detection
 
-Detection uses marker files and produces a confidence score per analyzer:
+Detection uses marker files and produces a confidence score per signal:
 
-| Marker | Analyzer |
+| Marker | Signal |
 |---|---|
-| `Cargo.toml` | Rust/Cargo |
-| `build.rs` | Rust build script (C/C++/assembly discovery) |
-| `CMakeLists.txt` | CMake |
-| `meson.build` | Meson |
-| `configure.ac` / `configure` | Autotools |
-| `Makefile` | Make |
-| `pyproject.toml` / `setup.py` | Python (future) |
+| `Cargo.toml` | Rust/Cargo analyzer |
+| `build.rs` | C/C++/assembly discovery inside the Rust analyzer |
+| `CMakeLists.txt` | C/C++ strategy: CMake |
+| `meson.build` | C/C++ strategy: Meson |
+| `configure.ac` / `configure` | C/C++ strategy: Autotools |
+| `Makefile` | C/C++ strategy: Make |
+| `pyproject.toml` / `setup.py` | Python (future analyzer; recorded, not analyzed in v1) |
 | `go.mod` | Go (future) |
 | `package.json` | Node (future) |
 
-Polyglot and monorepo projects MUST be supported: detection runs per subdirectory, and multiple analyzers may contribute to one project.
+v1 ships two analyzers: `cargo` and `cpp`. CMake, Meson, Autotools, and Make are **strategies inside the `cpp` analyzer**, not separate analyzers. Markers for future ecosystems are recorded in the analysis plan with status `Skipped` so the record shows what was seen but not analyzed.
+
+Polyglot and monorepo projects MUST be supported: detection runs per subdirectory, and multiple analyzers may contribute to one project. Detection MUST skip `target/`, `vendor/`, `node_modules/`, `.git/`, and anything matched by the `ignore` crate's default rules. Crates under `vendor/` are analyzed only when referenced by an in-tree manifest; unreferenced vendored crates are not expanded. Nested workspaces are analyzed as separate roots only when they are not reachable from the top-level workspace.
 
 ### 7.4 Characteristics
 
@@ -292,12 +367,13 @@ The analyzer determines and records:
 #[async_trait]
 pub trait ProjectAnalyzer: Send + Sync {
     fn id(&self) -> AnalyzerId;
+    /// Synchronous by design: pure marker inspection, no I/O.
     fn detect(&self, tree: &ProjectTree) -> Confidence;
     async fn analyze(&self, ctx: &AnalysisContext<'_>) -> Result<AnalyzerOutput, AnalyzerError>;
 }
 ```
 
-`AnalyzerOutput` contains discovered packages, dependency edges, artifacts, evidence, and follow-up expansion tasks. Analyzers MUST be deterministic given the same inputs and sandbox configuration.
+`AnalyzerOutput` contains discovered nodes (with status `Not_Started`), dependency edges, targets, provides/conflicts, evidence, analysis-plan rows, and follow-up expansion tasks. Analyzers MUST be deterministic given the same inputs and sandbox configuration.
 
 ### 7.6 Analysis strategies
 
@@ -309,31 +385,39 @@ The analysis plan selects one or more strategies per node:
 - **Documentation** — parse README and build instructions; optionally dispatch an LLM-assisted sub-agent for ambiguous projects.
 - **Validation** — independently re-analyze a node, cross-check two analyzers, or dispatch a reviewer sub-agent.
 
-"Sub-programs or sub-agents" therefore means a mix of in-process analyzers (preferred for deterministic ecosystems) and optional out-of-process or LLM-assisted agents (for ambiguous, documentation-driven, or build-observation cases). In-process analyzers MUST be the default; sub-agents MUST be opt-in and MUST record their evidence and confidence.
+In-process analyzers MUST be the default; sub-agents (out-of-process or LLM-assisted) are opt-in via configuration, run inside the same sandbox as any other analysis, and MUST record their evidence with method `LlmSubAgent`. The following rules apply to LLM sub-agents:
+
+- **Line-level and AST anchor rule**: the sub-agent MUST return precise, continuous file paths with starting and ending lines for every claim. The orchestrator MUST parse these locations and verify that the referenced strings and constructs actually exist in the codebase before accepting the evidence. Claims that cannot be verified are discarded.
+- **No-code-reproduction constraint**: to prevent token bloat and superficial pattern matching, sub-agents MUST NOT copy large chunks of source code into their reports. They MUST summarize the logic and map identifiers (variables, function signatures) rather than quoting exact text.
+- **Confidence cap**: LLM-derived evidence MUST NOT exceed tier L3 (§5.3). It MUST NOT be the sole evidence for an edge when a deterministic method is available; when it is the only evidence, the edge is flagged in reports.
+- Prompt-injection stance: TSP content is untrusted input to the sub-agent (§17). Sub-agents receive no host secrets or credentials, and no network access beyond the analysis allowlist (their LLM API endpoint must be added to the allowlist explicitly when enabled).
 
 ### 7.7 Recursive expansion
 
 1. Start with the TSP root node or nodes.
-2. For each node, select an analysis plan and run the chosen analyzers in the sandbox.
-3. Merge discovered edges and evidence.
+2. For each node: create/refresh its `analysis_plan` rows, set status `Started` and **persist before work begins**, then run the chosen strategies in the sandbox.
+3. Merge discovered edges and evidence (union `kinds`, max confidence, §5.2); upsert nodes and edges incrementally so the database always reflects progress.
 4. Enqueue unresolved dependencies for expansion.
-5. Deduplicate by `PackageId`; detect cycles with SCC analysis; enforce configurable depth and node limits.
-6. Persist progress so an interrupted analysis can resume.
+5. Deduplicate by `PackageId`; detect cycles with SCC analysis (cycles are legal — Cargo dev-dependency cycles — and are recorded, not errors); enforce configurable depth and node limits.
+6. Mark a node `Complete` only when all of its targeted dependencies are `Complete` (unresolved requirements exempt, §5.1); failures mark the node `Error` with the cause recorded in its plan rows.
+7. **Resume**: because one database is per analysis (§11), re-running `tsp-analyzer analyze` against an existing `--db` resumes the run: `Complete` nodes are skipped, `Started` nodes are re-analyzed, and `Error` nodes are retried after their cause is addressed. The recorded source identity (URI + digest) and configuration MUST match the request or the tool exits with code 3.
+8. If limits stop expansion, the run finishes with an incomplete graph: exit code 5 is returned, and every non-`Complete` node remains queryable (§14).
 
 ## 8. Ecosystem Analyzers
 
 ### 8.1 Rust/Cargo (primary)
 
-- Use `cargo_metadata` (`cargo metadata --format-version 1`) as the primary source; it handles workspace inheritance, target-specific dependencies, features, and resolved versions.
-- Use `toml_edit` for span-preserving parsing when `cargo` is unavailable or offline; this is a fallback, not the primary path.
-- Parse `[target.'cfg(...)'.dependencies]`, optional dependencies, and feature syntax (`dep:foo`, `foo?/bar`).
+- Use `cargo_metadata` (`cargo metadata --format-version 1`) as the primary source; it handles workspace inheritance, target-specific dependencies, features, and resolved versions. It runs **in the sandbox with network access to the crates.io allowlist enabled by default** (§10), so the registry index can be fetched and updated. `toml_edit` is a fallback for offline runs (`--offline`); offline analyses produce declared-but-unresolved edges, record `network_mode = "offline"` in metadata, and carry reduced-confidence evidence.
+- Use unfiltered `cargo metadata` (no `--filter-platform`) as the primary source so predicates for all targets are recorded. `cargo metadata --filter-platform <triple>` MAY be used in the Validation strategy to cross-check target-specific evaluation.
+- Parse `[target.'cfg(...)'.dependencies]` (stored as `cfg` atoms, §4.1), optional dependencies, and feature syntax (`dep:foo`, `foo?/bar`) via `FeatureExpr`.
 - Analyze `build.rs` for `cc`, `cxx`, `bindgen`, `pkg-config`, `cmake`, and `meson` usage, and for `cargo:` directives and the `links` key.
-- Fetch registry crates as `.crate` tarballs; fetch git dependencies with `gix`; read path dependencies from disk.
+- Fetch registry crates as `.crate` tarballs (checksum-verified, §7.2); fetch git dependencies with `gix` (in `spawn_blocking`); read path dependencies from disk.
+- **Path containment**: path dependencies MUST resolve only within the fetched source tree. A path dependency that escapes the analysis root (for example `path = "../../outside"`) MUST be rejected and recorded as an error on that node; the sandbox's read-only source mount enforces the same rule at execution time.
 - Record both the declared requirement and the resolved version.
 
 ### 8.2 C/C++/assembly within Rust projects
 
-- Parse `build.rs`, `CMakeLists.txt`, `meson.build`, `configure.ac`, and `Makefile` for `find_package`, `pkg_check_modules`, `PKG_CHECK_MODULES`, `AC_CHECK_LIB`, `dependency()`, `target_link_libraries`, and `-l` flags.
+- Parse `build.rs`, `CMakeLists.txt`, `meson.build`, `configure.ac`, and `Makefile` for `find_package`, `pkg_check_modules`, `PKG_CHECK_MODULES`, `AC_CHECK_LIB`, `dependency()`, `target_link_libraries`, and `-l` flags. These build systems are strategies inside the `cpp` analyzer (§7.3).
 - Scan `#include <...>` directives for system headers.
 - Use `pkg-config` (the crate or the tool in the sandbox) to resolve module names.
 - Record system dependencies as unresolved requirements (pkg-config module, header, soname) for Phase 2 mapping.
@@ -347,8 +431,9 @@ Python, Go, and Node analyzers are out of scope for v1 but MUST fit the same `Pr
 Phase 1 is a **graph expansion** problem, not a global version-solving problem.
 
 - Concrete versions come from ecosystem-native resolution: `cargo metadata` and `Cargo.lock` for Rust; declared requirements for system dependencies.
-- robigus MUST NOT invent a cross-ecosystem version solution in Phase 1.
-- The existing `solver.rs` traits (`DependencyProvider`, `ConflictPolicy`) remain the provider seam, but `ModularSolver` MUST be reframed as a graph expander. The current greedy work-queue sketch is not a resolver: it never populates `ResolvedNode.dependencies`, performs no backtracking, and does not unify features. It MUST be replaced before use.
+- For Cargo nodes, robigus MUST delegate resolution and **feature unification** to cargo itself (resolver v2, via `cargo metadata`) and record the unified result. robigus MUST NOT re-implement Cargo's resolver or feature-unification semantics. Offline fallback edges are declared-but-unresolved.
+- **Feature provenance**: because edges carry predicates with package-qualified feature atoms (§4.1), robigus MUST be able to answer "which root feature activations cause this node/requirement to be present" by walking reverse edges and evaluating predicates. The CLI exposes this as `print --why` (§14).
+- The existing `solver.rs` traits (`DependencyProvider`, `ConflictPolicy`) remain the Phase 2 provider seam, but `ModularSolver` MUST be reframed as a graph expander or deleted. The current greedy work-queue sketch is not a resolver: it never populates `ResolvedNode.dependencies`, performs no backtracking, and does not unify features. It MUST NOT ship in v1 in its current form. If `ConflictPolicy` is retained for Phase 2, fix its pre-1.0 handling: keying Rust side-by-side domains by major version alone wrongly merges `0.1` and `0.2`, which Cargo treats as incompatible; key pre-1.0 by `major.minor`.
 - Phase 2/3 MAY use a CDCL solver (`pubgrub` or `resolvo`) to select Ubuntu packages and acceptable version adjustments, with human-readable conflict explanations.
 
 ## 10. Sandboxed Analysis
@@ -359,6 +444,7 @@ Fetched sources are untrusted. All analysis that executes project code MUST run 
 
 - Malicious or compromised upstream source code, build scripts, `configure` scripts, and tests.
 - Network exfiltration or fetching of unexpected content.
+- Prompt injection through untrusted content fed to LLM sub-agents (§7.6, §17).
 - Resource exhaustion (CPU, memory, disk, process count).
 - Writes to the host filesystem or access to host secrets.
 
@@ -366,20 +452,24 @@ Fetched sources are untrusted. All analysis that executes project code MUST run 
 
 - Run as an unprivileged user in isolated namespaces (mount, PID, network, user).
 - Prefer `bubblewrap` (`bwrap`) when available; otherwise use Landlock plus seccomp and namespaces via the `landlock` and `nix` crates.
-- Mount the source tree read-only; provide a writable tmpfs for build output.
+- `--sandbox <mode>` accepts `auto` (default: `bwrap` if available, else native), `bwrap`, or `native`. There is **no** `none` mode.
+- **Fail closed**: if no sandbox can be established — for example unprivileged user namespaces blocked by AppArmor on stock Ubuntu, `bwrap` missing, or seccomp/namespace setup failure — the tool MUST exit with code 4, print `no sandbox available`, and include a detailed diagnostic listing every mechanism attempted and why each failed. (Operator guidance, not a tool mode: run robigus where namespaces are permitted, such as a configured CI runner.)
+- Mount the source tree read-only; provide writable tmpfs for build output and a writable `CARGO_HOME` inside the sandbox (required by `cargo metadata`).
 - Do not expose the host home directory, SSH agent, environment secrets, or package manager credentials.
-- Network is disabled by default. When enabled, restrict to an allowlist (crates.io, the Ubuntu archive) and log all requests.
-- Enforce wall-clock timeouts and cgroup v2 limits (memory, pids, CPU).
-- Capture stdout and stderr and record the exact commands, environment, and tool versions for reproducibility.
+- Network egress is restricted to the allowlist by default; `--offline` disables all egress, and configuration may narrow the allowlist further. Unrestricted, unproxied egress is never available.
+- When egress is enabled, it MUST be mediated by an allowlisting forward proxy started by robigus and exposed to the sandbox (proxy environment variables), with direct egress blocked by the network namespace. The proxy validates CONNECT/SNI host names against the allowlist and logs every request.
+- Default allowlist: `crates.io` subdomains (registry index and static/CDN hosts), `ubuntu.com` subdomains (archive, security, ports, changelogs), `github.com` subdomains (including codeload and release assets), `gitlab.com` subdomains, and `codeberg.org` subdomains. A configuration file or CLI parameter may add other hosts or remove defaults.
+- Enforce wall-clock timeouts and cgroup v2 limits (memory, pids, CPU) when cgroup delegation is available; when it is not, fall back to timeouts and process limits and record that fact in metadata.
+- Capture stdout and stderr and record the exact commands, environment (scrubbed), and tool versions for reproducibility (§11 `tool_invocation`).
 - If a sandbox cannot be established, analysis MUST fail closed rather than run unsandboxed.
 
 ## 11. Dependency Graph Persistence
 
-The SQLite file is the **source of truth** for a dependency graph for a given target project and version. One database is created per analysis.
+The SQLite file is the **source of truth** for one analysis of one target project and version. **One database is created per analysis**; re-running `analyze` against an existing database resumes that analysis (§7.7). Because there is exactly one analysis per database, the schema carries no `analysis_id` foreign keys.
 
 ### 11.1 Configuration
 
-Use `rusqlite` with the `bundled` feature. Apply:
+Use `rusqlite` with the `bundled` feature, driven through `tokio-rusqlite` (which wraps calls in `spawn_blocking`). Schema migrations use the **`rusqlite_migration`** crate with `PRAGMA user_version`; there is no `schema_version` table. Apply:
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -389,100 +479,152 @@ PRAGMA foreign_keys = ON;
 PRAGMA temp_store = MEMORY;
 ```
 
-Use integer primary keys and indexed lookups so queries run in microseconds without loading the whole graph into RAM. Wrap all `rusqlite` calls in `spawn_blocking` (or use `tokio-rusqlite`).
+WAL mode also allows `check`, `print`, and `export` to read a database while an analysis is writing it.
 
-### 11.2 Schema
+### 11.2 Schema (v1, `user_version = 1`)
 
 ```sql
-CREATE TABLE schema_version (
-    version INTEGER NOT NULL
-);
-
-CREATE TABLE analysis (
-    id               INTEGER PRIMARY KEY,
-    project_name     TEXT    NOT NULL,
-    project_version  TEXT    NOT NULL,
-    source_kind      TEXT    NOT NULL,
-    source_uri       TEXT    NOT NULL,
-    source_digest    TEXT    NOT NULL DEFAULT '',
-    analyzer_version TEXT    NOT NULL,
-    created_at       TEXT    NOT NULL,
-    UNIQUE (project_name, project_version, source_kind, source_uri, source_digest)
+CREATE TABLE metadata (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    robigus_version TEXT NOT NULL,
+    project_name    TEXT NOT NULL,
+    project_version TEXT NOT NULL,
+    source_kind     TEXT NOT NULL,
+    source_uri      TEXT NOT NULL,
+    source_digest   TEXT NOT NULL DEFAULT '',
+    configuration   TEXT NOT NULL,  -- JSON: primary Configuration used for analysis
+    toolchain       TEXT NOT NULL,  -- JSON: tool name -> version (cargo, rustc, pkg-config, cc, ...)
+    network_mode    TEXT NOT NULL,  -- 'allowlist' | 'offline'
+    sandbox_mode    TEXT NOT NULL,  -- 'bwrap' | 'native'
+    options         TEXT NOT NULL,  -- JSON: AnalysisOptions as applied
+    created_at      TEXT NOT NULL,  -- RFC 3339, UTC
+    updated_at      TEXT NOT NULL   -- RFC 3339, UTC
 );
 
 CREATE TABLE package (
-    id          INTEGER PRIMARY KEY,
-    analysis_id INTEGER NOT NULL REFERENCES analysis(id) ON DELETE CASCADE,
-    name        TEXT    NOT NULL,
-    version     TEXT    NOT NULL,
-    ecosystem   TEXT    NOT NULL,
-    source_kind TEXT    NOT NULL,
-    source_uri  TEXT    NOT NULL DEFAULT '',
-    is_root     INTEGER NOT NULL DEFAULT 0,
-    UNIQUE (analysis_id, name, version, ecosystem, source_kind, source_uri)
+    id              INTEGER PRIMARY KEY,
+    name            TEXT NOT NULL,
+    version         TEXT NOT NULL,
+    ecosystem       TEXT NOT NULL,
+    source_kind     TEXT NOT NULL,
+    source_uri      TEXT NOT NULL DEFAULT '',
+    source_precise  TEXT NOT NULL DEFAULT '',  -- git rev / digest; part of identity
+    is_root         INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'Not_Started',
+    active_features TEXT NOT NULL DEFAULT '[]', -- JSON array of unified feature names
+    path            TEXT NOT NULL DEFAULT ''    -- workspace-relative source dir; '' if none
 );
+CREATE UNIQUE INDEX idx_package_identity ON package
+    (name, version, ecosystem, source_kind, source_uri, source_precise);
+CREATE INDEX idx_package_name   ON package (name);
+CREATE INDEX idx_package_status ON package (status);
 
 CREATE TABLE dependency_edge (
-    id              INTEGER PRIMARY KEY,
-    analysis_id     INTEGER NOT NULL REFERENCES analysis(id) ON DELETE CASCADE,
-    from_package_id INTEGER NOT NULL REFERENCES package(id) ON DELETE CASCADE,
-    to_package_id   INTEGER REFERENCES package(id) ON DELETE SET NULL,
-    requirement     TEXT    NOT NULL,
-    version_req     TEXT,
-    kind            TEXT    NOT NULL,
-    predicate       TEXT    NOT NULL,
-    confidence      INTEGER NOT NULL,
-    evidence        TEXT    NOT NULL
+    id               INTEGER PRIMARY KEY,
+    from_package_id  INTEGER NOT NULL REFERENCES package(id) ON DELETE CASCADE,
+    to_package_id    INTEGER REFERENCES package(id) ON DELETE SET NULL,
+    requirement      TEXT NOT NULL,
+    requirement_kind TEXT NOT NULL,   -- 'crate' | 'pkg_config' | 'header' | 'soname' | 'tool' | 'generic'
+    version_req      TEXT NOT NULL DEFAULT '',
+    kinds            TEXT NOT NULL,   -- JSON array of DependencyKind (a set)
+    predicate        TEXT NOT NULL,   -- canonical serialization of the Predicate AST
+    confidence       INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+    evidence         TEXT NOT NULL    -- JSON array of Evidence
 );
+CREATE UNIQUE INDEX idx_edge_resolved ON dependency_edge
+    (from_package_id, to_package_id, requirement, requirement_kind, version_req, predicate)
+    WHERE to_package_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_edge_unresolved ON dependency_edge
+    (from_package_id, requirement, requirement_kind, version_req, predicate)
+    WHERE to_package_id IS NULL;
+CREATE INDEX idx_edge_from           ON dependency_edge (from_package_id);
+CREATE INDEX idx_edge_to             ON dependency_edge (to_package_id);
+CREATE INDEX idx_edge_requirement_kk ON dependency_edge (requirement_kind);
 
 CREATE TABLE package_target (
     id         INTEGER PRIMARY KEY,
     package_id INTEGER NOT NULL REFERENCES package(id) ON DELETE CASCADE,
-    name       TEXT    NOT NULL,
-    kind       TEXT    NOT NULL,
-    path       TEXT,
-    soname     TEXT
+    name       TEXT NOT NULL,
+    kind       TEXT NOT NULL,              -- full serialized TargetKind (includes soname for shared libraries)
+    soname     TEXT NOT NULL DEFAULT ''    -- denormalized for soname lookups (Phase 2)
 );
+CREATE UNIQUE INDEX idx_target_unique ON package_target (package_id, name, kind, soname);
+CREATE INDEX idx_target_name ON package_target (name);
 
 CREATE TABLE package_provides (
     id         INTEGER PRIMARY KEY,
     package_id INTEGER NOT NULL REFERENCES package(id) ON DELETE CASCADE,
-    name       TEXT    NOT NULL,
-    version    TEXT
+    name       TEXT NOT NULL,
+    version    TEXT NOT NULL DEFAULT ''
 );
+CREATE UNIQUE INDEX idx_provides_unique ON package_provides (package_id, name, version);
+CREATE INDEX idx_provides_name ON package_provides (name);
+
+CREATE TABLE package_conflicts (
+    id          INTEGER PRIMARY KEY,
+    package_id  INTEGER NOT NULL REFERENCES package(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    version_req TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX idx_conflicts_unique ON package_conflicts (package_id, name, version_req);
 
 CREATE TABLE analysis_plan (
-    id          INTEGER PRIMARY KEY,
-    analysis_id INTEGER NOT NULL REFERENCES analysis(id) ON DELETE CASCADE,
-    package_id  INTEGER NOT NULL REFERENCES package(id) ON DELETE CASCADE,
-    analyzer    TEXT    NOT NULL,
-    strategy    TEXT    NOT NULL,
-    status      TEXT    NOT NULL,
-    detail      TEXT
+    id         INTEGER PRIMARY KEY,
+    package_id INTEGER NOT NULL REFERENCES package(id) ON DELETE CASCADE,
+    analyzer   TEXT NOT NULL,
+    strategy   TEXT NOT NULL,
+    status     TEXT NOT NULL,   -- 'Pending' | 'Running' | 'Complete' | 'Failed' | 'Skipped'
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    error      TEXT,
+    detail     TEXT,
+    updated_at TEXT NOT NULL
 );
+CREATE UNIQUE INDEX idx_plan_unique  ON analysis_plan (package_id, analyzer, strategy);
+CREATE INDEX idx_plan_status         ON analysis_plan (status);
 
-CREATE INDEX idx_package_name  ON package (analysis_id, name);
-CREATE INDEX idx_edge_from     ON dependency_edge (from_package_id);
-CREATE INDEX idx_edge_to       ON dependency_edge (to_package_id);
-CREATE INDEX idx_edge_kind     ON dependency_edge (analysis_id, kind);
-CREATE INDEX idx_target_name   ON package_target (name);
-CREATE INDEX idx_provides_name ON package_provides (name);
+CREATE TABLE tool_invocation (
+    id           INTEGER PRIMARY KEY,
+    package_id   INTEGER REFERENCES package(id) ON DELETE SET NULL,
+    tool         TEXT NOT NULL,     -- e.g. 'cargo metadata'; LLM sub-agent calls use 'llm-sub-agent'
+    argv         TEXT NOT NULL,     -- JSON array; secrets scrubbed
+    env          TEXT NOT NULL,     -- JSON object; secrets scrubbed
+    tool_version TEXT,
+    sandbox_mode TEXT NOT NULL,
+    exit_status  TEXT NOT NULL,
+    started_at   TEXT NOT NULL,
+    duration_ms  INTEGER NOT NULL,
+    log_path     TEXT               -- workspace-relative path to full stdout/stderr
+);
+CREATE INDEX idx_invocation_package ON tool_invocation (package_id);
 ```
+
+Schema conventions:
+
+- JSON columns (`configuration`, `toolchain`, `options`, `kinds`, `predicate`, `evidence`, `active_features`) are serde-serialized model types; the store MUST validate them on load, and a parse error is an integrity failure.
+- Nullable TEXT columns that participate in unique indexes (`path`, `soname`, `version`, `version_req`) are stored as `''` when absent so uniqueness holds (SQLite treats NULLs as distinct in unique indexes).
+- The two partial unique indexes on `dependency_edge` make re-runs idempotent upserts and prevent duplicate edges on resume.
 
 ### 11.3 Migrations and integrity
 
-- Schema changes MUST be versioned and applied through migrations (`rusqlite`'s `Migration` feature).
-- `tsp-analyzer check` MUST verify the schema version, foreign keys, and graph invariants (no dangling edges, no duplicate package identities, acyclic root reachability where expected).
-- Import and export MUST round-trip without loss.
+- Schema changes MUST be versioned and applied through `rusqlite_migration` using `PRAGMA user_version`; migrations are forward-only. Opening a database with a **newer** schema version MUST fail with exit code 3.
+- `tsp-analyzer check` MUST verify:
+  - the schema version;
+  - `PRAGMA foreign_key_check`;
+  - no duplicate package identities (enforced by unique index, re-verified);
+  - every `predicate`, `kinds`, `evidence`, `active_features` JSON value parses into its model type;
+  - confidence values are within `0..=100` and within tier caps (in particular `LlmSubAgent` ≤ L3);
+  - status invariants: a `Complete` node's targeted dependencies are `Complete`; `Started`/`Error` nodes have at least one plan row and `Error` nodes have a recorded error;
+  - informational findings: unresolved requirements grouped by `requirement_kind`, cycles (SCCs with more than one node), and orphan nodes (no incoming edges and not a root).
+- JSON export MUST be lossless with respect to the graph model (everything needed to reconstruct the `Analysis`); DOT export is a lossy visualization. A lossless `import` is future work.
 
 ## 12. Ubuntu Archive Mapping (Phase 2)
 
 Phase 2 uses `rapt` to determine which dependencies can be satisfied from the Ubuntu archive.
 
 - Query package existence, versions, provides, and dependencies through `rapt`'s `ArchiveClient` and `RaptQuery`.
-- Extend `rapt` (or a companion index) to consume `Contents-<arch>.gz` indices for file-path to package mapping.
-- Mapping rules:
-  - Rust crates to `librust-<name>-<version>-dev` (with `+<feature>` suffixes).
+- `rapt` will be extended — in the `rapt` crate — with structured query APIs (its current `showpkg`/`depends` return human-readable strings) and with `Contents-<arch>.gz` index support for file-path-to-package mapping. These `rapt` features are not needed for Phase 1.
+- Mapping rules (per the Debian Rust packaging policy, https://wiki.debian.org/Teams/RustPackaging/Policy):
+  - Rust crates map to source package `rust-<crate>` with binary packages `librust-<crate>-dev` and feature variants `librust-<crate>+<feature>-dev`. The crate version is carried in the package **version**, not the package name.
   - pkg-config modules to `-dev` packages via `.pc` paths.
   - Headers to `-dev` packages via Contents.
   - Sonames to runtime library packages via Contents.
@@ -492,9 +634,11 @@ Phase 2 uses `rapt` to determine which dependencies can be satisfied from the Ub
 
 ## 13. Packaging Plan (Phase 3)
 
-For each dependency classified as `Missing`, generate a packaging template with `ubucargo`. The plan:
+For each dependency classified as `Missing`, generate a packaging template with `ubucargo`. `ubucargo` is published on crates.io (`canonical/ubucargo`) under GPL-3.0-or-later, which is compatible with robigus's GPL-3.0-only. It currently ships as a binary crate with no library target; Phase 3 integration MUST either invoke it as a subprocess or add/require a library target.
 
-1. orders packages topologically so dependencies are packaged first;
+The plan:
+
+1. orders packages so dependencies are packaged first, computed over the **SCC condensation** of the graph (dev/build dependency cycles are legal and must not break the sort);
 2. records the classification and rationale for each dependency;
 3. records the generated template location;
 4. is persisted in SQLite and exportable as JSON.
@@ -506,36 +650,67 @@ For each dependency classified as `Missing`, generate a packaging template with 
 | Command | Purpose |
 |---|---|
 | `fetch <SOURCE>` | Acquire and verify a source; print the local path and digest. |
-| `analyze <SOURCE> --db <PATH>` | Fetch (if needed), analyze, and persist the graph. |
-| `check <DB>` | Validate schema and graph well-formedness. |
-| `print <DB>` | Pretty-print the graph (filters: `--kind`, `--arch`, `--feature`, `--depth`). |
-| `export <DB> --format json\|dot` | Export the graph for other tools. |
+| `analyze <SOURCE>` | Fetch (if needed), analyze, and persist. Requires the global `--db`. If the database already exists, the analysis is **resumed**; the recorded source identity and configuration MUST match (§7.7). |
+| `check <DB>` | Validate schema and graph well-formedness (§11.3). |
+| `print <DB>` | Pretty-print the graph. Filters: `--kind`, `--arch`, `--platform`, `--feature`, `--build-profile`, `--series`, `--env`, `--depth`, `--status`, and `--why <PKG\|REQUIREMENT>` (feature/requirement provenance, §9). Filters evaluate predicates against the recorded configuration unless `--config` overrides it. |
+| `export <DB> --format json\|dot` | Export the graph. JSON is lossless; DOT is a lossy visualization. |
 | `version` | Print the tool version. |
 
-Loading is exposed through the library (`Store::open`) and used by `check`, `print`, and `export`. A future `diff <DB_A> <DB_B>` command may compare analyses.
+Global options: `--db <PATH>` (required for commands that read or write a database; the per-command `--db` form is retired), `--format`, `--offline`, `--sandbox <auto|bwrap|native>`, `--jobs`, `--verbose`, `--config <PATH>`, `--cache <PATH>`.
 
-Global options: `--db`, `--format`, `--offline`, `--sandbox <mode>`, `--jobs`, `--verbose`, `--config`.
-
-Exit codes: `0` success, `1` analysis failure, `2` usage error, `3` database or schema error, `4` sandbox unavailable.
+Exit codes: `0` success, `1` analysis failure, `2` usage error, `3` database or schema error (including resume identity mismatch and newer schema version), `4` sandbox unavailable, `5` analysis finished with an incomplete graph (limits or node errors).
 
 ## 15. Library API
 
 ```rust
 pub async fn analyze(input: SourceInput, options: AnalysisOptions) -> Result<Analysis>;
 
-pub struct Store;
-impl Store {
-    pub fn open(path: &Path) -> Result<Self>;
-    pub fn save(&self, analysis: &Analysis) -> Result<()>;
-    pub fn load(&self, id: AnalysisId) -> Result<Analysis>;
-    pub fn check(&self) -> Result<IntegrityReport>;
+pub struct Analysis {
+    pub metadata: AnalysisMetadata,
+    pub graph: DependencyGraph,
 }
 
-pub trait ProjectAnalyzer { /* ... */ }
-pub trait DependencyProvider { /* ... */ }
-pub trait Sandbox { /* ... */ }
+pub enum SourceInput {
+    Git { url: Url, reference: GitReference },
+    Tarball { url: Url, digest: Option<String> },
+    Path { path: PathBuf },
+}
+
+pub struct AnalysisOptions {
+    pub configuration: Configuration,   // primary arch/platform/features/profiles/env/series
+    pub network: NetworkPolicy,         // Allowlist(default) | Custom(Vec<Host>) | Offline
+    pub sandbox: SandboxPreference,     // Auto | Bwrap | Native
+    pub limits: Limits,                 // depth, node count, wall clock
+}
+
+pub struct Store { /* tokio-rusqlite connection handle */ }
+impl Store {
+    pub async fn open(path: &Path) -> Result<Self>;               // create/open + migrate
+    pub async fn metadata(&self) -> Result<AnalysisMetadata>;
+    pub async fn upsert_node(&self, node: &Node) -> Result<()>;
+    pub async fn upsert_edges(&self, from: &PackageId, edges: &[Edge]) -> Result<()>;
+    pub async fn update_status(&self, package: &PackageId, status: AnalysisStatus) -> Result<()>;
+    pub async fn record_invocation(&self, invocation: &ToolInvocation) -> Result<()>;
+    pub async fn load(&self) -> Result<Analysis>;
+    pub async fn check(&self) -> Result<IntegrityReport>;
+}
+
+pub trait ProjectAnalyzer: Send + Sync { /* id, detect (sync), analyze (async) */ }
+pub trait DependencyProvider: Send + Sync { /* Phase 2 seam */ }
+
+#[async_trait]
+pub trait Sandbox: Send + Sync {
+    fn mode(&self) -> SandboxMode;   // Bwrap | Native
+    async fn run(&self, command: &CommandSpec) -> Result<ProcessOutput, SandboxError>;
+}
+pub fn establish_sandbox(preference: SandboxPreference)
+    -> Result<Box<dyn Sandbox>, SandboxUnavailable>;
 ```
 
+- All public APIs are `async` except `ProjectAnalyzer::detect`, which is synchronous by design (§7.5).
+- `Store` methods are asynchronous and serialized through the `tokio-rusqlite` handle; callers never touch `rusqlite` directly on an async thread.
+- `SandboxUnavailable` implements `std::error::Error` and a `miette` diagnostic, and carries every attempted mechanism with its OS-level cause (drives exit code 4).
+- `IntegrityReport` exposes the §11.3 findings as typed fields (schema version, foreign-key result, duplicate identities, invalid JSON columns, status violations, confidence-cap violations, unresolved-requirement counts, cycles, orphans).
 - Public types MUST implement `Debug`; errors MUST implement `std::error::Error` via `thiserror`.
 - Library code MUST NOT panic on malformed input.
 - The CLI MUST use `miette` for user-facing diagnostics.
@@ -543,35 +718,43 @@ pub trait Sandbox { /* ... */ }
 ## 16. Testing Strategy
 
 - **Unit tests** alongside modules (`#[cfg(test)]`).
-- **Fixtures**: small synthetic projects under `tests/fixtures/` for each analyzer and build system (Cargo features, target-specific dependencies, `build.rs` with `cc`, workspaces, git and path dependencies, mixed C).
-- **Snapshot tests** with `insta` for analyzer output and CLI output.
-- **Property tests** with `proptest` for predicate normalization (CNF equivalence, De Morgan) and `dpkg` version comparison.
-- **Fuzzing** with `cargo-fuzz` for the predicate parser and `dpkg` comparator.
+- **Fixtures**: small synthetic projects under `tests/fixtures/` for each analyzer and build system (Cargo features, target-specific dependencies, `build.rs` with `cc`, workspaces, git and path dependencies, mixed C), plus fixtures for path-dependency escape attempts and vendored crates.
+- **Snapshot tests** with `insta` for analyzer output and CLI output; snapshots MUST redact absolute paths, timestamps, and environment-dependent versions.
+- **Property tests** with `proptest` for predicate canonicalization (idempotence, De Morgan, commutativity/associativity) and `dpkg` version comparison.
+- **Fuzzing** with `cargo-fuzz` for the predicate parser and `dpkg` comparator; fuzz jobs run on nightly CI, separate from the stable gate.
 - **Differential testing** of `dpkg.rs` against `dpkg --compare-versions` on an Ubuntu CI runner.
+- **Store tests**: migration tests (open an older-version database → migrate; open a newer-version database → exit 3), round-trip save/load tests, and idempotent re-run (upsert) tests.
+- **Resume tests**: interrupt an analysis mid-run, resume against the same database, and assert per-node status transitions including the `Complete` precondition.
+- **Limit tests**: depth and node limits leave an incomplete graph, exit code 5, and queryable non-`Complete` nodes.
+- **Extraction-hardening tests**: absolute paths, `..` traversal, escaping symlinks, device nodes, setuid/setgid entries, and decompression bombs are all rejected.
+- **Containment tests**: a path dependency escaping the analysis root is rejected.
 - **Integration tests** with `assert_cmd`, `predicates`, and `tempfile`.
 - **HTTP mocking** with `wiremock` for registry and archive interactions.
-- **Sandbox tests** verifying that analysis cannot reach the network or write outside its workspace.
-- **CI** MUST run `cargo fmt -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo doc --locked --no-deps --all-features`, `cargo test --locked --all-targets --all-features`, and `cargo audit`.
+- **Sandbox tests** verifying that analysis cannot reach non-allowlisted hosts or write outside its workspace.
+- **CI** MUST run `cargo fmt -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo doc --locked --no-deps --all-features`, `cargo test --locked --all-targets --all-features`, `cargo audit`, `cargo deny` (licenses and advisories), and an MSRV job pinned to 1.85; CI MUST trigger on pushes as well as pull requests.
 
 ## 17. Security
 
 - Treat all fetched sources as untrusted; sandbox all execution (§10).
 - Never execute build scripts outside the sandbox.
 - Validate archive extraction (§7.2).
-- Do not log secrets; scrub environment variables from sandbox logs.
+- Do not log secrets; scrub environment variables from sandbox logs and `tool_invocation` records.
+- LLM sub-agents: run sandboxed; never include host secrets or credentials in prompt context; treat their output as untrusted and require anchor verification (§7.6) before it becomes evidence; record their interactions in `tool_invocation` for audit.
 - Record provenance for every discovered edge so results can be audited.
+- Provide a robigus-specific `SECURITY.md` with its own reporting path (the current workspace `SECURITY.md` points at the `rapt` repository).
 - Report vulnerabilities per `SECURITY.md`.
 
 ## 18. Coding Standards
 
 - Follow idiomatic Rust as defined in `../rust-instructions.md`.
 - Edition 2024; MSRV 1.85.
-- License: GPL-3.0-only (matching `rapt`).
-- Include `description`, `license`, `repository`, `keywords`, and `categories` in `Cargo.toml`.
-- Use `thiserror` for library errors and `miette` for CLI diagnostics.
+- License: GPL-3.0-only (matching `rapt`; `ubucargo` is GPL-3.0-or-later and compatible).
+- Include `description`, `license`, `repository`, `keywords`, `categories`, and `rust-version = "1.85"` in `robigus/Cargo.toml` (an M1 checklist item; the manifest currently lacks them).
+- Use `thiserror` for library errors and `miette` for CLI diagnostics; `DpkgVersion::parse` and every parser MUST return typed errors, never `String`.
 - Use `tracing` for structured logging; never use `println!` for diagnostics in library code.
 - Avoid `unwrap` and `expect` in library code; return `Result`.
 - Use `spawn_blocking` for blocking I/O and CPU-bound work.
+- `#![forbid(unsafe_code)]` at the crate root, with narrowly scoped `#[allow(unsafe_code)]` only inside `sandbox.rs` where `nix`/`landlock` require it.
 - Document all public APIs with rustdoc and examples.
 
 ## 19. Folder Structure
@@ -579,21 +762,21 @@ pub trait Sandbox { /* ... */ }
 ```
 /src
   lib.rs
-  model.rs          # core types
-  predicate.rs      # predicate AST, parser, normalization, evaluation
+  main.rs           # `tsp-analyzer` binary ([[bin]] name = "tsp-analyzer")
+  model.rs          # core types (Node, Edge, Requirement, AnalysisStatus, …)
+  predicate.rs      # predicate AST, parser, canonicalization, evaluation
+  feature.rs        # FeatureExpr: Cargo feature syntax (dep:foo, foo?/bar)
   fetch.rs          # acquisition, verification, safe extraction
   detect.rs         # project detection and ProjectTree
   sandbox.rs        # sandbox abstraction and implementations
   analyzers/
     mod.rs
     cargo.rs        # Rust/Cargo
-    cpp.rs          # C/C++/assembly
-  resolve.rs        # graph expansion, deduplication, cycles
+    cpp.rs          # C/C++/assembly; CMake/Meson/Autotools/Make strategies
+  expand.rs         # graph expansion, dedup, SCC, resume, limits
   store.rs          # SQLite persistence, migrations, integrity
-  mapping/          # Phase 2: Ubuntu archive mapping
-  plan/             # Phase 3: packaging plan
-  bin/
-    tsp-analyzer.rs
+  mapping/          # Phase 2 (stub in v1)
+  plan/             # Phase 3 (stub in v1)
 /tests
   fixtures/
   integration tests
@@ -609,8 +792,29 @@ You are a Debian packaging expert with deep knowledge of `debian/control`, build
 
 ## 21. Milestones
 
-1. **M1 — Foundations**: predicate AST and parser, model extensions, SQLite store with migrations, CLI skeleton, `check` and `print`.
-2. **M2 — Rust analysis**: Cargo analyzer, transitive expansion, evidence and confidence, fixtures and snapshots.
-3. **M3 — C/C++ and sandbox**: build-script and C/C++ analyzer, sandbox implementation, build-observation strategy.
-4. **M4 — Ubuntu mapping**: `rapt` integration, Contents indices, classification.
-5. **M5 — Packaging plan**: `ubucargo` integration, topological plan generation.
+1. **M1 — Foundations**: predicate AST and parser (including `cfg` atoms), model extensions (§5.4: kind sets, `Runtime`, `Evidence`, `FeatureExpr`, `DependencyGraph`, `AnalysisStatus`, `SourceKind::Tarball`, dpkg unification with the `Eq`/`Ord` fix), SQLite store with `rusqlite_migration`, sandbox abstraction with fail-closed establishment, CLI skeleton, `check`, `print`, `export`; `robigus/Cargo.toml` metadata and a robigus `SECURITY.md`.
+2. **M2 — Rust analysis**: Cargo analyzer (sandboxed `cargo metadata` with allowlisted network, unfiltered so predicates are recorded for all targets), transitive expansion with per-node status and resume, evidence and confidence merge, fixtures and snapshots.
+3. **M3 — C/C++ and assisted analysis**: `cpp` analyzer (CMake/Meson/Autotools/Make strategies), sandboxed build-observation strategy, LLM sub-agent integration with anchor verification and the L3 confidence cap.
+4. **M4 — Ubuntu mapping** (Phase 2, **not in v1**): `rapt` integration, structured `rapt` query APIs, Contents indices, classification.
+5. **M5 — Packaging plan** (Phase 3, **not in v1**): `ubucargo` integration (subprocess or library target), SCC-condensed plan generation.
+
+## 22. Recorded Decisions
+
+Decisions binding on this specification:
+
+1. v1 = M1–M3 only: TSP analysis, dependency graph discovery and expansion, persistence. M4/M5 are Phase 2/3.
+2. Default network posture: crates.io access is allowed by default so `cargo metadata` can pull and update registry data; `--offline` disables egress. `toml_edit` remains the offline fallback.
+3. Features follow Cargo's model; feature dependencies are mapped throughout the full graph, and the source of a feature-driven requirement is traceable via qualified feature predicates and `print --why`.
+4. Cargo `cfg()` conditions are represented by a general `cfg("key" = "value")` atom, stored verbatim (no lossy mapping).
+5. `kind` is a set per edge; no separate linkage attribute — `Depends` vs `Build-Depends` is decided in Phase 2/3 from the kind set plus the provider node's targets.
+6. One SQLite database per analysis.
+7. Predicates are persisted AST-only with query-time evaluation; no persisted CNF/DNF.
+8. Sandboxing is mandatory and fails closed; there is no "none" mode. Failures exit 4 with detailed diagnostics of what was attempted.
+9. Default network allowlist: crates.io, ubuntu.com, github.com, gitlab.com, codeberg.org (with subdomains); extendable/restrictable via configuration file or CLI.
+10. LLM sub-agents are in v1: sandboxed, opt-in, anchor-verified (line-level and AST anchors verified by the orchestrator), subject to the no-code-reproduction constraint, and capped at confidence tier L3.
+11. Per-node `AnalysisStatus` (`Not_Started`, `Started`, `Complete`, `Error`) drives resume; a node is `Complete` only when all of its targeted dependencies are `Complete`.
+12. Ubuntu Rust package naming follows the Debian Rust packaging policy: `rust-<crate>` sources; `librust-<crate>-dev` and `librust-<crate>+<feature>-dev` binaries; version in the package version, not the name.
+13. `rapt` will grow structured query APIs and Contents support in the future; Phase 1 does not depend on them.
+14. `ubucargo` is published (crates.io, `canonical/ubucargo`, GPL-3.0-or-later); it is currently a binary crate, so Phase 3 integrates via subprocess or a future library target.
+15. Migrations use the `rusqlite_migration` crate with `PRAGMA user_version`.
+16. `MachineArch` = `Ubuntu(Architecture)` | `All` | `Unsupported(String)`; `All` expands to the `ubuntu-info-rust` set; unsupported architectures are stubbed (`supported = false`, not expanded); the default analysis set excludes `i386` and includes `amd64v3`.

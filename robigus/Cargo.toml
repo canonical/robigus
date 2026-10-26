@@ -2,6 +2,12 @@
 name = "robigus"
 version = "0.1.0"
 edition = "2024"
+description = "Rust libraries and tools for packaging automation"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/canonical/robigus"
+keywords = "ubuntu, packaging, automation"
+categories = "automation, ubuntu"
+rust-version = "1.93"
 
 [dependencies]
 async-trait = "0.1.92"
