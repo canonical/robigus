@@ -85,6 +85,10 @@ name = "unicode-ident"
 
 [[licenses.exceptions]]
 allow = ["Unicode-3.0"]
+name = "unicode-normalization"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
 name = "writeable"
 
 [[licenses.exceptions]]

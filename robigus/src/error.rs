@@ -64,6 +64,10 @@ pub enum FetchError {
     Extraction(String),
     #[error("source tree walk failed: {0}")]
     Walk(String),
+    #[error("unsupported archive format: {0}")]
+    UnsupportedFormat(String),
+    #[error("registry error: {0}")]
+    Registry(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

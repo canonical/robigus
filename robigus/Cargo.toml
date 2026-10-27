@@ -12,7 +12,10 @@ categories = ["development-tools", "development-tools::build-utils"]
 [dependencies]
 async-trait = "0.1"
 chrono = { workspace = true }
+flate2 = { workspace = true }
+gix = { workspace = true, features = ["blocking-http-transport-reqwest"] }
 petgraph = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 rusqlite = { workspace = true }
 rusqlite_migration = { workspace = true }
 semver = { version = "1", features = ["serde"] }
@@ -20,12 +23,16 @@ serde.workspace = true
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror.workspace = true
+tar = { workspace = true }
 tokio = { workspace = true }
 ubuntu-info-rust = { workspace = true }
 url = { version = "2", features = ["serde"] }
 walkdir = { workspace = true }
+xz2 = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+wiremock = { workspace = true }

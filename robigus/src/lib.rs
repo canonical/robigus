@@ -8,6 +8,7 @@
 pub mod dpkg;
 pub mod error;
 pub mod feature;
+pub mod fetch;
 pub mod model;
 pub mod predicate;
 pub mod solver;
@@ -18,6 +19,9 @@ pub use error::{
     StoreError,
 };
 pub use feature::{FeatureExpr, FeatureExprError};
+pub use fetch::{
+    Cache, ExtractionLimits, FetchedSource, IndexRecord, Provenance, RegistryClient, SourceInput,
+};
 pub use model::{
     AnalysisStatus, ConfidenceTier, Conflict, Dependency, DependencyGraph, DependencyKind, Edge,
     Evidence, EvidenceMethod, MachineArch, Node, PackageId, Provide, Requirement, RequirementKind,
