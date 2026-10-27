@@ -29,6 +29,26 @@ pub enum StoreError {
     SchemaTooNew { found: u32, supported: u32 },
     #[error("stored data failed validation: {0}")]
     Corrupt(String),
+    #[error("invalid analysis status transition from {from} to {to}")]
+    InvalidTransition { from: String, to: String },
+}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for StoreError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Corrupt(error.to_string())
+    }
+}
+
+impl From<PredicateError> for StoreError {
+    fn from(error: PredicateError) -> Self {
+        Self::Corrupt(error.to_string())
+    }
 }
 
 /// Source acquisition failures.

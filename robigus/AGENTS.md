@@ -297,7 +297,7 @@ flowchart TD
 | Rust metadata | `cargo_metadata`, `toml_edit` | 1 |
 | Graph algorithms | `petgraph` | 1 |
 | Core types | `serde`, `thiserror`, `semver`, `url`, `async-trait`, `ubuntu-info-rust` | 1 |
-| SQLite | `rusqlite` (bundled), `tokio-rusqlite`, `rusqlite_migration` | 1 |
+| SQLite | `rusqlite` (bundled), `rusqlite_migration` | 1 |
 | CLI | `clap` | 1 |
 | Logging | `tracing`, `tracing-subscriber` | 1 |
 | Diagnostics | `miette` | 1 |
@@ -469,7 +469,7 @@ The SQLite file is the **source of truth** for one analysis of one target projec
 
 ### 11.1 Configuration
 
-Use `rusqlite` with the `bundled` feature, driven through `tokio-rusqlite` (which wraps calls in `spawn_blocking`). Schema migrations use the **`rusqlite_migration`** crate with `PRAGMA user_version`; there is no `schema_version` table. Apply:
+Use `rusqlite` with the `bundled` feature. All SQLite work runs inside `tokio::task::spawn_blocking` on a shared `Arc<Mutex<rusqlite::Connection>>` — the §11.1 alternative to `tokio-rusqlite`, which is unused because no released version pairs with an MSRV-compatible `rusqlite_migration`. The mutex serializes access; reads (`load`, `check`) run inside deferred transactions so WAL readers see one consistent snapshot while an analysis writes. Schema migrations use the **`rusqlite_migration`** crate with `PRAGMA user_version`; there is no `schema_version` table. Apply:
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -683,7 +683,7 @@ pub struct AnalysisOptions {
     pub limits: Limits,                 // depth, node count, wall clock
 }
 
-pub struct Store { /* tokio-rusqlite connection handle */ }
+pub struct Store { /* rusqlite connection behind a mutex, driven via spawn_blocking */ }
 impl Store {
     pub async fn open(path: &Path) -> Result<Self>;               // create/open + migrate
     pub async fn metadata(&self) -> Result<AnalysisMetadata>;
@@ -708,7 +708,7 @@ pub fn establish_sandbox(preference: SandboxPreference)
 ```
 
 - All public APIs are `async` except `ProjectAnalyzer::detect`, which is synchronous by design (§7.5).
-- `Store` methods are asynchronous and serialized through the `tokio-rusqlite` handle; callers never touch `rusqlite` directly on an async thread.
+- `Store` methods are asynchronous: each operation clones the `Arc<Mutex<rusqlite::Connection>>` handle and runs in `tokio::task::spawn_blocking`; callers never touch `rusqlite` directly on an async thread.
 - `SandboxUnavailable` implements `std::error::Error` and a `miette` diagnostic, and carries every attempted mechanism with its OS-level cause (drives exit code 4).
 - `IntegrityReport` exposes the §11.3 findings as typed fields (schema version, foreign-key result, duplicate identities, invalid JSON columns, status violations, confidence-cap violations, unresolved-requirement counts, cycles, orphans).
 - Public types MUST implement `Debug`; errors MUST implement `std::error::Error` via `thiserror`.
@@ -816,5 +816,5 @@ Decisions binding on this specification:
 12. Ubuntu Rust package naming follows the Debian Rust packaging policy: `rust-<crate>` sources; `librust-<crate>-dev` and `librust-<crate>+<feature>-dev` binaries; version in the package version, not the name.
 13. `rapt` will grow structured query APIs and Contents support in the future; Phase 1 does not depend on them.
 14. `ubucargo` is published (crates.io, `canonical/ubucargo`, GPL-3.0-or-later); it is currently a binary crate, so Phase 3 integrates via subprocess or a future library target.
-15. Migrations use the `rusqlite_migration` crate with `PRAGMA user_version`.
+15. Persistence uses `rusqlite` (bundled) with `rusqlite_migration` on `PRAGMA user_version`; all SQLite work runs in `tokio::task::spawn_blocking` on a shared `Arc<Mutex<rusqlite::Connection>>` (§11.1). `tokio-rusqlite` is unused: no released version pairs with `rusqlite_migration` ≤ 2.5 under the workspace MSRV. Turso was evaluated and rejected for v1: `turso-migrate` pins turso 0.4.x, which lacks CHECK-constraint and foreign-key enforcement, and turso 0.8.x does not enforce partial unique indexes — a swap would lose functionality (§11.2, §11.3).
 16. `MachineArch` = `Ubuntu(Architecture)` | `All` | `Unsupported(String)`; `All` expands to the `ubuntu-info-rust` set; unsupported architectures are stubbed (`supported = false`, not expanded); the default analysis set excludes `i386` and includes `amd64v3`.

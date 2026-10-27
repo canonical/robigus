@@ -11,6 +11,7 @@ pub mod feature;
 pub mod model;
 pub mod predicate;
 pub mod solver;
+pub mod store;
 
 pub use error::{
     DpkgError, FetchError, PredicateError, RobigusError, SandboxAttempt, SandboxUnavailable,
@@ -23,3 +24,4 @@ pub use model::{
     SourceId, SourceKind, Target, TargetKind, VersionConstraint, path_tree_digest,
 };
 pub use predicate::{Atom, Configuration, DEFAULT_DNF_TERM_CAP, DnfError, Evaluator, Predicate};
+pub use store::{Analysis, AnalysisMetadata, IntegrityReport, Store, ToolInvocation};

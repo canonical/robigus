@@ -30,12 +30,16 @@ xz2 = "0.1"
 # in via `.workspace = true`.
 # Graph algorithms
 petgraph = "0.8"
-# SQLite persistence. rusqlite 0.40 is the newest major supported by both
-# tokio-rusqlite 0.8 (^0.40.1) and rusqlite_migration 2.6 (^0.40.0); do not
-# bump to 0.41 until those two follow.
-rusqlite = { version = "0.40", features = ["bundled"] }
+# SQLite persistence. rusqlite 0.39 pairs with rusqlite_migration 2.5.0, the
+# newest migration crate whose rust-version (1.84) satisfies the workspace
+# MSRV (1.93.1); rusqlite_migration 2.6.0 requires rustc 1.95. tokio-rusqlite
+# is unused: the store drives a shared Arc<Mutex<rusqlite::Connection>> via
+# spawn_blocking (spec §11.1). Turso was evaluated and rejected for v1 —
+# turso-migrate pins turso 0.4.x (no CHECK/FK enforcement), and turso 0.8.x
+# does not enforce partial unique indexes (spec §22.15).
+rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite_migration = "2.5"
 tokio-rusqlite = "0.8"
-rusqlite_migration = "2.6"
 # Observability and diagnostics
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

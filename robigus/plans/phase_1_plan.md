@@ -29,7 +29,7 @@ Ubuntu archive mapping (M4) and packaging plans (M5) are explicitly out of scope
 - **Determinism.** Analyzers MUST produce identical output for identical inputs: `BTreeMap`/`BTreeSet` ordering everywhere, sorted fixture output, redacted snapshots.
 - **Fail closed.** If the sandbox cannot be established, nothing runs (exit 4). There is no `none` mode.
 - **One database per analysis.** The store is the source of truth; resume reads and writes it.
-- **Blocking work in `spawn_blocking`** (SQLite via `tokio-rusqlite`, `gix`, extraction, CPU-bound parsing).
+- **Blocking work in `spawn_blocking`** (SQLite on a shared `Arc<Mutex<rusqlite::Connection>>`, `gix`, extraction, CPU-bound parsing).
 
 ## 3. Sequencing overview
 
@@ -117,7 +117,7 @@ Goal (spec §21): predicate AST and parser (including `cfg` atoms), model extens
 Tasks:
 
 - [ ] `robigus/Cargo.toml`: add `description`, `license = "GPL-3.0-only"`, `repository`, `keywords`, `categories`, `rust-version = "1.93.1"`.
-- [ ] Workspace `Cargo.toml`: add shared deps — `petgraph`, `rusqlite` (bundled), `tokio-rusqlite`, `rusqlite_migration`, `tracing`, `tracing-subscriber`, `miette`, `sha2`, `tar`, `zstd`, `walkdir`, `ignore`, `toml`, `gix`, `cargo_metadata`, `toml_edit`; dev-deps `insta`, `proptest`, `wiremock`. (`reqwest`, `clap`, `flate2`, `xz2`, `chrono`, `regex`, `serde*`, `thiserror`, `tokio`, `ubuntu-info-rust` already exist.)
+- [ ] Workspace `Cargo.toml`: add shared deps — `petgraph`, `rusqlite` (bundled), `rusqlite_migration`, `tracing`, `tracing-subscriber`, `miette`, `sha2`, `tar`, `zstd`, `walkdir`, `ignore`, `toml`, `gix`, `cargo_metadata`, `toml_edit`; dev-deps `insta`, `proptest`, `wiremock`. (`reqwest`, `clap`, `flate2`, `xz2`, `chrono`, `regex`, `serde*`, `thiserror`, `tokio`, `ubuntu-info-rust` already exist.)
 - [ ] Add `deny.toml` and a `cargo deny` CI job (licenses must accept GPL-3.0-only family; advisories on).
 - [ ] Add a robigus `SECURITY.md` with its own reporting path (the workspace one points at `rapt`).
 - [ ] CI: add an MSRV job pinned to 1.93.1; trigger workflows on pushes as well as PRs; reserve a nightly fuzz job (wired up once targets exist in WP-1.2/WP-1.3).
@@ -183,7 +183,7 @@ Tasks:
 
 - [ ] Migration v1 = the full §11.2 DDL (`metadata`, `package`, `dependency_edge`, `package_target`, `package_provides`, `package_conflicts`, `analysis_plan`, `tool_invocation` + indexes) via `rusqlite_migration` on `PRAGMA user_version`; forward-only; opening a newer-version database → `StoreError::SchemaTooNew` (exit 3).
 - [ ] Pragmas on open: WAL, `synchronous = NORMAL`, `mmap_size`, `foreign_keys = ON`, `temp_store = MEMORY`.
-- [ ] `Store` over a `tokio-rusqlite` handle; async API: `open`, `metadata` (read/write single row), `upsert_node`, `upsert_edges`, `update_status`, `record_invocation`, `load`, `check`.
+- [ ] `Store` over a shared `Arc<Mutex<rusqlite::Connection>>` with every operation in `tokio::task::spawn_blocking` (§11.1); async API: `open`, `metadata` (read/write single row), `upsert_node`, `upsert_edges`, `update_status`, `record_invocation`, `load`, `check`.
 - [ ] `upsert_node`: identity conflict on `(name, version, ecosystem, source_kind, source_uri, source_precise)` → update `status`/`active_features`/`path`.
 - [ ] `upsert_edges`: single transaction; on partial-unique-index violation, SELECT the existing row and merge in Rust (union `kinds`, max confidence, merged evidence) then UPDATE — do not rely on `ON CONFLICT` against partial indexes.
 - [ ] `''` (not NULL) for absent values in unique-index columns (`path`, `soname`, `version`, `version_req`).

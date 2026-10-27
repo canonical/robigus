@@ -5,7 +5,7 @@
 //! in-memory [`DependencyGraph`].
 
 use crate::dpkg::DpkgVersion;
-use crate::error::{FetchError, RobigusError};
+use crate::error::{FetchError, RobigusError, StoreError};
 use crate::feature::FeatureExpr;
 use crate::predicate::Predicate;
 use petgraph::Direction;
@@ -60,6 +60,19 @@ impl SourceKind {
             Self::Apt { .. } => "apt",
         }
     }
+
+    /// The URI component of the persisted package identity (spec §11.2):
+    /// the index URL, repository URL, filesystem path, tarball URL, or
+    /// mirror URL.
+    pub fn identity_uri(&self) -> String {
+        match self {
+            Self::CargoRegistry { index_url } => index_url.to_string(),
+            Self::Git { url, .. } => url.to_string(),
+            Self::Path { path } => path.to_string_lossy().into_owned(),
+            Self::Tarball { url, .. } => url.to_string(),
+            Self::Apt { mirror_url, .. } => mirror_url.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -89,6 +102,30 @@ pub enum Ecosystem {
     Generic,
 }
 
+impl Ecosystem {
+    /// The stored form in `package.ecosystem` (spec §11.2); matches the
+    /// serde representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Ubuntu => "ubuntu",
+            Self::SystemC => "system_c",
+            Self::Generic => "generic",
+        }
+    }
+
+    /// Parses [`Ecosystem::as_str`] output.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "rust" => Some(Self::Rust),
+            "ubuntu" => Some(Self::Ubuntu),
+            "system_c" => Some(Self::SystemC),
+            "generic" => Some(Self::Generic),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for Ecosystem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -111,6 +148,24 @@ pub enum PackageVersion {
     SemVer(Version),
     Debian(DpkgVersion),
     Opaque(String),
+}
+
+impl PackageVersion {
+    /// Parses the stored text form for `ecosystem` (spec §11.2): SemVer for
+    /// Rust, dpkg for Ubuntu, opaque otherwise. Unparseable text degrades to
+    /// `Opaque` carrying the identity-preserving original.
+    pub fn from_stored_text(ecosystem: Ecosystem, text: &str) -> Self {
+        match ecosystem {
+            Ecosystem::Rust => text
+                .parse::<Version>()
+                .map(Self::SemVer)
+                .unwrap_or_else(|_| Self::Opaque(text.to_string())),
+            Ecosystem::Ubuntu => DpkgVersion::parse(text)
+                .map(Self::Debian)
+                .unwrap_or_else(|_| Self::Opaque(text.to_string())),
+            _ => Self::Opaque(text.to_string()),
+        }
+    }
 }
 
 impl fmt::Display for PackageVersion {
@@ -241,6 +296,50 @@ pub enum VersionConstraint {
     Any,
 }
 
+impl VersionConstraint {
+    /// Canonical text for `version_req` columns; empty means `Any` (spec
+    /// §11.2). Debian requirements are `op version` with a space after the
+    /// operator; Cargo requirement strings never have one, so the two forms
+    /// are unambiguous.
+    pub fn requirement_text(&self) -> String {
+        match self {
+            Self::Any => String::new(),
+            Self::SemVer(req) => req.to_string(),
+            Self::Debian { op, target_version } => format!("{} {target_version}", op.as_str()),
+        }
+    }
+
+    /// Parses [`VersionConstraint::requirement_text`] output; empty is `Any`.
+    pub fn from_requirement_text(text: &str) -> Result<Self, StoreError> {
+        if text.is_empty() {
+            return Ok(Self::Any);
+        }
+        for (spelling, operator) in [
+            ("<<", DebianOperator::Lt),
+            ("<=", DebianOperator::Le),
+            (">>", DebianOperator::Gt),
+            (">=", DebianOperator::Ge),
+            ("=", DebianOperator::Eq),
+        ] {
+            if let Some(version) = text
+                .strip_prefix(spelling)
+                .and_then(|rest| rest.strip_prefix(' '))
+                .filter(|version| !version.is_empty())
+            {
+                return Ok(Self::Debian {
+                    op: operator,
+                    target_version: version.to_string(),
+                });
+            }
+        }
+        text.parse::<VersionReq>()
+            .map(Self::SemVer)
+            .map_err(|error| {
+                StoreError::Corrupt(format!("invalid version requirement '{text}': {error}"))
+            })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DebianOperator {
     Eq,
@@ -248,6 +347,19 @@ pub enum DebianOperator {
     Le,
     Gt,
     Ge,
+}
+
+impl DebianOperator {
+    /// The Debian relational operator spelling (Debian Policy §7.1).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Eq => "=",
+            Self::Lt => "<<",
+            Self::Le => "<=",
+            Self::Gt => ">>",
+            Self::Ge => ">=",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -331,6 +443,34 @@ pub enum RequirementKind {
     Generic,
 }
 
+impl RequirementKind {
+    /// The stored form in `dependency_edge.requirement_kind` (spec §11.2);
+    /// matches the serde representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Crate => "crate",
+            Self::PkgConfig => "pkg_config",
+            Self::Header => "header",
+            Self::Soname => "soname",
+            Self::Tool => "tool",
+            Self::Generic => "generic",
+        }
+    }
+
+    /// Parses [`RequirementKind::as_str`] output.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "crate" => Some(Self::Crate),
+            "pkg_config" => Some(Self::PkgConfig),
+            "header" => Some(Self::Header),
+            "soname" => Some(Self::Soname),
+            "tool" => Some(Self::Tool),
+            "generic" => Some(Self::Generic),
+            _ => None,
+        }
+    }
+}
+
 /// The declared dependency need, independent of any resolved node (spec §5.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Requirement {
@@ -356,6 +496,21 @@ pub enum EvidenceMethod {
 }
 
 impl EvidenceMethod {
+    /// The stored/serde name of the method (spec §11.2 evidence JSON).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Lockfile => "lockfile",
+            Self::BuildScript => "build_script",
+            Self::ToolOutput => "tool_output",
+            Self::SourceScan => "source_scan",
+            Self::Documentation => "documentation",
+            Self::BuildObservation => "build_observation",
+            Self::LlmSubAgent => "llm_sub_agent",
+            Self::HumanOverride => "human_override",
+        }
+    }
+
     /// The highest confidence this method may produce (spec §5.3).
     /// LLM-derived evidence is capped at tier L3 (§7.6).
     pub fn max_confidence(&self) -> u8 {
