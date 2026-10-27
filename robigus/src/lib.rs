@@ -22,4 +22,4 @@ pub use model::{
     Evidence, EvidenceMethod, MachineArch, Node, PackageId, Provide, Requirement, RequirementKind,
     SourceId, SourceKind, Target, TargetKind, VersionConstraint, path_tree_digest,
 };
-pub use predicate::{Atom, Predicate};
+pub use predicate::{Atom, Configuration, DEFAULT_DNF_TERM_CAP, DnfError, Evaluator, Predicate};

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 00ed5e91c144d35b2c2c9ac4a91f4d79f514eececb4d7fe9a85318fd9ee1af22 # shrinks to predicate = And([Or([Atom(Arch(Unsupported("mips")))])])
