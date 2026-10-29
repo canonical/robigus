@@ -13,129 +13,24 @@ use std::path::{Component, Path, PathBuf};
 use ignore::WalkBuilder;
 
 use crate::error::DetectError;
-use crate::model::ConfidenceTier;
+use serde::{Deserialize, Serialize};
 
-/// A 0–100 confidence score (spec §5.3).
-///
-/// Distinct from the raw `u8` stored on [`crate::model::Evidence`] so analyzer
-/// detection can carry a typed, clamped score. Values above 100 are clamped to
-/// 100 rather than rejected, so malformed input cannot panic (§15).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Confidence(u8);
+pub use crate::model::Confidence;
+use crate::model::{AnalysisStrategy, AnalyzerId, BuildSystem, PlanRow, PlanStatus, PlanSubject};
 
-impl Confidence {
-    /// The lowest possible confidence (no signal).
-    pub const ZERO: Self = Self(0);
-    /// The highest possible confidence.
-    pub const MAX: Self = Self(100);
-
-    /// Builds a confidence, clamping values above 100 to 100.
-    pub const fn new(value: u8) -> Self {
-        Self(if value > 100 { 100 } else { value })
-    }
-
-    /// The raw 0–100 score.
-    pub const fn value(self) -> u8 {
-        self.0
-    }
-
-    /// The qualitative tier this score falls into (§5.3).
-    pub fn tier(self) -> ConfidenceTier {
-        ConfidenceTier::from_confidence(self.0)
-    }
-}
-
-/// The analyzers robigus knows about (spec §7.3). Only [`AnalyzerId::Cargo`]
-/// and [`AnalyzerId::Cpp`] ship in v1; the rest are detected and recorded as
-/// `Skipped` plan rows so the record shows what was seen but not analyzed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum AnalyzerId {
-    Cargo,
-    Cpp,
-    Python,
-    Go,
-    Node,
-}
-
-impl AnalyzerId {
-    /// The stable analyzer name used in plan rows and reports.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Cargo => "cargo",
-            Self::Cpp => "cpp",
-            Self::Python => "python",
-            Self::Go => "go",
-            Self::Node => "node",
-        }
-    }
-
-    /// True for analyzers shipped in v1 (spec §7.3).
-    pub fn is_shipped(self) -> bool {
-        matches!(self, Self::Cargo | Self::Cpp)
-    }
-}
-
-/// The per-analyzer build-system/ecosystem strategy a marker signals (spec
-/// §7.3). CMake, Meson, Autotools, and Make are strategies *inside* the `cpp`
-/// analyzer, not separate analyzers. This axis is distinct from the §7.6
-/// analysis-strategy axis (manifest, tool introspection, build observation, …),
-/// which is added during expansion (WP-2.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Strategy {
-    /// Parse the ecosystem manifest (`Cargo.toml`, `package.json`, …).
-    Manifest,
-    /// `build.rs` → C/C++/assembly discovery inside the Cargo analyzer.
-    NativeBuildScript,
-    Cmake,
-    Meson,
-    Autotools,
-    Make,
-}
-
-impl Strategy {
-    /// The stable strategy name used in plan rows and reports.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Manifest => "manifest",
-            Self::NativeBuildScript => "native_build_script",
-            Self::Cmake => "cmake",
-            Self::Meson => "meson",
-            Self::Autotools => "autotools",
-            Self::Make => "make",
-        }
-    }
-}
-
-/// The status of a plan row (spec §7.3). Future-ecosystem markers are recorded
-/// as `Skipped`; shipped analyzers are `Pending` until expansion runs them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PlanStatus {
-    Pending,
-    Skipped,
-}
-
-impl PlanStatus {
-    /// The exact serialized form, matching the store's `analysis_plan.status`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "Pending",
-            Self::Skipped => "Skipped",
-        }
-    }
-}
-
-/// One marker file and the analyzer/strategy it signals (spec §7.3).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// One marker file and the analyzer (and, for C/C++ and `build.rs`, the build
+/// system) it signals (spec §7.3).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DetectionSignal {
     /// Workspace-relative marker path.
     pub marker: PathBuf,
     pub analyzer: AnalyzerId,
-    pub strategy: Strategy,
+    pub build_system: Option<BuildSystem>,
     pub confidence: Confidence,
 }
 
 /// A detected analysis entry point: a directory that is analyzed as one unit.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ProjectRoot {
     /// Workspace-relative directory (empty for the top level).
     pub path: PathBuf,
@@ -143,18 +38,9 @@ pub struct ProjectRoot {
     pub analyzers: BTreeSet<AnalyzerId>,
 }
 
-/// One row of the dependency mapping plan (spec §2, §7.3).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PlanRow {
-    pub root: PathBuf,
-    pub analyzer: AnalyzerId,
-    pub strategy: Strategy,
-    pub status: PlanStatus,
-}
-
 /// The result of [`detect`]: signals, roots, and plan rows, each sorted for
 /// determinism.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectionReport {
     pub signals: Vec<DetectionSignal>,
     pub roots: Vec<ProjectRoot>,
@@ -162,45 +48,164 @@ pub struct DetectionReport {
     /// separate roots (test fixtures, examples, …). Recorded so the report
     /// shows what was seen, but not analyzed as roots (spec §7.3).
     pub non_member_crates: Vec<PathBuf>,
+    /// Root-keyed plan rows ([`PlanSubject::Root`]), ready for
+    /// `Store::upsert_plan_rows`. Shipped analyzers are `Pending`; future
+    /// ecosystems are `Skipped`.
     pub plan: Vec<PlanRow>,
+    /// What detection can infer about the project (spec §7.4).
+    pub characteristics: ProjectCharacteristics,
+    /// Problems that may make this report incomplete, sorted.
+    pub diagnostics: Vec<DetectionDiagnostic>,
 }
 
-/// Limits applied to the [`ProjectTree`] walk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Limits applied to the [`ProjectTree`] walk. The defaults bound a hostile
+/// or pathological tree while covering large monorepos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DetectionLimits {
-    /// Maximum directory depth to descend (`None` = unlimited). The root is
-    /// depth 0.
+    /// Maximum directory depth to inspect (`None` = unlimited); the root is
+    /// depth 0. Reaching the limit is reported as a diagnostic.
     pub max_depth: Option<usize>,
+    /// Maximum number of entries walked; exceeding it fails detection with
+    /// [`DetectError::LimitExceeded`] rather than silently truncating.
+    pub max_entries: u64,
+    /// Build descriptions (`Cargo.toml`, `CMakeLists.txt`, `meson.build`)
+    /// larger than this are not parsed; a diagnostic is recorded instead.
+    pub max_manifest_bytes: u64,
 }
 
-/// The §7.3 marker table: filename → (analyzer, strategy, confidence).
-const MARKERS: &[(&str, AnalyzerId, Strategy, u8)] = &[
-    ("Cargo.toml", AnalyzerId::Cargo, Strategy::Manifest, 90),
+impl Default for DetectionLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: Some(64),
+            max_entries: 500_000,
+            max_manifest_bytes: 1024 * 1024,
+        }
+    }
+}
+
+/// A problem found during detection that did not stop it: a malformed,
+/// oversized, or unreadable manifest, an invalid workspace member glob, an
+/// unreadable directory, or the depth limit cutting the walk short. Each one
+/// means the report may be incomplete for `path`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DetectionDiagnostic {
+    /// Workspace-relative path the problem concerns (empty = whole tree).
+    pub path: PathBuf,
+    pub message: String,
+}
+
+/// A programming language seen in the tree, by file extension (spec §7.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Language {
+    Assembly,
+    C,
+    Cpp,
+    Go,
+    /// JavaScript and TypeScript.
+    JavaScript,
+    Python,
+    Rust,
+}
+
+fn language_of(filename: &str) -> Option<Language> {
+    let (_, extension) = filename.rsplit_once('.')?;
+    Some(match extension {
+        "rs" => Language::Rust,
+        "c" | "h" => Language::C,
+        "cc" | "cpp" | "cxx" | "c++" | "hh" | "hpp" | "hxx" => Language::Cpp,
+        "s" | "S" | "asm" => Language::Assembly,
+        "py" => Language::Python,
+        "go" => Language::Go,
+        "js" | "mjs" | "cjs" | "ts" | "mts" | "cts" => Language::JavaScript,
+        _ => return None,
+    })
+}
+
+/// A testing system the project uses (spec §7.4), inferred from markers and
+/// build descriptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestSystem {
+    /// Cargo's built-in harness (any Cargo package).
+    CargoTest,
+    /// CTest: `enable_testing()` or `add_test()` in a `CMakeLists.txt`.
+    CTest,
+    /// Meson's `test()` in a `meson.build`.
+    MesonTest,
+    /// pytest: a `conftest.py` or `pytest.ini`.
+    Pytest,
+    /// Go's `testing` package: a `*_test.go` file.
+    GoTest,
+}
+
+/// The project characteristics detection can infer from the tree alone
+/// (spec §7.4). Target machine architectures and operating systems are not
+/// inferable from markers: analyzers record them as predicates on edges
+/// (spec §4) during analysis (WP-2.2, WP-3.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCharacteristics {
+    /// From the top-level Cargo manifest (or the only Cargo root).
+    pub name: Option<String>,
+    /// From that manifest's `package.version`, or the workspace's
+    /// `workspace.package.version` when inherited or virtual.
+    pub version: Option<String>,
+    pub languages: BTreeSet<Language>,
+    /// The ecosystems present; an ecosystem's own build tool (for example
+    /// Cargo) is implied by its analyzer.
+    pub analyzers: BTreeSet<AnalyzerId>,
+    /// The C/C++ build systems and `build.rs` scripts present.
+    pub build_systems: BTreeSet<BuildSystem>,
+    pub test_systems: BTreeSet<TestSystem>,
+}
+
+/// The §7.3 marker table: filename → (analyzer, build system, confidence).
+const MARKERS: &[(&str, AnalyzerId, Option<BuildSystem>, u8)] = &[
+    ("Cargo.toml", AnalyzerId::Cargo, None, 90),
     (
         "build.rs",
         AnalyzerId::Cargo,
-        Strategy::NativeBuildScript,
+        Some(BuildSystem::BuildScript),
         70,
     ),
-    ("CMakeLists.txt", AnalyzerId::Cpp, Strategy::Cmake, 90),
-    ("meson.build", AnalyzerId::Cpp, Strategy::Meson, 90),
-    ("configure.ac", AnalyzerId::Cpp, Strategy::Autotools, 90),
-    ("configure", AnalyzerId::Cpp, Strategy::Autotools, 80),
-    ("Makefile", AnalyzerId::Cpp, Strategy::Make, 70),
-    ("pyproject.toml", AnalyzerId::Python, Strategy::Manifest, 90),
-    ("setup.py", AnalyzerId::Python, Strategy::Manifest, 80),
-    ("go.mod", AnalyzerId::Go, Strategy::Manifest, 90),
-    ("package.json", AnalyzerId::Node, Strategy::Manifest, 90),
+    (
+        "CMakeLists.txt",
+        AnalyzerId::Cpp,
+        Some(BuildSystem::Cmake),
+        90,
+    ),
+    ("meson.build", AnalyzerId::Cpp, Some(BuildSystem::Meson), 90),
+    (
+        "configure.ac",
+        AnalyzerId::Cpp,
+        Some(BuildSystem::Autotools),
+        90,
+    ),
+    (
+        "configure",
+        AnalyzerId::Cpp,
+        Some(BuildSystem::Autotools),
+        80,
+    ),
+    // Every name GNU make looks for, in its lookup order.
+    ("GNUmakefile", AnalyzerId::Cpp, Some(BuildSystem::Make), 70),
+    ("makefile", AnalyzerId::Cpp, Some(BuildSystem::Make), 70),
+    ("Makefile", AnalyzerId::Cpp, Some(BuildSystem::Make), 70),
+    ("pyproject.toml", AnalyzerId::Python, None, 90),
+    ("setup.py", AnalyzerId::Python, None, 80),
+    ("go.mod", AnalyzerId::Go, None, 90),
+    ("package.json", AnalyzerId::Node, None, 90),
 ];
 
-fn marker_signal(filename: &str) -> Option<(AnalyzerId, Strategy, u8)> {
+fn marker_signal(filename: &str) -> Option<(AnalyzerId, Option<BuildSystem>, u8)> {
     MARKERS
         .iter()
         .find(|(name, ..)| *name == filename)
-        .map(|(_, analyzer, strategy, confidence)| (*analyzer, *strategy, *confidence))
+        .map(|(_, analyzer, build_system, confidence)| (*analyzer, *build_system, *confidence))
 }
 
-/// Workspace membership info parsed from a `Cargo.toml` (spec §7.3).
+/// Workspace membership and identity info parsed from a `Cargo.toml` (spec
+/// §7.3, §7.4).
 #[derive(Debug, Clone, Default)]
 struct CargoManifest {
     is_workspace: bool,
@@ -210,6 +215,11 @@ struct CargoManifest {
     /// Normalized `[workspace] exclude` entries. Cargo treats these as path
     /// prefixes, not globs.
     exclude: Vec<PathBuf>,
+    package_name: Option<String>,
+    /// `package.version` when given literally (not workspace-inherited).
+    package_version: Option<String>,
+    /// `workspace.package.version`.
+    workspace_version: Option<String>,
 }
 
 /// The in-memory result of walking a project tree (spec §7.3). Built once by
@@ -223,20 +233,52 @@ pub struct ProjectTree {
     /// Parsed Cargo manifests, keyed by the workspace-relative directory
     /// containing the `Cargo.toml` (empty path = top level).
     cargo_manifests: BTreeMap<PathBuf, CargoManifest>,
+    diagnostics: Vec<DetectionDiagnostic>,
+    languages: BTreeSet<Language>,
+    test_systems: BTreeSet<TestSystem>,
 }
 
 impl ProjectTree {
     /// Walks `root` with the `ignore` crate, honoring its default rules plus
     /// the §7.3 skip list (`target/`, `vendor/`, `node_modules/`, `.git/`) and
-    /// the depth limit. Out-of-tree ignore files (parent `.gitignore`s and the
-    /// user's global gitignore) are disabled so detection is reproducible.
-    pub fn discover(
+    /// `limits`. Out-of-tree ignore files (parent `.gitignore`s and the user's
+    /// global gitignore) are disabled so detection is reproducible.
+    ///
+    /// The walk is blocking I/O and runs in `spawn_blocking` (spec §6.2).
+    /// Problems that do not prevent detection are recorded as
+    /// [`DetectionDiagnostic`]s rather than failing it.
+    pub async fn discover(
         root: impl Into<PathBuf>,
         limits: &DetectionLimits,
     ) -> Result<Self, DetectError> {
         let root = root.into();
-        let mut markers = Vec::new();
-        let mut cargo_manifests = BTreeMap::new();
+        let limits = *limits;
+        tokio::task::spawn_blocking(move || Self::discover_blocking(root, &limits))
+            .await
+            .map_err(|error| DetectError::Walk(format!("detection task failed: {error}")))?
+    }
+
+    /// The blocking walk behind [`ProjectTree::discover`].
+    pub(crate) fn discover_blocking(
+        root: impl Into<PathBuf>,
+        limits: &DetectionLimits,
+    ) -> Result<Self, DetectError> {
+        let root = root.into();
+        if !root.is_dir() {
+            return Err(DetectError::Walk(format!(
+                "'{}' is not a directory",
+                root.display()
+            )));
+        }
+        let mut tree = Self {
+            root: root.clone(),
+            markers: Vec::new(),
+            cargo_manifests: BTreeMap::new(),
+            diagnostics: Vec::new(),
+            languages: BTreeSet::new(),
+            test_systems: BTreeSet::new(),
+        };
+        let relative = |path: &Path| path.strip_prefix(&root).unwrap_or(path).to_path_buf();
 
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -246,46 +288,121 @@ impl ProjectTree {
             // `.gitignore` rules apply even when no `.git` directory exists
             // (a tarball may ship `.gitignore` without a repository).
             .require_git(false)
-            .max_depth(limits.max_depth)
+            // One level past the limit, so reaching it can be reported.
+            .max_depth(limits.max_depth.map(|depth| depth + 1))
             .filter_entry(|entry| {
                 let name = entry.file_name().to_string_lossy();
                 !matches!(name.as_ref(), "target" | "vendor" | "node_modules" | ".git")
             });
 
+        let mut entries: u64 = 0;
+        let mut depth_limited = false;
         for result in builder.build() {
-            let entry = result.map_err(|e| DetectError::Walk(e.to_string()))?;
-            let Some(file_type) = entry.file_type() else {
-                continue;
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let path = match &error {
+                        ignore::Error::WithPath { path, .. } => relative(path),
+                        _ => PathBuf::new(),
+                    };
+                    tree.diagnose(path, format!("could not be read: {error}"));
+                    continue;
+                }
             };
-            if !file_type.is_file() {
+            if entry.depth() == 0 {
                 continue;
             }
-            let rel = entry
-                .path()
-                .strip_prefix(&root)
-                .map_err(|e| DetectError::Walk(e.to_string()))?
-                .to_path_buf();
-            let Some(filename) = rel.file_name().and_then(|n| n.to_str()) else {
+            entries += 1;
+            if entries > limits.max_entries {
+                return Err(DetectError::LimitExceeded(format!(
+                    "more than {} entries under '{}'",
+                    limits.max_entries,
+                    root.display()
+                )));
+            }
+            if limits.max_depth.is_some_and(|max| entry.depth() > max) {
+                depth_limited = true;
+                continue;
+            }
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
+                continue;
+            }
+            let rel = relative(entry.path());
+            let Some(filename) = rel.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if marker_signal(filename).is_some() {
-                markers.push(rel.clone());
+            if let Some(language) = language_of(filename) {
+                tree.languages.insert(language);
             }
-            if filename == "Cargo.toml" {
-                let content = std::fs::read_to_string(entry.path())?;
-                let dir = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-                cargo_manifests.insert(dir, parse_cargo_manifest(&content));
+            if filename == "conftest.py" || filename == "pytest.ini" {
+                tree.test_systems.insert(TestSystem::Pytest);
+            }
+            if filename.ends_with("_test.go") {
+                tree.test_systems.insert(TestSystem::GoTest);
+            }
+            if marker_signal(filename).is_none() {
+                continue;
+            }
+            tree.markers.push(rel.clone());
+            match filename {
+                "Cargo.toml" => {
+                    tree.test_systems.insert(TestSystem::CargoTest);
+                    let dir = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+                    let manifest = match read_bounded(entry.path(), limits.max_manifest_bytes) {
+                        Ok(content) => {
+                            let (manifest, problems) = parse_cargo_manifest(&content);
+                            for problem in problems {
+                                tree.diagnose(rel.clone(), problem);
+                            }
+                            manifest
+                        }
+                        Err(problem) => {
+                            tree.diagnose(rel.clone(), problem);
+                            CargoManifest::default()
+                        }
+                    };
+                    tree.cargo_manifests.insert(dir, manifest);
+                }
+                "CMakeLists.txt" | "meson.build" => {
+                    match read_bounded(entry.path(), limits.max_manifest_bytes) {
+                        Ok(content) if filename == "CMakeLists.txt" => {
+                            let lower = content.to_ascii_lowercase();
+                            if has_call(&lower, "enable_testing") || has_call(&lower, "add_test") {
+                                tree.test_systems.insert(TestSystem::CTest);
+                            }
+                        }
+                        Ok(content) => {
+                            if has_call(&content, "test") {
+                                tree.test_systems.insert(TestSystem::MesonTest);
+                            }
+                        }
+                        Err(problem) => tree.diagnose(rel.clone(), problem),
+                    }
+                }
+                _ => {}
             }
         }
+        if depth_limited {
+            let max = limits.max_depth.unwrap_or_default();
+            tree.diagnose(
+                PathBuf::new(),
+                format!(
+                    "directory depth limit of {max} reached; deeper entries were not inspected"
+                ),
+            );
+        }
 
-        markers.sort();
-        markers.dedup();
+        tree.markers.sort();
+        tree.markers.dedup();
+        tree.diagnostics.sort();
+        Ok(tree)
+    }
 
-        Ok(Self {
-            root,
-            markers,
-            cargo_manifests,
-        })
+    fn diagnose(&mut self, path: PathBuf, message: String) {
+        self.diagnostics.push(DetectionDiagnostic { path, message });
     }
 
     /// The absolute root directory that was walked.
@@ -300,25 +417,86 @@ impl ProjectTree {
 
     /// True when `rel` (workspace-relative) is a detected marker file.
     pub fn has_marker(&self, rel: &Path) -> bool {
-        self.markers.iter().any(|m| m == rel)
+        self.markers
+            .binary_search_by(|m| m.as_path().cmp(rel))
+            .is_ok()
     }
 
     /// The number of marker files found.
     pub fn marker_count(&self) -> usize {
         self.markers.len()
     }
+
+    /// Problems recorded during the walk, sorted.
+    pub fn diagnostics(&self) -> &[DetectionDiagnostic] {
+        &self.diagnostics
+    }
 }
 
-fn parse_cargo_manifest(content: &str) -> CargoManifest {
+/// Reads a build description no larger than `max_bytes`; the error is a
+/// diagnostic message.
+fn read_bounded(path: &Path, max_bytes: u64) -> Result<String, String> {
+    let size = std::fs::metadata(path)
+        .map_err(|error| format!("could not be read: {error}"))?
+        .len();
+    if size > max_bytes {
+        return Err(format!(
+            "is {size} bytes, over the {max_bytes}-byte limit; not parsed"
+        ));
+    }
+    std::fs::read_to_string(path).map_err(|error| format!("could not be read: {error}"))
+}
+
+/// True when `text` contains a call `name(` (optionally with whitespace
+/// before the parenthesis) not preceded by an identifier character, so
+/// `test(` matches but `my_test(` does not.
+fn has_call(text: &str, name: &str) -> bool {
+    text.match_indices(name).any(|(start, _)| {
+        let before_ok = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+        let after = text[start + name.len()..].trim_start_matches([' ', '\t']);
+        before_ok && after.starts_with('(')
+    })
+}
+
+/// Parses the workspace and identity fields of a `Cargo.toml`. Returns the
+/// manifest plus diagnostic messages; a malformed manifest yields a plain
+/// (non-workspace) package entry, so its directory is still known to be a
+/// Cargo package.
+fn parse_cargo_manifest(content: &str) -> (CargoManifest, Vec<String>) {
     let mut manifest = CargoManifest::default();
-    let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
-        return manifest;
+    let mut problems = Vec::new();
+    let doc = match content.parse::<toml_edit::DocumentMut>() {
+        Ok(doc) => doc,
+        Err(error) => {
+            problems.push(format!(
+                "malformed Cargo.toml; treated as a plain package: {}",
+                error.to_string().trim()
+            ));
+            return (manifest, problems);
+        }
     };
+    let string_at = |table: Option<&toml_edit::Item>, key: &str| {
+        table
+            .and_then(|item| item.get(key))
+            .and_then(|item| item.as_str())
+            .map(str::to_owned)
+    };
+    manifest.package_name = string_at(doc.get("package"), "name");
+    manifest.package_version = string_at(doc.get("package"), "version");
+    manifest.workspace_version = string_at(
+        doc.get("workspace")
+            .and_then(|workspace| workspace.get("package")),
+        "version",
+    );
+
     let Some(workspace) = doc.get("workspace").and_then(|item| item.as_table()) else {
-        return manifest;
+        return (manifest, problems);
     };
     manifest.is_workspace = true;
-    let entries = |key: &str| -> Vec<String> {
+    let mut entries = |key: &str| -> Vec<String> {
         workspace
             .get(key)
             .and_then(|item| item.as_value())
@@ -327,14 +505,34 @@ fn parse_cargo_manifest(content: &str) -> CargoManifest {
                 array
                     .iter()
                     .filter_map(|value| value.as_str())
-                    .filter_map(normalize_workspace_entry)
+                    .filter_map(|entry| {
+                        let normalized = normalize_workspace_entry(entry);
+                        // `.` names the workspace directory itself.
+                        let is_self = Path::new(entry)
+                            .components()
+                            .all(|component| component == Component::CurDir);
+                        if normalized.is_none() && !is_self {
+                            problems.push(format!(
+                                "workspace {key} entry '{entry}' is absolute or outside the \
+                                 workspace; ignored"
+                            ));
+                        }
+                        normalized
+                    })
                     .collect()
             })
             .unwrap_or_default()
     };
     manifest.members = entries("members");
     manifest.exclude = entries("exclude").into_iter().map(PathBuf::from).collect();
-    manifest
+    for member in &manifest.members {
+        if let Err(error) = glob::Pattern::new(member) {
+            problems.push(format!(
+                "workspace member glob '{member}' is invalid and matches nothing: {error}"
+            ));
+        }
+    }
+    (manifest, problems)
 }
 
 /// Normalizes a workspace `members`/`exclude` entry relative to the
@@ -438,11 +636,12 @@ fn cargo_roots(tree: &ProjectTree) -> (BTreeSet<PathBuf>, Vec<PathBuf>) {
     (roots, non_member_crates)
 }
 
+/// Detected roots: directory → analyzer → build systems (`None` = the
+/// analyzer's own manifest, with no build system).
+type RootMap = BTreeMap<PathBuf, BTreeMap<AnalyzerId, BTreeSet<Option<BuildSystem>>>>;
+
 /// The deepest root that is an ancestor of (or equal to) `dir`.
-fn nearest_root(
-    root_map: &BTreeMap<PathBuf, BTreeMap<AnalyzerId, BTreeSet<Strategy>>>,
-    dir: &Path,
-) -> Option<PathBuf> {
+fn nearest_root(root_map: &RootMap, dir: &Path) -> Option<PathBuf> {
     root_map
         .keys()
         .filter(|root| dir.starts_with(root))
@@ -466,28 +665,28 @@ pub fn detect(tree: &ProjectTree) -> DetectionReport {
         .iter()
         .filter_map(|marker| {
             let filename = marker.file_name().and_then(|n| n.to_str())?;
-            let (analyzer, strategy, confidence) = marker_signal(filename)?;
+            let (analyzer, build_system, confidence) = marker_signal(filename)?;
             Some(DetectionSignal {
                 marker: marker.clone(),
                 analyzer,
-                strategy,
+                build_system,
                 confidence: Confidence::new(confidence),
             })
         })
         .collect();
     signals.sort();
 
-    // Establish roots: directory -> analyzer -> strategies.
-    let mut root_map: BTreeMap<PathBuf, BTreeMap<AnalyzerId, BTreeSet<Strategy>>> = BTreeMap::new();
+    let mut root_map = RootMap::new();
 
     let (cargo_root_dirs, non_member_crates) = cargo_roots(tree);
+    let characteristics = project_characteristics(tree, &signals, &cargo_root_dirs);
     for dir in cargo_root_dirs {
         root_map
             .entry(dir)
             .or_default()
             .entry(AnalyzerId::Cargo)
             .or_default()
-            .insert(Strategy::Manifest);
+            .insert(None);
     }
 
     // Attach every marker to its owning root, creating a new root when no
@@ -503,24 +702,13 @@ pub fn detect(tree: &ProjectTree) -> DetectionReport {
             .parent()
             .unwrap_or_else(|| Path::new(""))
             .to_path_buf();
-        match nearest_root(&root_map, &dir) {
-            Some(root) => {
-                root_map
-                    .entry(root)
-                    .or_default()
-                    .entry(signal.analyzer)
-                    .or_default()
-                    .insert(signal.strategy);
-            }
-            None => {
-                root_map
-                    .entry(dir)
-                    .or_default()
-                    .entry(signal.analyzer)
-                    .or_default()
-                    .insert(signal.strategy);
-            }
-        }
+        let root = nearest_root(&root_map, &dir).unwrap_or(dir);
+        root_map
+            .entry(root)
+            .or_default()
+            .entry(signal.analyzer)
+            .or_default()
+            .insert(signal.build_system);
     }
 
     let mut roots = Vec::new();
@@ -530,19 +718,24 @@ pub fn detect(tree: &ProjectTree) -> DetectionReport {
             path: path.clone(),
             analyzers: analyzers.keys().copied().collect(),
         });
-        for (analyzer, strategies) in analyzers {
-            for strategy in strategies {
-                let status = if analyzer.is_shipped() {
-                    PlanStatus::Pending
-                } else {
-                    PlanStatus::Skipped
-                };
-                plan.push(PlanRow {
-                    root: path.clone(),
+        for (analyzer, build_systems) in analyzers {
+            let status = if analyzer.is_shipped() {
+                PlanStatus::Pending
+            } else {
+                PlanStatus::Skipped
+            };
+            // Detection proposes the §7.6 manifest strategy (static parsing
+            // of the manifests and build descriptions it found); expansion
+            // (WP-2.3) adds tool-introspection, build-observation, and
+            // validation rows per node.
+            for build_system in build_systems {
+                plan.push(PlanRow::new(
+                    PlanSubject::Root(path.clone()),
                     analyzer,
-                    strategy,
+                    AnalysisStrategy::Manifest,
+                    build_system,
                     status,
-                });
+                ));
             }
         }
     }
@@ -554,6 +747,41 @@ pub fn detect(tree: &ProjectTree) -> DetectionReport {
         roots,
         non_member_crates,
         plan,
+        characteristics,
+        diagnostics: tree.diagnostics.clone(),
+    }
+}
+
+/// Infers the §7.4 characteristics. The name and version come from the
+/// top-level Cargo manifest, or from the only Cargo root when the top level
+/// is not a Cargo package.
+fn project_characteristics(
+    tree: &ProjectTree,
+    signals: &[DetectionSignal],
+    cargo_root_dirs: &BTreeSet<PathBuf>,
+) -> ProjectCharacteristics {
+    let identity_manifest = tree.cargo_manifests.get(Path::new("")).or_else(|| {
+        let mut roots = cargo_root_dirs.iter();
+        match (roots.next(), roots.next()) {
+            (Some(only), None) => tree.cargo_manifests.get(only),
+            _ => None,
+        }
+    });
+    ProjectCharacteristics {
+        name: identity_manifest.and_then(|manifest| manifest.package_name.clone()),
+        version: identity_manifest.and_then(|manifest| {
+            manifest
+                .package_version
+                .clone()
+                .or_else(|| manifest.workspace_version.clone())
+        }),
+        languages: tree.languages.clone(),
+        analyzers: signals.iter().map(|signal| signal.analyzer).collect(),
+        build_systems: signals
+            .iter()
+            .filter_map(|signal| signal.build_system)
+            .collect(),
+        test_systems: tree.test_systems.clone(),
     }
 }
 
@@ -613,6 +841,7 @@ fn analyzer_confidence(tree: &ProjectTree, analyzer: AnalyzerId) -> Confidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ConfidenceTier;
     use std::fs;
 
     fn write(dir: &Path, rel: &str, content: &str) {
@@ -624,7 +853,14 @@ mod tests {
     }
 
     fn discover(root: &Path) -> ProjectTree {
-        ProjectTree::discover(root, &DetectionLimits::default()).unwrap()
+        ProjectTree::discover_blocking(root, &DetectionLimits::default()).unwrap()
+    }
+
+    fn with_depth(max_depth: usize) -> DetectionLimits {
+        DetectionLimits {
+            max_depth: Some(max_depth),
+            ..DetectionLimits::default()
+        }
     }
 
     fn root_paths(report: &DetectionReport) -> Vec<&Path> {
@@ -1016,12 +1252,189 @@ mod tests {
             "a/b/c/Cargo.toml",
             "[package]\nname = \"deep\"\nversion = \"0.1.0\"\n",
         );
-        let deep =
-            ProjectTree::discover(tmp.path(), &DetectionLimits { max_depth: Some(2) }).unwrap();
+        let deep = ProjectTree::discover_blocking(tmp.path(), &with_depth(2)).unwrap();
         assert!(deep.markers().is_empty());
-        let shallow =
-            ProjectTree::discover(tmp.path(), &DetectionLimits { max_depth: Some(4) }).unwrap();
+        // Reaching the limit is reported, not silent.
+        assert!(
+            deep.diagnostics()
+                .iter()
+                .any(|d| d.message.contains("depth limit of 2")),
+            "{:?}",
+            deep.diagnostics()
+        );
+        let shallow = ProjectTree::discover_blocking(tmp.path(), &with_depth(4)).unwrap();
         assert_eq!(shallow.markers().len(), 1);
+        assert!(shallow.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn default_limits_are_bounded() {
+        let limits = DetectionLimits::default();
+        assert_eq!(limits.max_depth, Some(64));
+        assert!(limits.max_entries > 0);
+        assert!(limits.max_manifest_bytes > 0);
+    }
+
+    #[test]
+    fn entry_limit_fails_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        for index in 0..5 {
+            write(tmp.path(), &format!("f{index}.txt"), "");
+        }
+        let limits = DetectionLimits {
+            max_entries: 3,
+            ..DetectionLimits::default()
+        };
+        let error = ProjectTree::discover_blocking(tmp.path(), &limits).unwrap_err();
+        assert!(matches!(error, DetectError::LimitExceeded(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn discover_runs_off_the_async_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "Cargo.toml", PACKAGE);
+        let tree = ProjectTree::discover(tmp.path(), &DetectionLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(tree.markers(), [PathBuf::from("Cargo.toml")]);
+        let error = ProjectTree::discover(tmp.path().join("missing"), &DetectionLimits::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DetectError::Walk(_)));
+    }
+
+    /// Regression (Medium): a malformed top-level workspace manifest is
+    /// reported instead of silently changing the roots; its members fall back
+    /// to non-member crates rather than becoming separate roots.
+    #[test]
+    fn malformed_manifest_is_a_diagnostic() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "Cargo.toml", "[workspace\nmembers = [\"a\"]\n");
+        write(tmp.path(), "a/Cargo.toml", PACKAGE);
+        let report = detect(&discover(tmp.path()));
+        assert_eq!(root_paths(&report), vec![Path::new("")]);
+        assert_eq!(report.non_member_crates, vec![PathBuf::from("a")]);
+        assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+        assert_eq!(report.diagnostics[0].path, Path::new("Cargo.toml"));
+        assert!(
+            report.diagnostics[0]
+                .message
+                .contains("malformed Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn oversized_and_unreadable_manifests_are_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            &format!("{PACKAGE}# {}\n", "x".repeat(256)),
+        );
+        fs::write(tmp.path().join("CMakeLists.txt"), [0xff, 0xfe, 0x00]).unwrap();
+        let limits = DetectionLimits {
+            max_manifest_bytes: 128,
+            ..DetectionLimits::default()
+        };
+        let report = detect(&ProjectTree::discover_blocking(tmp.path(), &limits).unwrap());
+        let paths: Vec<_> = report.diagnostics.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("CMakeLists.txt"), PathBuf::from("Cargo.toml")]
+        );
+        assert!(
+            report.diagnostics[1]
+                .message
+                .contains("over the 128-byte limit")
+        );
+        // The markers are still detected.
+        assert_eq!(report.signals.len(), 2);
+    }
+
+    #[test]
+    fn invalid_and_escaping_workspace_entries_are_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/[\", \"../outside\", \".\"]\n",
+        );
+        let report = detect(&discover(tmp.path()));
+        let messages: Vec<_> = report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("'../outside'")));
+        assert!(messages.iter().any(|m| m.contains("glob 'crates/['")));
+    }
+
+    /// Medium (§7.4): name, version, languages, build systems, and test
+    /// systems inferred from the tree.
+    #[test]
+    fn characteristics_are_inferred() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion.workspace = true\n\n\
+             [workspace]\nmembers = [\"crates/*\"]\n\n[workspace.package]\nversion = \"2.1.0\"\n",
+        );
+        write(tmp.path(), "src/lib.rs", "");
+        write(tmp.path(), "build.rs", "");
+        write(tmp.path(), "native/codec.c", "");
+        write(tmp.path(), "native/simd.S", "");
+        write(
+            tmp.path(),
+            "native/CMakeLists.txt",
+            "project(c)\nENABLE_TESTING()\n",
+        );
+        write(
+            tmp.path(),
+            "tools/meson.build",
+            "project('t')\nmy_test('x')\n",
+        );
+        write(tmp.path(), "bindings/conftest.py", "");
+        let report = detect(&discover(tmp.path()));
+        let characteristics = &report.characteristics;
+        assert_eq!(characteristics.name.as_deref(), Some("demo"));
+        assert_eq!(characteristics.version.as_deref(), Some("2.1.0"));
+        assert_eq!(
+            characteristics.languages,
+            BTreeSet::from([
+                Language::Assembly,
+                Language::C,
+                Language::Python,
+                Language::Rust
+            ])
+        );
+        assert_eq!(
+            characteristics.analyzers,
+            BTreeSet::from([AnalyzerId::Cargo, AnalyzerId::Cpp])
+        );
+        assert_eq!(
+            characteristics.build_systems,
+            BTreeSet::from([
+                BuildSystem::BuildScript,
+                BuildSystem::Cmake,
+                BuildSystem::Meson
+            ])
+        );
+        // `my_test(` is not Meson's `test(`; CMake commands are case-insensitive.
+        assert_eq!(
+            characteristics.test_systems,
+            BTreeSet::from([TestSystem::CargoTest, TestSystem::CTest, TestSystem::Pytest])
+        );
+    }
+
+    #[test]
+    fn has_call_matches_whole_identifiers() {
+        assert!(has_call("test('a')", "test"));
+        assert!(has_call("x = test ('a')", "test"));
+        assert!(!has_call("my_test('a')", "test"));
+        assert!(!has_call("tests = 1", "test"));
+        assert!(has_call("if(x)\n  add_test(NAME a)", "add_test"));
     }
 
     #[test]
@@ -1034,16 +1447,82 @@ mod tests {
         );
         write(tmp.path(), "build.rs", "fn main() {}\n");
         let report = detect(&discover(tmp.path()));
-        let strategies: BTreeSet<_> = report
+        let build_systems: BTreeSet<_> = report
             .plan
             .iter()
             .filter(|p| p.analyzer == AnalyzerId::Cargo)
-            .map(|p| p.strategy)
+            .map(|p| p.build_system)
             .collect();
         assert_eq!(
-            strategies,
-            BTreeSet::from([Strategy::Manifest, Strategy::NativeBuildScript])
+            build_systems,
+            BTreeSet::from([None, Some(BuildSystem::BuildScript)])
         );
+    }
+
+    /// Detection plan rows are root-keyed and use the §7.6 manifest strategy,
+    /// with the build system in its own field (High 3).
+    #[test]
+    fn plan_rows_are_root_keyed_manifest_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "Cargo.toml", PACKAGE);
+        write(tmp.path(), "native/CMakeLists.txt", "");
+        write(tmp.path(), "py/pyproject.toml", "");
+        let report = detect(&discover(tmp.path()));
+        assert!(!report.plan.is_empty());
+        for row in &report.plan {
+            assert_eq!(row.subject, PlanSubject::Root(PathBuf::new()));
+            assert_eq!(row.strategy, AnalysisStrategy::Manifest);
+            assert_eq!(row.attempts, 0);
+        }
+        let cmake = report
+            .plan
+            .iter()
+            .find(|row| row.build_system == Some(BuildSystem::Cmake))
+            .expect("cmake row");
+        assert_eq!(cmake.analyzer, AnalyzerId::Cpp);
+        assert_eq!(cmake.status, PlanStatus::Pending);
+        let python = report
+            .plan
+            .iter()
+            .find(|row| row.analyzer == AnalyzerId::Python)
+            .expect("python row");
+        assert_eq!(python.status, PlanStatus::Skipped);
+        assert_eq!(python.build_system, None);
+    }
+
+    #[test]
+    fn every_make_spelling_is_detected() {
+        for name in ["GNUmakefile", "makefile", "Makefile"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(tmp.path(), name, "all:\n");
+            let report = detect(&discover(tmp.path()));
+            assert_eq!(report.signals.len(), 1, "{name}");
+            assert_eq!(report.signals[0].build_system, Some(BuildSystem::Make));
+        }
+    }
+
+    /// The report serializes for `print`/`export` and round-trips.
+    #[test]
+    fn detection_report_round_trips_through_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        );
+        write(tmp.path(), "src/lib.rs", "");
+        write(tmp.path(), "CMakeLists.txt", "add_test(NAME a)\n");
+        write(tmp.path(), "broken/Cargo.toml", "[package\n");
+        let report = detect(&discover(tmp.path()));
+        assert!(!report.diagnostics.is_empty());
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            json.contains("\"confidence\":90"),
+            "confidence is a plain number: {json}"
+        );
+        assert!(json.contains("\"c_test\""));
+        let back: DetectionReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, report);
     }
 
     #[test]
@@ -1056,14 +1535,14 @@ mod tests {
         let report = detect(&discover(tmp.path()));
         assert_eq!(report.roots.len(), 1);
         assert_eq!(report.roots[0].analyzers, BTreeSet::from([AnalyzerId::Cpp]));
-        let strategies: BTreeSet<_> = report.plan.iter().map(|p| p.strategy).collect();
+        let build_systems: BTreeSet<_> = report.plan.iter().map(|p| p.build_system).collect();
         assert_eq!(
-            strategies,
+            build_systems,
             BTreeSet::from([
-                Strategy::Cmake,
-                Strategy::Meson,
-                Strategy::Autotools,
-                Strategy::Make
+                Some(BuildSystem::Cmake),
+                Some(BuildSystem::Meson),
+                Some(BuildSystem::Autotools),
+                Some(BuildSystem::Make)
             ])
         );
     }

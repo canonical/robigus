@@ -33,6 +33,16 @@ pub enum StoreError {
     Corrupt(String),
     #[error("invalid analysis status transition from {from} to {to}")]
     InvalidTransition { from: String, to: String },
+    #[error("package not found: {0}")]
+    PackageNotFound(String),
+    /// A status change that would break a §11.3 invariant, for example
+    /// `Started` without plan rows or `Error` without a recorded cause.
+    #[error("status change rejected: {0}")]
+    Invariant(String),
+    /// The value cannot be persisted without loss: reloading it would not
+    /// yield an equal value (spec §11.3, lossless round trip).
+    #[error("cannot store losslessly: {0}")]
+    Unrepresentable(String),
 }
 
 impl From<rusqlite::Error> for StoreError {
@@ -88,11 +98,19 @@ pub struct PredicateError {
     pub message: String,
 }
 
+/// A confidence score outside the 0–100 scale (spec §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("confidence {0} is outside 0..=100")]
+pub struct ConfidenceOutOfRange(pub u8);
+
 /// Project detection failures (spec §7.3).
 #[derive(Debug, thiserror::Error)]
 pub enum DetectError {
     #[error("project tree walk failed: {0}")]
     Walk(String),
+    /// The tree exceeds [`crate::detect::DetectionLimits::max_entries`].
+    #[error("detection limit exceeded: {0}")]
+    LimitExceeded(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

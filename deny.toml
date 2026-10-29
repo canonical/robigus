@@ -15,19 +15,18 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 version = 2
 confidence-threshold = 0.93
 # GPL-3.0-only is the project license (spec §18); GPL-3.0-or-later is
-# compatible and covers ubucargo (Phase 3).
+# compatible and covers ubucargo (Phase 3). Only licenses the dependency tree
+# actually uses are listed (`cargo deny` warns about unused entries); add one
+# when a new dependency legitimately needs it.
 allow = [
     "Apache-2.0",
-    "BSD-2-Clause",
     "BSD-3-Clause",
-    "BSL-1.0",
     "CC0-1.0",
     "GPL-3.0-only",
     "GPL-3.0-or-later",
     "ISC",
     "MIT",
     "MPL-2.0",
-    "OpenSSL",
     "Zlib",
 ]
 

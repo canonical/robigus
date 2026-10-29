@@ -6,6 +6,11 @@ pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 /// The full v1 DDL, applied by migration 1 (spec §11.2). JSON columns hold
 /// serde-serialized model types; nullable-by-design TEXT columns that
 /// participate in unique indexes use `''` for absent values.
+///
+/// v1 has not shipped, so it is still amended in place (spec §22.19–§22.22:
+/// `package.source_reference`, `package_target.path`, and the
+/// root-or-package keyed `analysis_plan`). Once released, changes MUST be new
+/// migrations.
 pub const SCHEMA_V1: &str = r#"
 CREATE TABLE metadata (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
@@ -32,6 +37,7 @@ CREATE TABLE package (
     source_kind     TEXT NOT NULL,
     source_uri      TEXT NOT NULL DEFAULT '',
     source_precise  TEXT NOT NULL DEFAULT '',
+    source_reference TEXT NOT NULL DEFAULT '',
     is_root         INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL DEFAULT 'Not_Started',
     active_features TEXT NOT NULL DEFAULT '[]',
@@ -69,7 +75,8 @@ CREATE TABLE package_target (
     package_id INTEGER NOT NULL REFERENCES package(id) ON DELETE CASCADE,
     name       TEXT NOT NULL,
     kind       TEXT NOT NULL,
-    soname     TEXT NOT NULL DEFAULT ''
+    soname     TEXT NOT NULL DEFAULT '',
+    path       TEXT NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX idx_target_unique ON package_target (package_id, name, kind, soname);
 CREATE INDEX idx_target_name ON package_target (name);
@@ -92,18 +99,28 @@ CREATE TABLE package_conflicts (
 CREATE UNIQUE INDEX idx_conflicts_unique ON package_conflicts (package_id, name, version_req);
 
 CREATE TABLE analysis_plan (
-    id         INTEGER PRIMARY KEY,
-    package_id INTEGER NOT NULL REFERENCES package(id) ON DELETE CASCADE,
-    analyzer   TEXT NOT NULL,
-    strategy   TEXT NOT NULL,
-    status     TEXT NOT NULL,
-    attempts   INTEGER NOT NULL DEFAULT 0,
-    error      TEXT,
-    detail     TEXT,
-    updated_at TEXT NOT NULL
+    id           INTEGER PRIMARY KEY,
+    package_id   INTEGER REFERENCES package(id) ON DELETE CASCADE,
+    root_path    TEXT,
+    analyzer     TEXT NOT NULL,
+    strategy     TEXT NOT NULL CHECK (strategy IN
+                     ('manifest', 'tool_introspection', 'build_observation',
+                      'documentation', 'validation')),
+    build_system TEXT NOT NULL DEFAULT '' CHECK (build_system IN
+                     ('', 'build_script', 'cmake', 'meson', 'autotools', 'make')),
+    status       TEXT NOT NULL CHECK (status IN
+                     ('Pending', 'Running', 'Complete', 'Failed', 'Skipped')),
+    attempts     INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    error        TEXT,
+    detail       TEXT,
+    updated_at   TEXT NOT NULL,
+    CHECK ((package_id IS NULL) <> (root_path IS NULL))
 );
-CREATE UNIQUE INDEX idx_plan_unique ON analysis_plan (package_id, analyzer, strategy);
-CREATE INDEX idx_plan_status        ON analysis_plan (status);
+CREATE UNIQUE INDEX idx_plan_package ON analysis_plan
+    (package_id, analyzer, strategy, build_system) WHERE package_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_plan_root ON analysis_plan
+    (root_path, analyzer, strategy, build_system) WHERE package_id IS NULL;
+CREATE INDEX idx_plan_status ON analysis_plan (status);
 
 CREATE TABLE tool_invocation (
     id           INTEGER PRIMARY KEY,

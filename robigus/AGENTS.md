@@ -140,6 +140,8 @@ Precedence: `!` binds tighter than `&&`, which binds tighter than `||`. An empty
 
 A node is a concrete package instance identified by `PackageId` (name + version + source + ecosystem). The TSP is the root node; a project may have multiple roots (for example workspace members).
 
+Source identity matches the persisted identity columns exactly (§11.2, §22.21): a git source is identified by its URL plus the exact commit (`SourceId.precise`) — the requested branch/tag/rev is stored (`source_reference`) but is not part of the identity, so the same commit requested by branch or by tag is one package; a tarball is identified by its URL plus its digest (`precise`, or the kind's `digest` when `precise` is unset); other sources compare structurally. The store rejects (`StoreError::Unrepresentable`) any `PackageId` that would not load back equal — in particular a version variant other than the one its ecosystem parses back to (SemVer for `rust`, dpkg for `ubuntu`, opaque otherwise).
+
 ```rust
 pub struct Node {
     pub id: PackageId,
@@ -279,7 +281,7 @@ flowchart TD
 
 ### 6.2 Async model
 
-- All public APIs are `async` and run on `tokio`. The one deliberate exception is `ProjectAnalyzer::detect`, which is synchronous by design: it is pure marker inspection over an in-memory `ProjectTree` with no I/O (§7.5).
+- All public APIs that perform I/O are `async` and run on `tokio` (for example `ProjectTree::discover`, whose blocking walk runs in `spawn_blocking`). The deliberate exceptions are `ProjectAnalyzer::detect` and the free function `detect::detect`, which are synchronous by design: pure inspection of an in-memory `ProjectTree` with no I/O (§7.5).
 - Network I/O uses `reqwest`; git uses `gix`. `gix` operations are blocking and MUST run inside `spawn_blocking`.
 - Blocking work (SQLite, archive extraction, CPU-bound parsing) MUST run in `tokio::task::spawn_blocking`.
 - CPU-bound analysis MAY use `rayon` inside a blocking task.
@@ -328,6 +330,9 @@ flowchart TD
 - Extract with `tar` plus `flate2`/`xz2`/`zstd`.
 - Extraction MUST reject absolute paths, `..` traversal, symlinks escaping the destination, device nodes, and setuid/setgid entries; it MUST enforce entry-count and total-size limits (decompression-bomb protection).
 - Never execute anything during extraction.
+- **Download limits**: every HTTP download (tarballs, registry index entries and `.crate` files) has a connect timeout, a whole-request timeout, and a size cap; bodies are streamed and abandoned once over the cap, never buffered unbounded (`DownloadLimits`).
+- **Git**: the whole clone, checkout, and submodule fetch is bounded by a wall-clock timeout, and the checked-out tree is held to the same entry-count and total-size limits as an extracted tarball (checked after checkout). Submodules are checked out recursively at the commit the superproject pins (`update = none` submodules are skipped), within depth and count limits. `.gitmodules` is untrusted: submodule names and paths are validated (no traversal, no symlink crossing) and only allowlisted URL schemes are fetched — `https` by default — so a hostile `file://` or `ssh://` URL cannot pull local repositories or use host credentials (`GitOptions`, §22.24).
+- `FetchedSource::source_id()` pins the root's `SourceId.precise` to the recorded digest (resolved commit, archive digest, or tree digest).
 
 ### 7.3 Detection
 
@@ -349,6 +354,8 @@ v1 ships two analyzers: `cargo` and `cpp`. CMake, Meson, Autotools, and Make are
 
 Polyglot and monorepo projects MUST be supported: detection runs per subdirectory, and multiple analyzers may contribute to one project. Detection MUST skip `target/`, `vendor/`, `node_modules/`, `.git/`, and anything matched by the `ignore` crate's default rules. Crates under `vendor/` are analyzed only when referenced by an in-tree manifest; unreferenced vendored crates are not expanded. Workspace membership follows Cargo: `members` entries are globs whose `*` does not cross `/`, `exclude` entries are path prefixes that override `members`, and both are normalized (`./a` and `a/` name `a`). A Cargo package directory not reached by an ancestor workspace's `members` becomes a separate root only when it has its own `[workspace]` or is listed explicitly in an ancestor workspace's `exclude`; any other such package (test fixtures, examples) is recorded as a detection signal and a non-member crate, but is not a root. A package with no enclosing Cargo root (the top level, or an independent crate in a monorepo whose top level is not Cargo) is always a root. Root assignment MUST NOT depend on marker file names: markers attach to roots shallowest first.
 
+The walk is bounded (`DetectionLimits`: a depth limit, default 64; an entry-count limit, default 500,000, whose violation fails detection; and a size cap on parsed build descriptions, default 1 MiB). Problems that do not stop detection — malformed, oversized, or unreadable manifests, invalid or escaping workspace entries, unreadable directories, reaching the depth limit — are recorded as `DetectionDiagnostic`s in the report and never silently change its meaning; a malformed manifest is treated as a plain (non-workspace) package.
+
 ### 7.4 Characteristics
 
 The analyzer determines and records:
@@ -360,6 +367,8 @@ The analyzer determines and records:
 - target machine architectures;
 - target operating systems and platforms;
 - the dependency mapping plan.
+
+Detection infers what the tree alone shows (`ProjectCharacteristics`): name and version from the top-level Cargo manifest (or the only Cargo root; `workspace.package.version` when inherited), languages by file extension, analyzers and build systems from markers, and test systems from markers and build descriptions (Cargo's harness, CTest's `enable_testing()`/`add_test()`, Meson's `test()`, pytest's `conftest.py`/`pytest.ini`, Go's `*_test.go`). Target architectures and platforms are not inferable from markers; analyzers record them as predicates during analysis (§4, §8).
 
 ### 7.5 Analyzer registry
 
@@ -508,7 +517,8 @@ CREATE TABLE package (
     ecosystem       TEXT NOT NULL,
     source_kind     TEXT NOT NULL,
     source_uri      TEXT NOT NULL DEFAULT '',
-    source_precise  TEXT NOT NULL DEFAULT '',  -- git rev / digest; part of identity
+    source_precise  TEXT NOT NULL DEFAULT '',  -- git commit / tarball digest; part of identity
+    source_reference TEXT NOT NULL DEFAULT '', -- git only: 'default' | 'branch:<n>' | 'tag:<n>' | 'rev:<r>'; NOT identity
     is_root         INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL DEFAULT 'Not_Started',
     active_features TEXT NOT NULL DEFAULT '[]', -- JSON array of unified feature names
@@ -546,7 +556,8 @@ CREATE TABLE package_target (
     package_id INTEGER NOT NULL REFERENCES package(id) ON DELETE CASCADE,
     name       TEXT NOT NULL,
     kind       TEXT NOT NULL,              -- full serialized TargetKind (includes soname for shared libraries)
-    soname     TEXT NOT NULL DEFAULT ''    -- denormalized for soname lookups (Phase 2)
+    soname     TEXT NOT NULL DEFAULT '',   -- denormalized for soname lookups (Phase 2)
+    path       TEXT NOT NULL DEFAULT ''    -- Target.path; '' if none; NOT part of the unique index
 );
 CREATE UNIQUE INDEX idx_target_unique ON package_target (package_id, name, kind, soname);
 CREATE INDEX idx_target_name ON package_target (name);
@@ -569,18 +580,28 @@ CREATE TABLE package_conflicts (
 CREATE UNIQUE INDEX idx_conflicts_unique ON package_conflicts (package_id, name, version_req);
 
 CREATE TABLE analysis_plan (
-    id         INTEGER PRIMARY KEY,
-    package_id INTEGER NOT NULL REFERENCES package(id) ON DELETE CASCADE,
-    analyzer   TEXT NOT NULL,
-    strategy   TEXT NOT NULL,
-    status     TEXT NOT NULL,   -- 'Pending' | 'Running' | 'Complete' | 'Failed' | 'Skipped'
-    attempts   INTEGER NOT NULL DEFAULT 0,
-    error      TEXT,
-    detail     TEXT,
-    updated_at TEXT NOT NULL
+    id           INTEGER PRIMARY KEY,
+    package_id   INTEGER REFERENCES package(id) ON DELETE CASCADE, -- node rows
+    root_path    TEXT,              -- detection rows: workspace-relative root dir ('' = top level)
+    analyzer     TEXT NOT NULL,     -- 'cargo' | 'cpp' | 'python' | 'go' | 'node'
+    strategy     TEXT NOT NULL CHECK (strategy IN       -- §7.6 strategies
+                     ('manifest', 'tool_introspection', 'build_observation',
+                      'documentation', 'validation')),
+    build_system TEXT NOT NULL DEFAULT '' CHECK (build_system IN
+                     ('', 'build_script', 'cmake', 'meson', 'autotools', 'make')),
+    status       TEXT NOT NULL CHECK (status IN
+                     ('Pending', 'Running', 'Complete', 'Failed', 'Skipped')),
+    attempts     INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    error        TEXT,
+    detail       TEXT,
+    updated_at   TEXT NOT NULL,
+    CHECK ((package_id IS NULL) <> (root_path IS NULL))  -- exactly one subject
 );
-CREATE UNIQUE INDEX idx_plan_unique  ON analysis_plan (package_id, analyzer, strategy);
-CREATE INDEX idx_plan_status         ON analysis_plan (status);
+CREATE UNIQUE INDEX idx_plan_package ON analysis_plan
+    (package_id, analyzer, strategy, build_system) WHERE package_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_plan_root ON analysis_plan
+    (root_path, analyzer, strategy, build_system) WHERE package_id IS NULL;
+CREATE INDEX idx_plan_status ON analysis_plan (status);
 
 CREATE TABLE tool_invocation (
     id           INTEGER PRIMARY KEY,
@@ -614,7 +635,7 @@ Schema conventions:
   - every `predicate`, `kinds`, `evidence`, `active_features` JSON value parses into its model type;
   - confidence values are within `0..=100` and within tier caps (in particular `LlmSubAgent` ≤ L3);
   - status invariants: a `Complete` node's targeted dependencies are `Complete`; `Started`/`Error` nodes have at least one plan row and `Error` nodes have a recorded error;
-  - informational findings: unresolved requirements grouped by `requirement_kind`, cycles (SCCs with more than one node), and orphan nodes (no incoming edges and not a root).
+  - informational findings: unresolved requirements grouped by `requirement_kind`, cycles (SCCs with more than one node, plus any node with an edge to itself), and orphan nodes (no incoming edges and not a root).
 - JSON export MUST be lossless with respect to the graph model (everything needed to reconstruct the `Analysis`); DOT export is a lossy visualization. A lossless `import` is future work.
 
 ## 12. Ubuntu Archive Mapping (Phase 2)
@@ -687,8 +708,10 @@ pub struct Store { /* rusqlite connection behind a mutex, driven via spawn_block
 impl Store {
     pub async fn open(path: &Path) -> Result<Self>;               // create/open + migrate
     pub async fn metadata(&self) -> Result<AnalysisMetadata>;
-    pub async fn upsert_node(&self, node: &Node) -> Result<()>;
+    pub async fn upsert_node(&self, node: &Node) -> Result<()>;   // status written on first insert only
     pub async fn upsert_edges(&self, from: &PackageId, edges: &[Edge]) -> Result<()>;
+    pub async fn upsert_plan_rows(&self, rows: &[PlanRow]) -> Result<()>; // root- or package-keyed
+    pub async fn plan_rows(&self) -> Result<Vec<PlanRow>>;
     pub async fn update_status(&self, package: &PackageId, status: AnalysisStatus) -> Result<()>;
     pub async fn record_invocation(&self, invocation: &ToolInvocation) -> Result<()>;
     pub async fn load(&self) -> Result<Analysis>;
@@ -707,7 +730,7 @@ pub fn establish_sandbox(preference: SandboxPreference)
     -> Result<Box<dyn Sandbox>, SandboxUnavailable>;
 ```
 
-- All public APIs are `async` except `ProjectAnalyzer::detect`, which is synchronous by design (§7.5).
+- All public APIs that perform I/O are `async`; `ProjectAnalyzer::detect` and `detect::detect` are synchronous by design (pure in-memory inspection, §6.2, §7.5).
 - `Store` methods are asynchronous: each operation clones the `Arc<Mutex<rusqlite::Connection>>` handle and runs in `tokio::task::spawn_blocking`; callers never touch `rusqlite` directly on an async thread.
 - `SandboxUnavailable` implements `std::error::Error` and a `miette` diagnostic, and carries every attempted mechanism with its OS-level cause (drives exit code 4).
 - `IntegrityReport` exposes the §11.3 findings as typed fields (schema version, foreign-key result, duplicate identities, invalid JSON columns, status violations, confidence-cap violations, unresolved-requirement counts, cycles, orphans).
@@ -729,6 +752,7 @@ pub fn establish_sandbox(preference: SandboxPreference)
 - **Extraction-hardening tests**: absolute paths, `..` traversal, escaping symlinks, device nodes, setuid/setgid entries, and decompression bombs are all rejected.
 - **Containment tests**: a path dependency escaping the analysis root is rejected.
 - **Integration tests** with `assert_cmd`, `predicates`, and `tempfile`.
+- **Test isolation from the developer's environment**: tests that run external tools (for example `git` to build fixture repositories) MUST clear the inherited environment and run only inside temporary directories. The repository's pre-commit hook runs `cargo test`, and git exports `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and similar variables to hooks; inherited, they redirect fixture commands to the enclosing repository.
 - **HTTP mocking** with `wiremock` for registry and archive interactions.
 - **Sandbox tests** verifying that analysis cannot reach non-allowlisted hosts or write outside its workspace.
 - **CI** MUST run `cargo fmt -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo doc --locked --no-deps --all-features`, `cargo test --locked --all-targets --all-features`, `cargo audit`, `cargo deny` (licenses and advisories), and an MSRV job pinned to 1.93.1; CI MUST trigger on pushes as well as pull requests.
@@ -820,3 +844,13 @@ Decisions binding on this specification:
 16. `MachineArch` = `Ubuntu(Architecture)` | `All` | `Unsupported(String)`; `All` expands to the `ubuntu-info-rust` set; unsupported architectures are stubbed (`supported = false`, not expanded); the default analysis set excludes `i386` and includes `amd64v3`.
 17. Separate analysis roots inside a Cargo root are limited to directories with their own `[workspace]` and crates listed explicitly in an ancestor workspace's `exclude`; other non-member crates are recorded, not rooted (§7.3).
 18. Dependency-edge identity uses the canonical predicate in memory as well as in the store: `DependencyGraph::add_edge` canonicalizes the predicate, so equivalent spellings merge into one edge and a graph round-trips through the store unchanged (§4.3, §5.2).
+19. A node's status is written only when it is first inserted (`Store::upsert_node`, and likewise `DependencyGraph::add_node`); every later change goes through `Store::update_status`, which enforces the §7.7 transitions. `update_status` also enforces the §11.3 plan invariants at write time, in the §7.7 order (plan rows first): `Started` requires at least one plan row, and `Error` requires a plan row with a recorded `error`.
+20. `analysis_plan` rows are keyed by subject: detection rows by `root_path` (no package exists yet; future-ecosystem roots never get one), node rows by `package_id` — exactly one of the two is set. `strategy` holds the §7.6 strategies; the build system (`build_script`, `cmake`, `meson`, `autotools`, `make`) is a separate `build_system` column, part of the row key. Detection proposes `manifest` rows; expansion adds the other strategies per node.
+21. A git package's identity is its URL plus the exact commit; the requested reference is stored in `package.source_reference` (kept from the first insert) and is not part of the identity. `SourceId`'s `Eq`/`Ord`/`Hash` follow the same identity.
+22. `package_target.path` stores `Target.path` (`''` when absent; not part of the unique index). Schema v1 is unreleased and was amended in place for decisions 19–22; after release, schema changes MUST be new migrations.
+23. `Store::record_invocation` requires an attributed package to be stored already (`StoreError::PackageNotFound` otherwise) and never creates a placeholder; `package_id: None` records invocations not tied to a node. Only edge-identity unique-constraint collisions take the merge path; any other constraint failure is a real error.
+24. Git submodules are fetched by robigus itself (gix reads but does not clone them): recursively, at the superproject's pinned commits, within depth/count limits, from allowlisted schemes only (`https` by default). Download and git timeouts and size caps are configurable through `FetchOptions`.
+25. Detection reports problems as diagnostics rather than failing or silently changing results, except exceeding the entry-count limit, which fails; its defaults are depth 64, 500,000 entries, and 1 MiB build descriptions.
+26. Confidence is one bounded type, `model::Confidence` (0–100), shared by `Evidence`, `Edge`, and detection signals. `Confidence::new` clamps; `TryFrom<u8>` and deserialization reject values above 100, so an out-of-range confidence cannot be constructed in Rust or loaded from JSON; the database column has a CHECK. It serializes as a plain number.
+27. The source cache is lock-free: work is staged in unique per-process scratch paths and published with an atomic `rename`; losing the race to an identical content-addressed entry is success.
+28. Git acquisition is isolated from the caller's git setup: repositories are opened with `gix::open::Options::isolated()`, so `GIT_*` environment variables and global/system git configuration (for example `url.<base>.insteadOf` rewrites) cannot change what is fetched.

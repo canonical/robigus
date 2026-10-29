@@ -47,6 +47,15 @@ jobs:
       - name: Run clippy linter (cargo clippy)
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+      # `fuzz/` is a detached workspace with its own Cargo.lock, so the
+      # workspace-wide checks above do not cover it. `--locked` also fails the
+      # build when fuzz/Cargo.lock goes stale after a robigus dependency change.
+      - name: Check fuzz target formatting (cargo fmt)
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+
+      - name: Lint fuzz targets (cargo clippy)
+        run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+
       - name: Check documentation (cargo doc)
         env:
           RUSTDOCFLAGS: "-D warnings"

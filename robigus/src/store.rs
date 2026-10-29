@@ -10,13 +10,14 @@
 
 use crate::error::StoreError;
 use crate::model::{
-    AnalysisStatus, Conflict, DependencyGraph, DependencyKind, Ecosystem, Edge, Evidence,
-    GitReference, Node, PackageId, PackageVersion, Provide, Requirement, RequirementKind, SourceId,
-    SourceKind, Target, TargetKind, VersionConstraint,
+    AnalysisStatus, AnalysisStrategy, AnalyzerId, BuildSystem, Confidence, Conflict,
+    DependencyGraph, DependencyKind, Ecosystem, Edge, Evidence, GitReference, Node, PackageId,
+    PackageVersion, PlanRow, PlanStatus, PlanSubject, Provide, Requirement, RequirementKind,
+    SourceId, SourceKind, Target, TargetKind, VersionConstraint,
 };
 use crate::predicate::{Configuration, Predicate};
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -112,7 +113,9 @@ pub struct Store {
     conn: Arc<Mutex<rusqlite::Connection>>,
 }
 
-/// The persisted identity columns of a package (spec §11.2).
+/// The persisted columns describing a package's source (spec §11.2). The
+/// first six form the unique identity; `source_reference` is stored
+/// alongside but is not part of it (spec §22.21).
 #[derive(Debug, Clone)]
 struct PackageIdentity {
     name: String,
@@ -121,26 +124,80 @@ struct PackageIdentity {
     source_kind: String,
     source_uri: String,
     source_precise: String,
+    /// A git source's requested reference ([`GitReference::to_stored_text`]);
+    /// `''` for every other source kind.
+    source_reference: String,
 }
 
+/// The `package` columns read by [`PackageIdentity::from_row`].
+const IDENTITY_COLUMNS: &str =
+    "name, version, ecosystem, source_kind, source_uri, source_precise, source_reference";
+
 impl PackageIdentity {
+    /// The columns for `id`. Use [`PackageIdentity::checked`] when writing.
     fn of(id: &PackageId) -> Self {
+        let source_reference = match &id.source_id.kind {
+            SourceKind::Git { reference, .. } => reference.to_stored_text(),
+            _ => String::new(),
+        };
         Self {
             name: id.name.clone(),
             version: id.version.to_string(),
             ecosystem: id.ecosystem.as_str().to_string(),
             source_kind: id.source_id.kind.kind_name().to_string(),
             source_uri: id.source_id.kind.identity_uri(),
-            source_precise: id.source_id.precise.clone().unwrap_or_default(),
+            source_precise: id
+                .source_id
+                .effective_precise()
+                .unwrap_or_default()
+                .to_string(),
+            source_reference,
         }
+    }
+
+    /// The columns for `id`, verified to load back as an equal `PackageId`
+    /// (spec §11.3: lossless round trip). Rejects ids the schema cannot
+    /// represent — a version variant other than the one the ecosystem parses
+    /// back to (for example a SemVer version on a `system_c` package), a
+    /// non-UTF-8 path, or an apt source (Phase 2) — instead of silently
+    /// storing an identity that would no longer match after `load`.
+    fn checked(id: &PackageId) -> Result<Self, StoreError> {
+        let identity = Self::of(id);
+        match identity.package_id() {
+            Ok(reloaded) if reloaded == *id => Ok(identity),
+            Ok(reloaded) => Err(StoreError::Unrepresentable(format!(
+                "package '{id}' would load back as '{reloaded}' ({:?} vs {:?})",
+                id.version, reloaded.version
+            ))),
+            Err(error) => Err(StoreError::Unrepresentable(format!(
+                "package '{id}': {error}"
+            ))),
+        }
+    }
+
+    /// Reads the [`IDENTITY_COLUMNS`] of a row by name.
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            name: row.get("name")?,
+            version: row.get("version")?,
+            ecosystem: row.get("ecosystem")?,
+            source_kind: row.get("source_kind")?,
+            source_uri: row.get("source_uri")?,
+            source_precise: row.get("source_precise")?,
+            source_reference: row.get("source_reference")?,
+        })
     }
 
     fn package_id(&self) -> Result<PackageId, StoreError> {
         let ecosystem = Ecosystem::parse(&self.ecosystem).ok_or_else(|| {
             StoreError::Corrupt(format!("unknown ecosystem '{}'", self.ecosystem))
         })?;
-        let source_kind =
-            reconstruct_source_kind(&self.source_kind, &self.source_uri, &self.source_precise)?;
+        let source_kind = reconstruct_source_kind(
+            &self.source_kind,
+            &self.source_uri,
+            &self.source_precise,
+            &self.source_reference,
+        )?;
         Ok(PackageId {
             name: self.name.clone(),
             version: PackageVersion::from_stored_text(ecosystem, &self.version),
@@ -153,11 +210,16 @@ impl PackageIdentity {
     }
 }
 
-/// Reconstructs a [`SourceKind`] from the persisted identity columns. The
-/// git reference is not part of the identity; a pinned revision is restored
-/// as the reference. Apt payloads (suite, components, arch) are a Phase 2
+/// Reconstructs a [`SourceKind`] from the persisted source columns. A git
+/// source's reference comes from `source_reference`; a tarball's digest is
+/// its `source_precise`. Apt payloads (suite, components, arch) are a Phase 2
 /// concern and cannot be reconstructed.
-fn reconstruct_source_kind(kind: &str, uri: &str, precise: &str) -> Result<SourceKind, StoreError> {
+fn reconstruct_source_kind(
+    kind: &str,
+    uri: &str,
+    precise: &str,
+    reference: &str,
+) -> Result<SourceKind, StoreError> {
     let url = |text: &str| {
         Url::parse(text)
             .map_err(|error| StoreError::Corrupt(format!("invalid source URI '{text}': {error}")))
@@ -168,11 +230,9 @@ fn reconstruct_source_kind(kind: &str, uri: &str, precise: &str) -> Result<Sourc
         }),
         "git" => Ok(SourceKind::Git {
             url: url(uri)?,
-            reference: if precise.is_empty() {
-                GitReference::DefaultBranch
-            } else {
-                GitReference::Rev(precise.to_string())
-            },
+            reference: GitReference::from_stored_text(reference).ok_or_else(|| {
+                StoreError::Corrupt(format!("invalid git source reference '{reference}'"))
+            })?,
         }),
         "path" => Ok(SourceKind::Path {
             path: PathBuf::from(uri),
@@ -202,9 +262,24 @@ fn join_error(error: tokio::task::JoinError) -> StoreError {
     StoreError::Sqlite(format!("database task failed: {error}"))
 }
 
-fn user_version(conn: &rusqlite::Connection) -> u32 {
-    conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-        .unwrap_or(0) as u32
+fn user_version(conn: &rusqlite::Connection) -> Result<u32, StoreError> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // A negative or oversized value can only come from another writer; it is
+    // reported as too new so the database is never migrated.
+    Ok(u32::try_from(version).unwrap_or(u32::MAX))
+}
+
+/// Creates the database's parent directory. A bare file name (`analysis.db`)
+/// has an empty parent, meaning the current directory, which needs nothing.
+fn ensure_parent_dir(path: &Path) -> Result<(), StoreError> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                StoreError::Sqlite(format!("failed to create database directory: {error}"))
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 fn parse_status(text: &str) -> Result<AnalysisStatus, StoreError> {
@@ -223,16 +298,14 @@ impl Store {
     /// newer schema version fails with [`StoreError::SchemaTooNew`] (CLI
     /// exit code 3).
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                StoreError::Sqlite(format!("failed to create database directory: {error}"))
-            })?;
-        }
+        ensure_parent_dir(path)?;
         let path = path.to_path_buf();
         let conn =
             tokio::task::spawn_blocking(move || -> Result<rusqlite::Connection, StoreError> {
                 let mut conn = rusqlite::Connection::open(&path)?;
-                let found = user_version(&conn);
+                // Fails (rather than reading as version 0) when the file is
+                // not a SQLite database.
+                let found = user_version(&conn)?;
                 if found > schema::SUPPORTED_SCHEMA_VERSION {
                     return Err(StoreError::SchemaTooNew {
                         found,
@@ -274,11 +347,12 @@ impl Store {
         tokio::task::spawn_blocking(move || {
             let conn = lock(&conn)?;
             let now = Utc::now().to_rfc3339();
+            // Only a missing row means "first write"; any other error is real.
             let created_at: Option<String> = conn
                 .query_row("SELECT created_at FROM metadata WHERE id = 1", [], |row| {
                     row.get(0)
                 })
-                .ok();
+                .optional()?;
             let created_at = created_at.unwrap_or(metadata.created_at);
             let configuration = serde_json::to_string(&metadata.configuration)?;
             let toolchain = serde_json::to_string(&metadata.toolchain)?;
@@ -323,13 +397,34 @@ impl Store {
         .map_err(join_error)?
     }
 
-    /// Inserts a node, or updates `is_root`-independent fields on an
-    /// identity conflict: `status`, `active_features`, and `path` are
-    /// overwritten; `is_root` is preserved (see [`Store::set_root`]). The
+    /// Inserts a node, or updates its payload on an identity conflict: the
     /// identity is (name, version, ecosystem, source_kind, source_uri,
     /// source_precise).
+    ///
+    /// On conflict, `active_features`, `path`, targets, provides, and
+    /// conflicts are replaced. `status` is **not**: it is written only when
+    /// the node is first inserted, and every later change goes through
+    /// [`Store::update_status`], which enforces the allowed transitions
+    /// (spec §22.19). Re-discovering a `Complete` dependency therefore never
+    /// resets it. `is_root` is preserved (see [`Store::set_root`]), and a git
+    /// source's recorded reference is kept from the first insert.
+    ///
+    /// Fails with [`StoreError::Unrepresentable`] when the node's identity
+    /// or a provide's version would not load back unchanged.
     pub async fn upsert_node(&self, node: &Node) -> Result<(), StoreError> {
-        let identity = PackageIdentity::of(&node.id);
+        let identity = PackageIdentity::checked(&node.id)?;
+        for provide in &node.provides {
+            if let Some(version) = &provide.version {
+                let reloaded =
+                    PackageVersion::from_stored_text(node.id.ecosystem, &version.to_string());
+                if &reloaded != version {
+                    return Err(StoreError::Unrepresentable(format!(
+                        "provide '{}' version {version:?} of a {} package would load back as {reloaded:?}",
+                        provide.name, node.id.ecosystem
+                    )));
+                }
+            }
+        }
         let status = node.status.as_str().to_string();
         let active_features = serde_json::to_string(&node.active_features)?;
         let path = node
@@ -347,10 +442,16 @@ impl Store {
                     } => soname.clone(),
                     _ => String::new(),
                 };
+                let target_path = target
+                    .path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 Ok((
                     target.name.clone(),
                     serde_json::to_string(&target.kind)?,
                     soname,
+                    target_path,
                 ))
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
@@ -393,12 +494,16 @@ impl Store {
             // possibly another package's.
             let package_id: i64 = tx.query_row(
                 "INSERT INTO package (name, version, ecosystem, source_kind, source_uri,
-                       source_precise, is_root, status, active_features, path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9)
+                       source_precise, source_reference, is_root, status, active_features,
+                       path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10)
                  ON CONFLICT (name, version, ecosystem, source_kind, source_uri, source_precise)
-                 DO UPDATE SET status = excluded.status,
-                               active_features = excluded.active_features,
-                               path = excluded.path
+                 DO UPDATE SET active_features = excluded.active_features,
+                               path = excluded.path,
+                               source_reference = CASE
+                                   WHEN source_reference = '' THEN excluded.source_reference
+                                   ELSE source_reference
+                               END
                  RETURNING id",
                 params![
                     identity.name,
@@ -407,6 +512,7 @@ impl Store {
                     identity.source_kind,
                     identity.source_uri,
                     identity.source_precise,
+                    identity.source_reference,
                     status,
                     active_features,
                     path,
@@ -419,11 +525,11 @@ impl Store {
                 "DELETE FROM package_target WHERE package_id = ?1",
                 params![package_id],
             )?;
-            for (name, kind, soname) in &targets {
+            for (name, kind, soname, target_path) in &targets {
                 tx.execute(
-                    "INSERT INTO package_target (package_id, name, kind, soname)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![package_id, name, kind, soname],
+                    "INSERT INTO package_target (package_id, name, kind, soname, path)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![package_id, name, kind, soname, target_path],
                 )?;
             }
             tx.execute(
@@ -477,7 +583,7 @@ impl Store {
                 ],
             )?;
             if updated == 0 {
-                return Err(StoreError::Corrupt("package not found".to_string()));
+                return Err(StoreError::PackageNotFound(identity.name));
             }
             Ok(())
         })
@@ -518,6 +624,13 @@ impl Store {
     /// Updates a node's analysis status, enforcing the §7.7 transitions:
     /// `Not_Started → Started → Complete | Error`, `Error → Started` (retry),
     /// `Complete` terminal. Same-state updates are idempotent no-ops.
+    ///
+    /// The §11.3 plan invariants are enforced at write time, following the
+    /// §7.7 order (plan rows first, then status): moving to `Started`
+    /// requires at least one plan row for the package, and moving to `Error`
+    /// requires a plan row with a recorded `error` (see
+    /// [`Store::upsert_plan_rows`]). Violations fail with
+    /// [`StoreError::Invariant`].
     pub async fn update_status(
         &self,
         package: &PackageId,
@@ -543,12 +656,47 @@ impl Store {
             ) {
                 Ok(status) => status,
                 Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    return Err(StoreError::Corrupt("package not found".to_string()));
+                    return Err(StoreError::PackageNotFound(identity.name));
                 }
                 Err(error) => return Err(error.into()),
             };
             if current == status.as_str() {
                 return Ok(());
+            }
+            let plan_filter = match status {
+                AnalysisStatus::Started => Some(("", "at least one analysis_plan row")),
+                AnalysisStatus::Error => Some((
+                    " AND ap.error IS NOT NULL",
+                    "an analysis_plan row with a recorded error",
+                )),
+                _ => None,
+            };
+            if let Some((filter, requirement)) = plan_filter {
+                let has_rows: bool = conn.query_row(
+                    &format!(
+                        "SELECT EXISTS (
+                             SELECT 1 FROM analysis_plan ap JOIN package p ON p.id = ap.package_id
+                             WHERE p.name = ?1 AND p.version = ?2 AND p.ecosystem = ?3
+                               AND p.source_kind = ?4 AND p.source_uri = ?5
+                               AND p.source_precise = ?6{filter})"
+                    ),
+                    params![
+                        identity.name,
+                        identity.version,
+                        identity.ecosystem,
+                        identity.source_kind,
+                        identity.source_uri,
+                        identity.source_precise,
+                    ],
+                    |row| row.get(0),
+                )?;
+                if !has_rows {
+                    return Err(StoreError::Invariant(format!(
+                        "{} requires {requirement} for package '{}'",
+                        status.as_str(),
+                        identity.name
+                    )));
+                }
             }
             let allowed = matches!(
                 (current.as_str(), status),
@@ -584,6 +732,11 @@ impl Store {
 
     /// Records one tool execution (spec §10.2). The caller scrubs `argv` and
     /// `env` of secrets before recording.
+    ///
+    /// An invocation attributed to a package requires that package to be
+    /// stored already ([`StoreError::PackageNotFound`] otherwise); recording
+    /// never fabricates a placeholder package. Use `package_id: None` for
+    /// invocations not tied to a node (for example toolchain probes).
     pub async fn record_invocation(&self, invocation: &ToolInvocation) -> Result<(), StoreError> {
         let identity = invocation.package_id.as_ref().map(PackageIdentity::of);
         let argv = serde_json::to_string(&invocation.argv)?;
@@ -599,7 +752,10 @@ impl Store {
         tokio::task::spawn_blocking(move || {
             let conn = lock(&conn)?;
             let package_id = match &identity {
-                Some(identity) => Some(package_row_id(&conn, identity)?),
+                Some(identity) => Some(
+                    find_package_row_id(&conn, identity)?
+                        .ok_or_else(|| StoreError::PackageNotFound(identity.name.clone()))?,
+                ),
                 None => None,
             };
             conn.execute(
@@ -620,6 +776,121 @@ impl Store {
                 ],
             )?;
             Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    /// Inserts or updates analysis-plan rows in one transaction (spec §2,
+    /// §7.7 step 2). Rows are keyed by `(subject, analyzer, strategy,
+    /// build_system)`; for an existing row, `status`, `attempts`, `error`,
+    /// and `detail` are replaced and `updated_at` is stamped.
+    ///
+    /// A [`PlanSubject::Root`] row needs no package (detection runs before
+    /// any exists). A [`PlanSubject::Package`] row requires the package to be
+    /// stored already ([`StoreError::PackageNotFound`] otherwise); no
+    /// placeholder package is created.
+    pub async fn upsert_plan_rows(&self, rows: &[PlanRow]) -> Result<(), StoreError> {
+        let prepared = rows
+            .iter()
+            .map(|row| {
+                let subject = match &row.subject {
+                    PlanSubject::Root(path) => PlanKey::Root(
+                        path.to_str()
+                            .ok_or_else(|| {
+                                StoreError::Unrepresentable(format!(
+                                    "plan root path {path:?} is not UTF-8"
+                                ))
+                            })?
+                            .to_string(),
+                    ),
+                    PlanSubject::Package(id) => PlanKey::Package(PackageIdentity::checked(id)?),
+                };
+                Ok((subject, row.clone()))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = lock(&conn)?;
+            let tx = conn.transaction()?;
+            let now = Utc::now().to_rfc3339();
+            for (subject, row) in &prepared {
+                let (package_id, root_path) =
+                    match subject {
+                        PlanKey::Root(path) => (None, Some(path.as_str())),
+                        PlanKey::Package(identity) => (
+                            Some(find_package_row_id(&tx, identity)?.ok_or_else(|| {
+                                StoreError::PackageNotFound(identity.name.clone())
+                            })?),
+                            None,
+                        ),
+                    };
+                let analyzer = row.analyzer.as_str();
+                let strategy = row.strategy.as_str();
+                let build_system = row.build_system.map(BuildSystem::as_str).unwrap_or("");
+                let existing: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM analysis_plan
+                         WHERE package_id IS ?1 AND root_path IS ?2 AND analyzer = ?3
+                           AND strategy = ?4 AND build_system = ?5",
+                        params![package_id, root_path, analyzer, strategy, build_system],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match existing {
+                    Some(id) => {
+                        tx.execute(
+                            "UPDATE analysis_plan
+                             SET status = ?1, attempts = ?2, error = ?3, detail = ?4,
+                                 updated_at = ?5
+                             WHERE id = ?6",
+                            params![
+                                row.status.as_str(),
+                                row.attempts,
+                                row.error,
+                                row.detail,
+                                now,
+                                id
+                            ],
+                        )?;
+                    }
+                    None => {
+                        tx.execute(
+                            "INSERT INTO analysis_plan (package_id, root_path, analyzer, strategy,
+                                   build_system, status, attempts, error, detail, updated_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            params![
+                                package_id,
+                                root_path,
+                                analyzer,
+                                strategy,
+                                build_system,
+                                row.status.as_str(),
+                                row.attempts,
+                                row.error,
+                                row.detail,
+                                now
+                            ],
+                        )?;
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    /// Every analysis-plan row, sorted.
+    pub async fn plan_rows(&self) -> Result<Vec<PlanRow>, StoreError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = lock(&conn)?;
+            let tx = conn.transaction()?;
+            let rows = read_plan_rows(&tx)?;
+            tx.commit()?;
+            Ok(rows)
         })
         .await
         .map_err(join_error)?
@@ -659,6 +930,90 @@ impl Store {
     }
 }
 
+/// The resolved subject of a plan row being written.
+enum PlanKey {
+    Root(String),
+    Package(PackageIdentity),
+}
+
+/// Looks up a package's row id without creating anything.
+fn find_package_row_id(
+    conn: &rusqlite::Connection,
+    identity: &PackageIdentity,
+) -> Result<Option<i64>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM package
+             WHERE name = ?1 AND version = ?2 AND ecosystem = ?3
+               AND source_kind = ?4 AND source_uri = ?5 AND source_precise = ?6",
+            params![
+                identity.name,
+                identity.version,
+                identity.ecosystem,
+                identity.source_kind,
+                identity.source_uri,
+                identity.source_precise,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn read_plan_rows(conn: &rusqlite::Connection) -> Result<Vec<PlanRow>, StoreError> {
+    let package_columns = IDENTITY_COLUMNS
+        .split(", ")
+        .map(|column| format!("p.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut statement = conn.prepare(&format!(
+        "SELECT ap.package_id, ap.root_path, ap.analyzer, ap.strategy, ap.build_system,
+                ap.status AS plan_status, ap.attempts, ap.error, ap.detail, {package_columns}
+         FROM analysis_plan ap LEFT JOIN package p ON p.id = ap.package_id
+         ORDER BY ap.id"
+    ))?;
+    let corrupt = |column: &str, value: &str| {
+        StoreError::Corrupt(format!("unknown analysis_plan.{column} '{value}'"))
+    };
+    let mut rows = statement.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let package_id: Option<i64> = row.get("package_id")?;
+        let root_path: Option<String> = row.get("root_path")?;
+        let subject = match (package_id, root_path) {
+            (Some(_), None) => PlanSubject::Package(PackageIdentity::from_row(row)?.package_id()?),
+            (None, Some(path)) => PlanSubject::Root(PathBuf::from(path)),
+            _ => {
+                return Err(StoreError::Corrupt(
+                    "analysis_plan row must have exactly one of package_id and root_path"
+                        .to_string(),
+                ));
+            }
+        };
+        let analyzer: String = row.get("analyzer")?;
+        let strategy: String = row.get("strategy")?;
+        let build_system: String = row.get("build_system")?;
+        let status: String = row.get("plan_status")?;
+        out.push(PlanRow {
+            subject,
+            analyzer: AnalyzerId::parse(&analyzer).ok_or_else(|| corrupt("analyzer", &analyzer))?,
+            strategy: AnalysisStrategy::parse(&strategy)
+                .ok_or_else(|| corrupt("strategy", &strategy))?,
+            build_system: match build_system.as_str() {
+                "" => None,
+                text => {
+                    Some(BuildSystem::parse(text).ok_or_else(|| corrupt("build_system", text))?)
+                }
+            },
+            status: PlanStatus::parse(&status).ok_or_else(|| corrupt("status", &status))?,
+            attempts: row.get("attempts")?,
+            error: row.get("error")?,
+            detail: row.get("detail")?,
+        });
+    }
+    out.sort();
+    Ok(out)
+}
+
 fn package_row_id(
     conn: &rusqlite::Connection,
     identity: &PackageIdentity,
@@ -683,8 +1038,9 @@ fn package_row_id(
             // — mirrors `DependencyGraph::add_edge` (spec §5.2).
             conn.execute(
                 "INSERT INTO package (name, version, ecosystem, source_kind, source_uri,
-                       source_precise, is_root, status, active_features, path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 'Not_Started', '[]', '')",
+                       source_precise, source_reference, is_root, status, active_features,
+                       path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'Not_Started', '[]', '')",
                 params![
                     identity.name,
                     identity.version,
@@ -692,6 +1048,7 @@ fn package_row_id(
                     identity.source_kind,
                     identity.source_uri,
                     identity.source_precise,
+                    identity.source_reference,
                 ],
             )?;
             Ok(conn.last_insert_rowid())
@@ -701,9 +1058,12 @@ fn package_row_id(
 }
 
 fn upsert_edge(tx: &rusqlite::Transaction<'_>, edge: &Edge) -> Result<(), StoreError> {
-    let from_id = package_row_id(tx, &PackageIdentity::of(&edge.from))?;
+    // `Confidence` cannot exceed 100, so the edge-identity unique index is
+    // the only constraint a well-formed edge can hit; the merge path below
+    // handles it.
+    let from_id = package_row_id(tx, &PackageIdentity::checked(&edge.from)?)?;
     let to_id = match &edge.to {
-        Some(id) => Some(package_row_id(tx, &PackageIdentity::of(id))?),
+        Some(id) => Some(package_row_id(tx, &PackageIdentity::checked(id)?)?),
         None => None,
     };
     let requirement = edge.requirement.name.clone();
@@ -738,14 +1098,16 @@ fn upsert_edge(tx: &rusqlite::Transaction<'_>, edge: &Edge) -> Result<(), StoreE
             columns.version_req,
             kinds,
             columns.predicate,
-            edge.confidence,
+            edge.confidence.value(),
             evidence,
         ],
     );
     match inserted {
         Ok(_) => Ok(()),
+        // Only an edge-identity collision is merged; any other constraint
+        // failure (CHECK, NOT NULL, foreign key) is a real error.
         Err(rusqlite::Error::SqliteFailure(ref failure, _))
-            if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+            if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
         {
             merge_edge_row(tx, &columns, edge)
         }
@@ -800,7 +1162,7 @@ fn merge_edge_row(
     let (existing_id, existing_kinds, existing_confidence, existing_evidence) = existing;
     let mut kinds: BTreeSet<DependencyKind> = serde_json::from_str(&existing_kinds)?;
     kinds.extend(edge.kinds.iter().copied());
-    let confidence = existing_confidence.max(edge.confidence as i64);
+    let confidence = existing_confidence.max(i64::from(edge.confidence.value()));
     let mut evidence: Vec<Evidence> = serde_json::from_str(&existing_evidence)?;
     for record in &edge.evidence {
         if !evidence.contains(record) {
@@ -853,22 +1215,14 @@ fn read_graph(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError
     let mut ecosystems: HashMap<i64, Ecosystem> = HashMap::new();
 
     {
-        let mut statement = conn.prepare(
-            "SELECT id, name, version, ecosystem, source_kind, source_uri, source_precise,
-                    is_root, status, active_features, path
-             FROM package ORDER BY id",
-        )?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT id, {IDENTITY_COLUMNS}, is_root, status, active_features, path
+             FROM package ORDER BY id"
+        ))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let row_id: i64 = row.get("id")?;
-            let identity = PackageIdentity {
-                name: row.get("name")?,
-                version: row.get("version")?,
-                ecosystem: row.get("ecosystem")?,
-                source_kind: row.get("source_kind")?,
-                source_uri: row.get("source_uri")?,
-                source_precise: row.get("source_precise")?,
-            };
+            let identity = PackageIdentity::from_row(row)?;
             let package_id = identity.package_id()?;
             let ecosystem = Ecosystem::parse(&identity.ecosystem).ok_or_else(|| {
                 StoreError::Corrupt(format!("unknown ecosystem '{}'", identity.ecosystem))
@@ -897,16 +1251,16 @@ fn read_graph(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError
 
     {
         let mut statement =
-            conn.prepare("SELECT package_id, name, kind, soname FROM package_target ORDER BY id")?;
+            conn.prepare("SELECT package_id, name, kind, path FROM package_target ORDER BY id")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let package_row: i64 = row.get("package_id")?;
             let kind: TargetKind = serde_json::from_str(&row.get::<_, String>("kind")?)?;
+            let path_text: String = row.get("path")?;
             let target = Target {
                 name: row.get("name")?,
                 kind,
-                // `package_target` has no path column (spec §11.2).
-                path: None,
+                path: (!path_text.is_empty()).then(|| PathBuf::from(path_text)),
             };
             let Some(package_id) = by_row_id.get(&package_row) else {
                 return Err(StoreError::Corrupt(
@@ -1023,7 +1377,8 @@ fn read_graph(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError
             let kinds: BTreeSet<DependencyKind> =
                 serde_json::from_str(&row.get::<_, String>("kinds")?)?;
             let predicate = Predicate::parse(&row.get::<_, String>("predicate")?)?;
-            let confidence: u8 = row.get("confidence")?;
+            let confidence = Confidence::try_from(row.get::<_, u8>("confidence")?)
+                .map_err(|error| StoreError::Corrupt(error.to_string()))?;
             let evidence: Vec<Evidence> = serde_json::from_str(&row.get::<_, String>("evidence")?)?;
             graph.add_edge(Edge {
                 from,
@@ -1042,7 +1397,7 @@ fn read_graph(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError
 
 fn run_checks(conn: &rusqlite::Connection) -> Result<IntegrityReport, StoreError> {
     let mut report = IntegrityReport {
-        schema_version: user_version(conn),
+        schema_version: user_version(conn)?,
         ..IntegrityReport::default()
     };
 
@@ -1064,20 +1419,12 @@ fn run_checks(conn: &rusqlite::Connection) -> Result<IntegrityReport, StoreError
 
     // JSON validity, identity corruption, and confidence caps.
     {
-        let mut statement = conn.prepare(
-            "SELECT name, version, ecosystem, source_kind, source_uri, source_precise,
-                    active_features FROM package ORDER BY id",
-        )?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT {IDENTITY_COLUMNS}, active_features FROM package ORDER BY id"
+        ))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            let identity = PackageIdentity {
-                name: row.get("name")?,
-                version: row.get("version")?,
-                ecosystem: row.get("ecosystem")?,
-                source_kind: row.get("source_kind")?,
-                source_uri: row.get("source_uri")?,
-                source_precise: row.get("source_precise")?,
-            };
+            let identity = PackageIdentity::from_row(row)?;
             if identity.package_id().is_err() {
                 report.corrupt_identities += 1;
             }
@@ -1151,10 +1498,11 @@ fn run_checks(conn: &rusqlite::Connection) -> Result<IntegrityReport, StoreError
     }
 
     // Status invariants.
+    // Each query selects the identity columns of `package p` (see
+    // `collect_identity_violations`).
     collect_identity_violations(
         conn,
-        "SELECT p.name, p.version, p.ecosystem, p.source_kind, p.source_uri, p.source_precise
-         FROM package p
+        "FROM package p
          JOIN dependency_edge e ON e.from_package_id = p.id AND e.to_package_id IS NOT NULL
          JOIN package t ON t.id = e.to_package_id
          WHERE p.status = 'Complete' AND t.status != 'Complete'
@@ -1163,16 +1511,14 @@ fn run_checks(conn: &rusqlite::Connection) -> Result<IntegrityReport, StoreError
     )?;
     collect_identity_violations(
         conn,
-        "SELECT p.name, p.version, p.ecosystem, p.source_kind, p.source_uri, p.source_precise
-         FROM package p
+        "FROM package p
          WHERE p.status IN ('Started', 'Error')
            AND NOT EXISTS (SELECT 1 FROM analysis_plan ap WHERE ap.package_id = p.id)",
         &mut report,
     )?;
     collect_identity_violations(
         conn,
-        "SELECT p.name, p.version, p.ecosystem, p.source_kind, p.source_uri, p.source_precise
-         FROM package p
+        "FROM package p
          WHERE p.status = 'Error'
            AND NOT EXISTS (
                SELECT 1 FROM analysis_plan ap WHERE ap.package_id = p.id AND ap.error IS NOT NULL
@@ -1198,24 +1544,17 @@ fn run_checks(conn: &rusqlite::Connection) -> Result<IntegrityReport, StoreError
 
     // Informational: orphans (no incoming edges, not a root).
     {
-        let mut statement = conn.prepare(
-            "SELECT name, version, ecosystem, source_kind, source_uri, source_precise
+        let mut statement = conn.prepare(&format!(
+            "SELECT {IDENTITY_COLUMNS}
              FROM package p
              WHERE p.is_root = 0
                AND NOT EXISTS (
                    SELECT 1 FROM dependency_edge e WHERE e.to_package_id = p.id
-               )",
-        )?;
+               )"
+        ))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            let identity = PackageIdentity {
-                name: row.get("name")?,
-                version: row.get("version")?,
-                ecosystem: row.get("ecosystem")?,
-                source_kind: row.get("source_kind")?,
-                source_uri: row.get("source_uri")?,
-                source_precise: row.get("source_precise")?,
-            };
+            let identity = PackageIdentity::from_row(row)?;
             match identity.package_id() {
                 Ok(id) => report.orphans.push(id),
                 Err(_) => report.corrupt_identities += 1,
@@ -1236,22 +1575,22 @@ fn run_checks(conn: &rusqlite::Connection) -> Result<IntegrityReport, StoreError
     Ok(report)
 }
 
+/// Runs `SELECT <identity columns of p> <from_clause>` and records each row
+/// as a status violation.
 fn collect_identity_violations(
     conn: &rusqlite::Connection,
-    query: &str,
+    from_clause: &str,
     report: &mut IntegrityReport,
 ) -> Result<(), StoreError> {
-    let mut statement = conn.prepare(query)?;
+    let columns = IDENTITY_COLUMNS
+        .split(", ")
+        .map(|column| format!("p.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut statement = conn.prepare(&format!("SELECT {columns} {from_clause}"))?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        let identity = PackageIdentity {
-            name: row.get(0)?,
-            version: row.get(1)?,
-            ecosystem: row.get(2)?,
-            source_kind: row.get(3)?,
-            source_uri: row.get(4)?,
-            source_precise: row.get(5)?,
-        };
+        let identity = PackageIdentity::from_row(row)?;
         match identity.package_id() {
             Ok(id) => report.status_violations.push(id),
             Err(_) => report.corrupt_identities += 1,
@@ -1305,10 +1644,10 @@ mod tests {
             },
             kinds: BTreeSet::from([kind]),
             predicate: Predicate::TRUE,
-            confidence,
+            confidence: Confidence::new(confidence),
             evidence: vec![Evidence {
                 method: EvidenceMethod::Manifest,
-                confidence,
+                confidence: Confidence::new(confidence),
                 location: None,
                 detail: None,
             }],
@@ -1501,11 +1840,11 @@ mod tests {
             .expect("resolved edge");
         assert!(resolved.kinds.contains(&DependencyKind::Normal));
         assert!(resolved.kinds.contains(&DependencyKind::Development));
-        assert_eq!(resolved.confidence, 80);
+        assert_eq!(resolved.confidence.value(), 80);
         assert_eq!(resolved.evidence.len(), 2);
         let unresolved = analysis.graph.unresolved();
         assert_eq!(unresolved.len(), 1);
-        assert_eq!(unresolved[0].confidence, 60);
+        assert_eq!(unresolved[0].confidence.value(), 60);
     }
 
     #[tokio::test]
@@ -1610,6 +1949,318 @@ mod tests {
         assert_eq!(loaded.edges_from(&a), graph.edges_from(&a));
     }
 
+    fn package_plan_row(id: &PackageId, status: PlanStatus, error: Option<&str>) -> PlanRow {
+        let mut row = PlanRow::new(
+            PlanSubject::Package(id.clone()),
+            AnalyzerId::Cargo,
+            AnalysisStrategy::ToolIntrospection,
+            None,
+            status,
+        );
+        row.error = error.map(str::to_string);
+        row
+    }
+
+    fn git_id(name: &str, reference: GitReference) -> PackageId {
+        PackageId {
+            name: name.to_string(),
+            version: PackageVersion::SemVer(Version::new(0, 1, 0)),
+            source_id: SourceId {
+                kind: SourceKind::Git {
+                    url: Url::parse("https://github.com/example/repo").unwrap(),
+                    reference,
+                },
+                precise: Some("ab".repeat(20)),
+            },
+            ecosystem: Ecosystem::Rust,
+        }
+    }
+
+    /// Regression (High 2): re-saving a node never changes its status; only
+    /// `update_status` does.
+    #[tokio::test]
+    async fn reupsert_does_not_change_status() {
+        let (store, _dir) = open_test_store().await;
+        store.write_metadata(&test_metadata()).await.unwrap();
+        let id = test_id("a");
+        store.upsert_node(&Node::new(id.clone())).await.unwrap();
+        store
+            .upsert_plan_rows(&[package_plan_row(&id, PlanStatus::Complete, None)])
+            .await
+            .unwrap();
+        store
+            .update_status(&id, AnalysisStatus::Started)
+            .await
+            .unwrap();
+        store
+            .update_status(&id, AnalysisStatus::Complete)
+            .await
+            .unwrap();
+
+        // Re-discovered as a fresh Not_Started node with new features.
+        let mut rediscovered = Node::new(id.clone());
+        rediscovered.active_features = BTreeSet::from(["std".to_string()]);
+        store.upsert_node(&rediscovered).await.unwrap();
+
+        let graph = store.load().await.unwrap().graph;
+        let node = graph.node(&id).unwrap();
+        assert_eq!(node.status, AnalysisStatus::Complete);
+        assert!(
+            node.active_features.contains("std"),
+            "payload is still replaced"
+        );
+
+        // A node inserted with a status keeps it (first insert only).
+        let mut fresh = Node::new(test_id("b"));
+        fresh.status = AnalysisStatus::Started;
+        store.upsert_node(&fresh).await.unwrap();
+        let graph = store.load().await.unwrap().graph;
+        assert_eq!(
+            graph.node(&test_id("b")).unwrap().status,
+            AnalysisStatus::Started
+        );
+    }
+
+    /// High 3: `Started` needs plan rows and `Error` needs a recorded cause,
+    /// enforced at write time.
+    #[tokio::test]
+    async fn status_changes_require_plan_rows() {
+        let (store, _dir) = open_test_store().await;
+        let id = test_id("a");
+        store.upsert_node(&Node::new(id.clone())).await.unwrap();
+        let error = store
+            .update_status(&id, AnalysisStatus::Started)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Invariant(_)), "{error}");
+
+        store
+            .upsert_plan_rows(&[package_plan_row(&id, PlanStatus::Running, None)])
+            .await
+            .unwrap();
+        store
+            .update_status(&id, AnalysisStatus::Started)
+            .await
+            .unwrap();
+        let error = store
+            .update_status(&id, AnalysisStatus::Error)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Invariant(_)), "{error}");
+
+        let missing = store
+            .update_status(&test_id("missing"), AnalysisStatus::Started)
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, StoreError::PackageNotFound(_)));
+    }
+
+    /// High 3: detection rows are keyed by root directory, node rows by
+    /// package; both round-trip, and the key includes the build system.
+    #[tokio::test]
+    async fn plan_rows_round_trip_and_upsert_by_key() {
+        let (store, _dir) = open_test_store().await;
+        store.write_metadata(&test_metadata()).await.unwrap();
+        let id = test_id("a");
+        store.upsert_node(&Node::new(id.clone())).await.unwrap();
+
+        let root_row = |build_system, status| {
+            PlanRow::new(
+                PlanSubject::Root(PathBuf::new()),
+                AnalyzerId::Cpp,
+                AnalysisStrategy::Manifest,
+                build_system,
+                status,
+            )
+        };
+        let skipped = PlanRow::new(
+            PlanSubject::Root(PathBuf::from("py")),
+            AnalyzerId::Python,
+            AnalysisStrategy::Manifest,
+            None,
+            PlanStatus::Skipped,
+        );
+        store
+            .upsert_plan_rows(&[
+                root_row(Some(BuildSystem::Cmake), PlanStatus::Pending),
+                root_row(Some(BuildSystem::Meson), PlanStatus::Pending),
+                skipped.clone(),
+                package_plan_row(&id, PlanStatus::Running, None),
+            ])
+            .await
+            .unwrap();
+        // Same key → update, not a new row.
+        let mut failed =
+            package_plan_row(&id, PlanStatus::Failed, Some("cargo metadata exited 101"));
+        failed.attempts = 2;
+        failed.detail = Some("{\"stderr\":\"log/1.txt\"}".to_string());
+        store
+            .upsert_plan_rows(&[
+                root_row(Some(BuildSystem::Cmake), PlanStatus::Complete),
+                failed.clone(),
+            ])
+            .await
+            .unwrap();
+
+        let rows = store.plan_rows().await.unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.contains(&root_row(Some(BuildSystem::Cmake), PlanStatus::Complete)));
+        assert!(rows.contains(&root_row(Some(BuildSystem::Meson), PlanStatus::Pending)));
+        assert!(rows.contains(&skipped));
+        assert!(rows.contains(&failed));
+        let mut sorted = rows.clone();
+        sorted.sort();
+        assert_eq!(rows, sorted);
+
+        // A package row needs the package to exist; no placeholder is made.
+        let error = store
+            .upsert_plan_rows(&[package_plan_row(
+                &test_id("ghost"),
+                PlanStatus::Pending,
+                None,
+            )])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::PackageNotFound(_)));
+        assert!(
+            store
+                .load()
+                .await
+                .unwrap()
+                .graph
+                .node(&test_id("ghost"))
+                .is_none()
+        );
+
+        // The schema enforces the strategy/status vocabularies and the
+        // exactly-one-subject rule.
+        let raw = rusqlite::Connection::open(_dir.path().join("analysis.db")).unwrap();
+        for statement in [
+            "INSERT INTO analysis_plan (root_path, analyzer, strategy, status, updated_at)
+             VALUES ('', 'cpp', 'cmake', 'Pending', 'now')",
+            "INSERT INTO analysis_plan (root_path, analyzer, strategy, status, updated_at)
+             VALUES ('', 'cpp', 'manifest', 'Bogus', 'now')",
+            "INSERT INTO analysis_plan (analyzer, strategy, status, updated_at)
+             VALUES ('cpp', 'manifest', 'Pending', 'now')",
+        ] {
+            assert!(raw.execute(statement, []).is_err(), "{statement}");
+        }
+    }
+
+    /// High 4: a git package's identity is its URL plus the commit; the
+    /// requested reference is stored but does not split identities, and the
+    /// id loads back exactly.
+    #[tokio::test]
+    async fn git_identity_is_url_plus_commit() {
+        let (store, _dir) = open_test_store().await;
+        store.write_metadata(&test_metadata()).await.unwrap();
+        let by_branch = git_id("g", GitReference::Branch("main".to_string()));
+        let by_tag = git_id("g", GitReference::Tag("v0.1.0".to_string()));
+        assert_eq!(by_branch, by_tag, "same URL and commit → same package");
+
+        store
+            .upsert_node(&Node::new(by_branch.clone()))
+            .await
+            .unwrap();
+        store.upsert_node(&Node::new(by_tag.clone())).await.unwrap();
+        let graph = store.load().await.unwrap().graph;
+        assert_eq!(graph.node_count(), 1);
+        let (loaded, _) = graph.nodes().next().unwrap();
+        // The reference of the first insert is kept.
+        match &loaded.source_id.kind {
+            SourceKind::Git { reference, .. } => {
+                assert_eq!(reference, &GitReference::Branch("main".to_string()));
+            }
+            other => panic!("unexpected source {other:?}"),
+        }
+        assert!(
+            graph.node(&by_branch).is_some(),
+            "lookup by the original id works"
+        );
+
+        // A different commit is a different package.
+        let mut other_commit = by_branch.clone();
+        other_commit.source_id.precise = Some("cd".repeat(20));
+        store.upsert_node(&Node::new(other_commit)).await.unwrap();
+        assert_eq!(store.load().await.unwrap().graph.node_count(), 2);
+    }
+
+    /// High 4: target paths and tarball digests survive a round trip.
+    #[tokio::test]
+    async fn target_paths_and_tarball_ids_round_trip() {
+        let (store, _dir) = open_test_store().await;
+        store.write_metadata(&test_metadata()).await.unwrap();
+        let digest = "ef".repeat(32);
+        let tarball = PackageId {
+            name: "t".to_string(),
+            version: PackageVersion::SemVer(Version::new(1, 2, 3)),
+            source_id: SourceId {
+                kind: SourceKind::Tarball {
+                    url: Url::parse("https://example.com/t-1.2.3.tar.gz").unwrap(),
+                    digest: Some(digest.clone()),
+                },
+                precise: None,
+            },
+            ecosystem: Ecosystem::Rust,
+        };
+        let mut node = Node::new(tarball.clone());
+        node.targets = vec![
+            Target {
+                name: "t".to_string(),
+                kind: TargetKind::Binary,
+                path: Some(PathBuf::from("src/main.rs")),
+            },
+            Target {
+                name: "t-lib".to_string(),
+                kind: TargetKind::RustLib { proc_macro: false },
+                path: None,
+            },
+        ];
+        store.upsert_node(&node).await.unwrap();
+
+        let graph = store.load().await.unwrap().graph;
+        let loaded = graph.node(&tarball).expect("tarball id loads back");
+        assert_eq!(loaded.targets, node.targets);
+        assert_eq!(
+            loaded.id.source_id.effective_precise(),
+            Some(digest.as_str())
+        );
+    }
+
+    /// High 4: ids the schema cannot represent are rejected instead of
+    /// being stored as an identity that would not match after `load`.
+    #[tokio::test]
+    async fn unrepresentable_ids_are_rejected() {
+        let (store, _dir) = open_test_store().await;
+        let mut semver_system_lib = test_id("zlib");
+        semver_system_lib.ecosystem = Ecosystem::SystemC;
+        let error = store
+            .upsert_node(&Node::new(semver_system_lib))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Unrepresentable(_)), "{error}");
+
+        let mut opaque_rust = test_id("r");
+        opaque_rust.version = PackageVersion::Opaque("1.0.0".to_string());
+        assert!(store.upsert_node(&Node::new(opaque_rust)).await.is_err());
+
+        // Edge endpoints are checked too.
+        let a = test_id("a");
+        let mut bad = test_id("b");
+        bad.ecosystem = Ecosystem::Generic;
+        let edge = test_edge(a.clone(), Some(bad), DependencyKind::Normal, 50);
+        assert!(store.upsert_edges(&a, &[edge]).await.is_err());
+
+        // The matching representation is accepted.
+        let mut opaque_system_lib = test_id("zlib");
+        opaque_system_lib.ecosystem = Ecosystem::SystemC;
+        opaque_system_lib.version = PackageVersion::Opaque("1.3".to_string());
+        store
+            .upsert_node(&Node::new(opaque_system_lib))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn status_transitions_are_enforced() {
         let (store, _dir) = open_test_store().await;
@@ -1628,8 +2279,18 @@ mod tests {
                 .is_ok()
         ); // same-state no-op
 
+        // §7.7: plan rows are written before the node is Started.
+        store
+            .upsert_plan_rows(&[package_plan_row(&id, PlanStatus::Running, None)])
+            .await
+            .unwrap();
         store
             .update_status(&id, AnalysisStatus::Started)
+            .await
+            .unwrap();
+        // …and the failure cause is recorded before the node is Error.
+        store
+            .upsert_plan_rows(&[package_plan_row(&id, PlanStatus::Failed, Some("boom"))])
             .await
             .unwrap();
         store
@@ -1735,6 +2396,89 @@ mod tests {
         assert_eq!(tool, "cargo metadata");
     }
 
+    /// Regression (Medium): an invocation for an unknown package is an error
+    /// and never fabricates a placeholder `package` row.
+    #[tokio::test]
+    async fn record_invocation_requires_a_stored_package() {
+        let (store, dir) = open_test_store().await;
+        store.write_metadata(&test_metadata()).await.unwrap();
+        let invocation = |package_id| ToolInvocation {
+            package_id,
+            tool: "rustc".to_string(),
+            argv: vec!["rustc".to_string(), "--version".to_string()],
+            env: BTreeMap::new(),
+            tool_version: None,
+            sandbox_mode: "bwrap".to_string(),
+            exit_status: "success".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            duration_ms: 1,
+            log_path: None,
+        };
+        let error = store
+            .record_invocation(&invocation(Some(test_id("ghost"))))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::PackageNotFound(_)), "{error}");
+        // A package-less invocation is fine.
+        store.record_invocation(&invocation(None)).await.unwrap();
+
+        let raw = rusqlite::Connection::open(dir.path().join("analysis.db")).unwrap();
+        let packages: i64 = raw
+            .query_row("SELECT COUNT(*) FROM package", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(packages, 0, "no placeholder package was created");
+    }
+
+    /// A confidence above 100 cannot be built in Rust (`Confidence`), and one
+    /// planted in the database by another writer is caught: the schema's
+    /// CHECK rejects it in `confidence`, and loading rejects it in `evidence`.
+    #[tokio::test]
+    async fn out_of_range_confidence_in_the_database_is_detected() {
+        let (store, dir) = open_test_store().await;
+        store.write_metadata(&test_metadata()).await.unwrap();
+        let a = test_id("a");
+        let edge = test_edge(a.clone(), Some(test_id("b")), DependencyKind::Normal, 50);
+        store.upsert_edges(&a, &[edge]).await.unwrap();
+
+        let raw = rusqlite::Connection::open(dir.path().join("analysis.db")).unwrap();
+        assert!(
+            raw.execute("UPDATE dependency_edge SET confidence = 101", [])
+                .is_err()
+        );
+        raw.execute(
+            r#"UPDATE dependency_edge SET evidence =
+               '[{"method":"manifest","confidence":200,"location":null,"detail":null}]'"#,
+            [],
+        )
+        .unwrap();
+        let report = store.check().await.unwrap();
+        assert!(report.invalid_json_columns > 0);
+        assert!(store.load().await.is_err());
+    }
+
+    #[test]
+    fn bare_file_names_need_no_parent_directory() {
+        assert!(ensure_parent_dir(Path::new("analysis.db")).is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b/analysis.db");
+        ensure_parent_dir(&nested).unwrap();
+        assert!(dir.path().join("a/b").is_dir());
+    }
+
+    /// A file that is not a SQLite database is an error, not "version 0".
+    #[tokio::test]
+    async fn opening_a_non_database_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a.db");
+        std::fs::write(&path, vec![b'x'; 4096]).unwrap();
+        assert!(Store::open(&path).await.is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            vec![b'x'; 4096],
+            "left untouched"
+        );
+    }
+
     #[tokio::test]
     async fn corrupted_json_is_detected() {
         let (store, dir) = open_test_store().await;
@@ -1793,6 +2537,10 @@ mod tests {
 
         // A completes while its dependency B is still Not_Started.
         store
+            .upsert_plan_rows(&[package_plan_row(&a, PlanStatus::Complete, None)])
+            .await
+            .unwrap();
+        store
             .update_status(&a, AnalysisStatus::Started)
             .await
             .unwrap();
@@ -1800,11 +2548,13 @@ mod tests {
             .update_status(&a, AnalysisStatus::Complete)
             .await
             .unwrap();
-        // C is Started without any plan rows.
-        store
-            .update_status(&c, AnalysisStatus::Started)
-            .await
-            .unwrap();
+        // C is Started without any plan rows. The API refuses this, so the
+        // violation is planted directly, as another writer could leave it.
+        {
+            let raw = rusqlite::Connection::open(_dir.path().join("analysis.db")).unwrap();
+            raw.execute("UPDATE package SET status = 'Started' WHERE name = 'c'", [])
+                .unwrap();
+        }
 
         let report = store.check().await.unwrap();
         assert!(report.status_violations.contains(&a));

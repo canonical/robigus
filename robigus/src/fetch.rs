@@ -8,15 +8,17 @@
 //! the registry index (mandatory, never optional).
 
 use crate::error::{FetchError, RobigusError};
-use crate::model::{GitReference, SourceKind, path_tree_digest};
+use crate::model::{GitReference, SourceId, SourceKind, path_tree_digest};
 use flate2::read::GzDecoder;
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{ErrorKind, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 use tokio::task::spawn_blocking;
 use url::Url;
 
@@ -50,6 +52,19 @@ pub struct FetchedSource {
     pub digest: String,
     pub provenance: Provenance,
     pub kind: SourceKind,
+}
+
+impl FetchedSource {
+    /// The [`SourceId`] for the root package(s) of this source: the kind,
+    /// pinned by the recorded digest as `precise` (spec §5.1, §22.21) — the
+    /// resolved commit for git, the archive digest for a tarball, the tree
+    /// digest for a path.
+    pub fn source_id(&self) -> SourceId {
+        SourceId {
+            kind: self.kind.clone(),
+            precise: Some(self.digest.clone()),
+        }
+    }
 }
 
 // 2. Content-addressed cache
@@ -152,33 +167,105 @@ impl Default for ExtractionLimits {
     }
 }
 
+/// Bounds on every HTTP download (tarballs, registry index and `.crate`
+/// files). Bodies are streamed and abandoned as soon as they exceed
+/// `max_bytes`, so an oversized or endless response cannot exhaust memory.
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadLimits {
+    pub max_bytes: u64,
+    pub connect_timeout: Duration,
+    /// Wall-clock limit for one request, including reading the body.
+    pub timeout: Duration,
+}
+
+impl Default for DownloadLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: 512 * 1024 * 1024, // 512 MiB compressed
+            connect_timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(600),
+        }
+    }
+}
+
+/// Git acquisition policy.
+#[derive(Debug, Clone)]
+pub struct GitOptions {
+    /// Wall-clock limit for the whole clone, checkout, and submodule fetch.
+    pub timeout: Duration,
+    /// Maximum submodule nesting depth (a superproject's own submodules are
+    /// depth 1).
+    pub max_submodule_depth: usize,
+    /// Maximum number of submodules fetched in total.
+    pub max_submodules: usize,
+    /// URL schemes a submodule may be fetched from. `.gitmodules` is
+    /// untrusted project content: the default allows only `https`, so a
+    /// hostile `file://` or `ssh://` URL cannot pull a local repository or
+    /// use host credentials.
+    pub submodule_schemes: BTreeSet<String>,
+}
+
+impl Default for GitOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(600),
+            max_submodule_depth: 4,
+            max_submodules: 64,
+            submodule_schemes: BTreeSet::from(["https".to_string()]),
+        }
+    }
+}
+
+/// Resource limits and policy for [`fetch`].
+#[derive(Debug, Clone, Default)]
+pub struct FetchOptions {
+    pub download: DownloadLimits,
+    /// Applied to extracted tarballs and to git checkouts (whose size can
+    /// only be checked after checkout).
+    pub extraction: ExtractionLimits,
+    pub git: GitOptions,
+}
+
 // 4. Dispatch
 /// Fetches a source into the cache (spec §7.2).
-pub async fn fetch(input: SourceInput, cache: &Cache) -> Result<FetchedSource, RobigusError> {
+pub async fn fetch(
+    input: SourceInput,
+    cache: &Cache,
+    options: &FetchOptions,
+) -> Result<FetchedSource, RobigusError> {
     match input {
-        SourceInput::Git { url, reference } => fetch_git(&url, &reference, cache).await,
-        SourceInput::Tarball { url, digest } => fetch_tarball(&url, digest.as_deref(), cache).await,
+        SourceInput::Git { url, reference } => fetch_git(&url, &reference, cache, options).await,
+        SourceInput::Tarball { url, digest } => {
+            fetch_tarball(&url, digest.as_deref(), cache, options).await
+        }
         SourceInput::Path { path } => fetch_path(&path).await,
     }
 }
 
 /// Fetches a git repository: clone into a scratch directory, resolve the
-/// requested revision to a commit, check that commit out, and move the tree
+/// requested revision to a commit, check that commit out together with its
+/// submodules (each at the commit the superproject pins), and move the tree
 /// into the content-addressed cache. When the reference pins a revision that
 /// is already cached, no network access happens.
+///
+/// The whole operation is bounded by [`GitOptions::timeout`]; the checked-out
+/// tree is held to [`FetchOptions::extraction`] (checked after checkout, so
+/// it bounds what analysis sees rather than transient disk use).
 pub async fn fetch_git(
     url: &Url,
     reference: &GitReference,
     cache: &Cache,
+    options: &FetchOptions,
 ) -> Result<FetchedSource, RobigusError> {
     let url = url.clone();
     let reference = reference.clone();
     let cache = cache.clone();
-    spawn_blocking(move || fetch_git_sync(&url, &reference, &cache).map_err(RobigusError::from))
-        .await
-        .map_err(|error| {
-            RobigusError::Fetch(FetchError::Git(format!("git task failed: {error}")))
-        })?
+    let options = options.clone();
+    spawn_blocking(move || {
+        fetch_git_sync(&url, &reference, &cache, &options).map_err(RobigusError::from)
+    })
+    .await
+    .map_err(|error| RobigusError::Fetch(FetchError::Git(format!("git task failed: {error}"))))?
 }
 
 /// Downloads a tarball, verifies its digest (when one was supplied), and
@@ -188,6 +275,7 @@ pub async fn fetch_tarball(
     url: &Url,
     expected_digest: Option<&str>,
     cache: &Cache,
+    options: &FetchOptions,
 ) -> Result<FetchedSource, RobigusError> {
     // Validated before any cache lookup or network access: the digest is
     // used as a cache key.
@@ -207,11 +295,13 @@ pub async fn fetch_tarball(
         }
     }
 
-    let bytes = download(url).await?;
+    let bytes = download(url, &options.download).await?;
     let url = url.clone();
     let cache = cache.clone();
+    let limits = options.extraction;
     spawn_blocking(move || {
-        install_tarball(&bytes, expected.as_deref(), &url, &cache).map_err(RobigusError::from)
+        install_tarball(&bytes, expected.as_deref(), &url, &cache, &limits)
+            .map_err(RobigusError::from)
     })
     .await
     .map_err(|error| {
@@ -223,34 +313,22 @@ pub async fn fetch_tarball(
 
 /// Computes the deterministic tree digest of a local path and analyzes it in
 /// place (spec §7.2).
+///
+/// The tree and the recorded [`SourceKind::Path`] are both the canonical
+/// absolute path.
 pub async fn fetch_path(path: &Path) -> Result<FetchedSource, RobigusError> {
     let path = path.to_path_buf();
-    spawn_blocking(move || {
-        let tree = path
-            .canonicalize()
-            .map_err(FetchError::from)
-            .map_err(RobigusError::from)?;
+    spawn_blocking(move || -> Result<FetchedSource, RobigusError> {
+        let tree = path.canonicalize().map_err(FetchError::from)?;
         let digest = path_tree_digest(&tree)?;
         Ok(FetchedSource {
+            kind: SourceKind::Path { path: tree.clone() },
             tree,
             digest,
             provenance: Provenance::Verified,
-            kind: SourceKind::Path {
-                path: PathBuf::new(),
-            },
         })
     })
     .await
-    .map(|result| {
-        result.map(|mut fetched| {
-            // The kind carries the caller-supplied path; the tree is the
-            // canonicalized form.
-            fetched.kind = SourceKind::Path {
-                path: fetched.tree.clone(),
-            };
-            fetched
-        })
-    })
     .map_err(|error| {
         RobigusError::Fetch(FetchError::Walk(format!("digest task failed: {error}")))
     })?
@@ -261,6 +339,7 @@ fn fetch_git_sync(
     url: &Url,
     reference: &GitReference,
     cache: &Cache,
+    options: &FetchOptions,
 ) -> Result<FetchedSource, FetchError> {
     if let Some((tree, commit)) = git_cache_hit(cache, reference)? {
         return Ok(FetchedSource {
@@ -276,11 +355,24 @@ fn fetch_git_sync(
 
     let scratch = cache.scratch_path("clone");
     fs::create_dir_all(&scratch)?;
-    let cloned = clone_and_checkout(url, reference, &scratch);
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let cloned = {
+        let _watchdog = Watchdog::start(options.git.timeout, interrupt.clone());
+        checkout_tree(url, reference, &scratch, options, &interrupt)
+    };
     if cloned.is_err() {
         let _ = fs::remove_dir_all(&scratch);
     }
-    let commit = cloned?;
+    let commit = cloned.map_err(|error| {
+        if interrupt.load(Ordering::SeqCst) {
+            FetchError::Git(format!(
+                "git fetch of {url} exceeded the {:?} time limit",
+                options.git.timeout
+            ))
+        } else {
+            error
+        }
+    })?;
 
     let tree = match cache.path_for("git", &commit) {
         Ok(tree) => tree,
@@ -289,12 +381,7 @@ fn fetch_git_sync(
             return Err(error);
         }
     };
-    if tree.exists() {
-        fs::remove_dir_all(&scratch)?;
-    } else {
-        fs::create_dir_all(cache.root.join("git"))?;
-        fs::rename(&scratch, &tree)?;
-    }
+    install_into_cache(&scratch, &tree, &cache.root.join("git"))?;
 
     Ok(FetchedSource {
         tree,
@@ -305,6 +392,240 @@ fn fetch_git_sync(
             reference: reference.clone(),
         },
     })
+}
+
+/// Clones `url` at `reference` into `dest`, checks out its submodules, and
+/// holds the result to the extraction limits. Returns the resolved commit.
+fn checkout_tree(
+    url: &Url,
+    reference: &GitReference,
+    dest: &Path,
+    options: &FetchOptions,
+    interrupt: &AtomicBool,
+) -> Result<String, FetchError> {
+    let commit = clone_and_checkout(url, reference, dest, interrupt)?;
+    let mut fetched = 0;
+    checkout_submodules(dest, &options.git, interrupt, 1, &mut fetched)?;
+    check_worktree_limits(dest, &options.extraction)?;
+    Ok(commit)
+}
+
+/// Sets a flag once a timeout elapses, unless dropped first. gix polls the
+/// flag (its `should_interrupt`) and aborts the running fetch or checkout.
+struct Watchdog {
+    done: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn start(timeout: Duration, flag: Arc<AtomicBool>) -> Self {
+        let (done, finished) = mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            if let Err(mpsc::RecvTimeoutError::Timeout) = finished.recv_timeout(timeout) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+        Self {
+            done: Some(done),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        // Disconnecting the channel wakes the thread without setting the flag.
+        drop(self.done.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// One submodule to check out, read from the superproject before cloning.
+struct PendingSubmodule {
+    name: String,
+    path: String,
+    commit: String,
+    url: String,
+}
+
+/// Checks out every submodule of the repository at `worktree` at the commit
+/// its superproject pins, recursively (gix reads submodule metadata but does
+/// not clone submodules). `.gitmodules` is untrusted: names must validate,
+/// paths must stay inside the worktree without crossing a symlink, and URLs
+/// must use an allowed scheme. Submodules configured `update = none` and
+/// entries without a gitlink in `HEAD` are skipped, as `git submodule update
+/// --init --recursive` would.
+fn checkout_submodules(
+    worktree: &Path,
+    options: &GitOptions,
+    interrupt: &AtomicBool,
+    depth: usize,
+    fetched: &mut usize,
+) -> Result<(), FetchError> {
+    let git = |what: &str, error: &dyn std::fmt::Display| {
+        FetchError::Git(format!(
+            "submodule {what} in {}: {error}",
+            worktree.display()
+        ))
+    };
+    let pending = {
+        let repo = gix::open_opts(worktree, gix::open::Options::isolated())
+            .map_err(|error| git("discovery", &error))?;
+        let Some(submodules) = repo
+            .submodules()
+            .map_err(|error| git("discovery", &error))?
+        else {
+            return Ok(());
+        };
+        let mut pending = Vec::new();
+        for submodule in submodules {
+            let name = submodule
+                .validated_name()
+                .map_err(|error| git("name", &error))?
+                .to_string();
+            let update = submodule.update().map_err(|error| git(&name, &error))?;
+            if matches!(update, Some(gix::submodule::config::Update::None)) {
+                continue;
+            }
+            let Some(commit) = submodule.head_id().map_err(|error| git(&name, &error))? else {
+                continue;
+            };
+            let path = submodule.path().map_err(|error| git(&name, &error))?;
+            let url = submodule
+                .resolved_url()
+                .map_err(|error| git(&name, &error))?;
+            pending.push(PendingSubmodule {
+                path: path.to_string(),
+                commit: commit.to_string(),
+                url: url.to_bstring().to_string(),
+                name,
+            });
+        }
+        pending
+    };
+
+    for submodule in pending {
+        if depth > options.max_submodule_depth {
+            return Err(FetchError::Git(format!(
+                "submodule '{}' exceeds the nesting limit of {}",
+                submodule.name, options.max_submodule_depth
+            )));
+        }
+        *fetched += 1;
+        if *fetched > options.max_submodules {
+            return Err(FetchError::Git(format!(
+                "more than {} submodules",
+                options.max_submodules
+            )));
+        }
+        let rel = Path::new(&submodule.path);
+        if rel.as_os_str().is_empty()
+            || !rel
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(FetchError::Git(format!(
+                "submodule '{}' path '{}' escapes the worktree",
+                submodule.name, submodule.path
+            )));
+        }
+        ensure_no_symlink_components(worktree, rel)?;
+        let url = Url::parse(&submodule.url)
+            .ok()
+            .filter(|url| options.submodule_schemes.contains(url.scheme()))
+            .ok_or_else(|| {
+                FetchError::Git(format!(
+                    "submodule '{}' URL '{}' is not allowed: only {:?} URLs may be fetched",
+                    submodule.name, submodule.url, options.submodule_schemes
+                ))
+            })?;
+        let dest = worktree.join(rel);
+        // The superproject checkout leaves the gitlink as an empty directory
+        // (or nothing); anything else means the path is already in use.
+        match fs::read_dir(&dest) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    return Err(FetchError::Git(format!(
+                        "submodule '{}' path '{}' is not empty",
+                        submodule.name, submodule.path
+                    )));
+                }
+                fs::remove_dir(&dest)?;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        create_parent_dirs(&dest)?;
+        let checked_out = clone_and_checkout(
+            &url,
+            &GitReference::Rev(submodule.commit.clone()),
+            &dest,
+            interrupt,
+        )?;
+        if checked_out != submodule.commit {
+            return Err(FetchError::Git(format!(
+                "submodule '{}' resolved to {checked_out}, expected {}",
+                submodule.name, submodule.commit
+            )));
+        }
+        checkout_submodules(&dest, options, interrupt, depth + 1, fetched)?;
+    }
+    Ok(())
+}
+
+/// Holds a checked-out tree (excluding `.git` directories) to the extraction
+/// limits, so git sources face the same bounds as tarballs before analysis.
+fn check_worktree_limits(root: &Path, limits: &ExtractionLimits) -> Result<(), FetchError> {
+    let mut entries: u64 = 0;
+    let mut total: u64 = 0;
+    let walker = walkdir::WalkDir::new(root)
+        .min_depth(1)
+        .into_iter()
+        .filter_entry(|entry| entry.file_name() != ".git");
+    for entry in walker {
+        let entry = entry.map_err(|error| FetchError::Walk(error.to_string()))?;
+        entries += 1;
+        if entries > limits.max_entries {
+            return Err(FetchError::Git(format!(
+                "checkout exceeds the entry-count limit of {}",
+                limits.max_entries
+            )));
+        }
+        if entry.file_type().is_file() {
+            let size = entry
+                .metadata()
+                .map_err(|error| FetchError::Walk(error.to_string()))?
+                .len();
+            total = total.saturating_add(size);
+            if total > limits.max_total_size {
+                return Err(FetchError::Git(format!(
+                    "checkout exceeds the total-size limit of {}",
+                    limits.max_total_size
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Moves a completed staging tree to its content-addressed cache location.
+///
+/// The cache needs no lock: staging paths are unique per process and call,
+/// and an entry appears atomically via `rename`. When another process or
+/// task installs the same content first, our rename fails because the
+/// target already exists; since both trees have the same content address,
+/// the existing entry is used and the staging copy discarded.
+fn install_into_cache(staging: &Path, tree: &Path, kind_dir: &Path) -> Result<(), FetchError> {
+    fs::create_dir_all(kind_dir)?;
+    if let Err(error) = fs::rename(staging, tree) {
+        let _ = fs::remove_dir_all(staging);
+        if !tree.is_dir() {
+            return Err(error.into());
+        }
+    }
+    Ok(())
 }
 
 /// A pinned revision that is already cached needs no network access. Only a
@@ -326,28 +647,35 @@ fn git_cache_hit(
     Ok(cached.is_dir().then_some((cached, commit)))
 }
 
+/// Clones `url` into `dest` and checks out `reference`. The repository is
+/// opened *isolated*: no environment variables (`GIT_DIR`,
+/// `GIT_INDEX_FILE`, `GIT_CONFIG_*`, …) and no global or system git
+/// configuration are consulted. The result therefore cannot depend on the
+/// caller's git setup (for example a URL `insteadOf` rewrite) or on the
+/// repository variables git exports to hooks.
 fn clone_and_checkout(
     url: &Url,
     reference: &GitReference,
     dest: &Path,
+    interrupt: &AtomicBool,
 ) -> Result<String, FetchError> {
     let mut prepare = gix::clone::PrepareFetch::new(
         url.as_str(),
         dest,
         gix::create::Kind::WithWorktree,
         gix::create::Options::default(),
-        gix::open::Options::default(),
+        gix::open::Options::isolated(),
     )
     .map_err(|error| FetchError::Git(format!("clone preparation failed: {error}")))?;
     let (mut prepare_checkout, _) = prepare
-        .fetch_then_checkout(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
+        .fetch_then_checkout(gix::progress::Discard, interrupt)
         .map_err(|error| FetchError::Git(format!("fetch failed: {error}")))?;
 
     let commit = resolve_commit(prepare_checkout.repo(), reference)?;
     point_head_at(prepare_checkout.repo(), &commit)?;
 
     prepare_checkout
-        .main_worktree(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
+        .main_worktree(gix::progress::Discard, interrupt)
         .map_err(|error| FetchError::Git(format!("checkout of {commit} failed: {error}")))?;
     Ok(commit.to_string())
 }
@@ -376,7 +704,10 @@ fn resolve_commit(
             .head_id()
             .map(|id| id.detach())
             .map_err(|error| FetchError::Git(format!("no default branch: {error}"))),
-        GitReference::Branch(name) => peeled(format!("refs/heads/{name}")),
+        // A clone creates a local branch only for the remote's default
+        // branch; every other branch exists as a remote-tracking ref.
+        GitReference::Branch(name) => peeled(format!("refs/heads/{name}"))
+            .or_else(|_| peeled(format!("refs/remotes/origin/{name}"))),
         GitReference::Tag(name) => peeled(format!("refs/tags/{name}")),
         GitReference::Rev(rev) => peeled(rev.clone()),
     }
@@ -405,18 +736,52 @@ fn point_head_at(repo: &gix::Repository, commit: &gix::hash::ObjectId) -> Result
 }
 
 // 6. Tarball acquisition
-async fn download(url: &Url) -> Result<Vec<u8>, FetchError> {
-    let response = reqwest::get(url.as_str())
+async fn download(url: &Url, limits: &DownloadLimits) -> Result<Vec<u8>, FetchError> {
+    let failed = |error: &dyn std::fmt::Display| {
+        FetchError::Download(format!("download of {url} failed: {error}"))
+    };
+    let response = http_client(limits)
+        .map_err(|error| failed(&error))?
+        .get(url.as_str())
+        .send()
         .await
-        .map_err(|error| FetchError::Download(format!("download of {url} failed: {error}")))?;
-    let response = response
+        .map_err(|error| failed(&error))?
         .error_for_status()
-        .map_err(|error| FetchError::Download(format!("download of {url} failed: {error}")))?;
-    let bytes = response
-        .bytes()
+        .map_err(|error| failed(&error))?;
+    read_capped(response, limits.max_bytes)
         .await
-        .map_err(|error| FetchError::Download(format!("download of {url} failed: {error}")))?;
-    Ok(bytes.to_vec())
+        .map_err(|error| failed(&error))
+}
+
+/// The HTTP client for every download: robigus user agent plus the connect
+/// and whole-request timeouts.
+fn http_client(limits: &DownloadLimits) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent(http_user_agent())
+        .connect_timeout(limits.connect_timeout)
+        .timeout(limits.timeout)
+        .build()
+}
+
+/// Reads a response body, failing as soon as it exceeds `max_bytes`: a
+/// declared `Content-Length` over the limit is rejected before reading, and
+/// an undeclared or lying body is cut off while streaming.
+async fn read_capped(mut response: reqwest::Response, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let too_large = || format!("response exceeds the {max_bytes}-byte download limit");
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if (body.len() + chunk.len()) as u64 > max_bytes {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Verifies and installs a downloaded tarball: digest check, extraction into
@@ -430,6 +795,7 @@ fn install_tarball(
     expected: Option<&str>,
     url: &Url,
     cache: &Cache,
+    limits: &ExtractionLimits,
 ) -> Result<FetchedSource, FetchError> {
     let (digest, provenance) = verify_digest(expected, bytes)?;
     let tree = cache.path_for("tarball", &digest)?;
@@ -450,18 +816,11 @@ fn install_tarball(
     fs::create_dir_all(cache.root.join("tmp"))?;
     fs::write(&archive, bytes)?;
     // `extract_tarball` removes `staging` itself on failure.
-    let extracted = extract_tarball(&archive, &staging, &ExtractionLimits::default());
+    let extracted = extract_tarball(&archive, &staging, limits);
     let _ = fs::remove_file(&archive);
     extracted?;
 
-    fs::create_dir_all(cache.root.join("tarball"))?;
-    if let Err(error) = fs::rename(&staging, &tree) {
-        let _ = fs::remove_dir_all(&staging);
-        // A concurrent install of the same content may have won the race.
-        if !tree.is_dir() {
-            return Err(error.into());
-        }
-    }
+    install_into_cache(&staging, &tree, &cache.root.join("tarball"))?;
 
     Ok(FetchedSource {
         tree,
@@ -898,7 +1257,7 @@ fn verify_symlink_confined(root: &Path, link_rel: &Path) -> Result<(), FetchErro
 }
 
 /// Lexically resolves `.` and `..` components without touching the filesystem.
-pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
+fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -918,6 +1277,9 @@ pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
 pub struct RegistryClient {
     index: Url,
     http: reqwest::Client,
+    limits: DownloadLimits,
+    /// The index `config.json`, fetched at most once per client.
+    config: tokio::sync::OnceCell<IndexConfig>,
 }
 
 /// One record of a sparse-index entry.
@@ -938,14 +1300,38 @@ struct IndexConfig {
 }
 
 impl RegistryClient {
+    /// A client with the default [`DownloadLimits`].
     pub fn new(index_url: Url) -> Result<Self, FetchError> {
+        Self::with_limits(index_url, DownloadLimits::default())
+    }
+
+    /// A client whose index lookups and `.crate` downloads are bounded by
+    /// `limits` (size cap and timeouts).
+    pub fn with_limits(index_url: Url, limits: DownloadLimits) -> Result<Self, FetchError> {
         Ok(Self {
             index: index_url,
-            http: reqwest::Client::builder()
-                .user_agent(http_user_agent())
-                .build()
+            http: http_client(&limits)
                 .map_err(|error| FetchError::Registry(format!("http client failed: {error}")))?,
+            limits,
+            config: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// GETs `url` and reads the body within the download limits.
+    async fn get_capped(&self, url: Url, what: &str) -> Result<Vec<u8>, FetchError> {
+        let failed =
+            |error: &dyn std::fmt::Display| FetchError::Registry(format!("{what} failed: {error}"));
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| failed(&error))?
+            .error_for_status()
+            .map_err(|error| failed(&error))?;
+        read_capped(response, self.limits.max_bytes)
+            .await
+            .map_err(|error| failed(&error))
     }
 
     /// The sparse-index path for a crate name (crates.io layout).
@@ -976,17 +1362,10 @@ impl RegistryClient {
             .index
             .join(&path)
             .map_err(|error| FetchError::Registry(format!("invalid index URL: {error}")))?;
-        let text = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| FetchError::Registry(format!("index lookup failed: {error}")))?
-            .error_for_status()
-            .map_err(|error| FetchError::Registry(format!("index lookup failed: {error}")))?
-            .text()
-            .await
-            .map_err(|error| FetchError::Registry(format!("index lookup failed: {error}")))?;
+        let body = self.get_capped(url, "index lookup").await?;
+        let text = String::from_utf8(body).map_err(|error| {
+            FetchError::Registry(format!("index lookup failed: not UTF-8: {error}"))
+        })?;
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -1016,19 +1395,7 @@ impl RegistryClient {
             )));
         }
         let download_url = self.download_url(name, version, &record).await?;
-        let response = self
-            .http
-            .get(download_url)
-            .send()
-            .await
-            .map_err(|error| FetchError::Registry(format!("crate download failed: {error}")))?
-            .error_for_status()
-            .map_err(|error| FetchError::Registry(format!("crate download failed: {error}")))?;
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| FetchError::Registry(format!("crate download failed: {error}")))?
-            .to_vec();
+        let bytes = self.get_capped(download_url, "crate download").await?;
         let digest = crate::model::to_hex(Sha256::digest(bytes.as_slice()).as_slice());
         if digest != record.cksum.to_ascii_lowercase() {
             return Err(FetchError::Checksum {
@@ -1052,21 +1419,18 @@ impl RegistryClient {
         if let Ok(url) = Url::parse(&template) {
             return Ok(url);
         }
-        let config_url = self
-            .index
-            .join("config.json")
-            .map_err(|error| FetchError::Registry(format!("invalid index URL: {error}")))?;
-        let config: IndexConfig = self
-            .http
-            .get(config_url)
-            .send()
-            .await
-            .map_err(|error| FetchError::Registry(format!("index config lookup failed: {error}")))?
-            .error_for_status()
-            .map_err(|error| FetchError::Registry(format!("index config lookup failed: {error}")))?
-            .json::<IndexConfig>()
-            .await
-            .map_err(|error| FetchError::Registry(format!("invalid index config: {error}")))?;
+        let config = self
+            .config
+            .get_or_try_init(|| async {
+                let config_url = self
+                    .index
+                    .join("config.json")
+                    .map_err(|error| FetchError::Registry(format!("invalid index URL: {error}")))?;
+                let body = self.get_capped(config_url, "index config lookup").await?;
+                serde_json::from_slice::<IndexConfig>(&body)
+                    .map_err(|error| FetchError::Registry(format!("invalid index config: {error}")))
+            })
+            .await?;
         let template = template
             .replace("{crate}", name)
             .replace("{version}", version);
@@ -1335,7 +1699,7 @@ mod tests {
             (symlink_header("a", "."), &b""[..]),
             (symlink_header("a/b", ".."), &b""[..]),
         ]);
-        install_tarball(&bytes, None, &url, &cache).unwrap_err();
+        install_tarball(&bytes, None, &url, &cache, &ExtractionLimits::default()).unwrap_err();
         let digest = crate::model::to_hex(Sha256::digest(&bytes).as_slice());
         assert!(!cache.path_for("tarball", &digest).unwrap().exists());
         let leftovers = fs::read_dir(cache.root().join("tmp"))
@@ -1417,7 +1781,9 @@ mod tests {
         let url = Url::parse("https://robigus.invalid/src.tar").unwrap();
         let non_hex = "g".repeat(64);
         for bad in ["../../secret", "abc", non_hex.as_str()] {
-            let error = fetch_tarball(&url, Some(bad), &cache).await.unwrap_err();
+            let error = fetch_tarball(&url, Some(bad), &cache, &FetchOptions::default())
+                .await
+                .unwrap_err();
             assert!(
                 matches!(error, RobigusError::Fetch(FetchError::InvalidDigest(_))),
                 "{bad:?}: {error}"
@@ -1432,7 +1798,9 @@ mod tests {
         let digest = crate::model::to_hex(Sha256::digest(b"x").as_slice());
         fs::create_dir_all(cache.path_for("tarball", &digest).unwrap()).unwrap();
         let supplied = format!("  {}  ", digest.to_ascii_uppercase());
-        let fetched = fetch_tarball(&url, Some(&supplied), &cache).await.unwrap();
+        let fetched = fetch_tarball(&url, Some(&supplied), &cache, &FetchOptions::default())
+            .await
+            .unwrap();
         assert_eq!(fetched.digest, digest);
         assert_eq!(fetched.provenance, Provenance::Verified);
     }
@@ -1614,7 +1982,9 @@ mod tests {
         fs::create_dir_all(&cached_tree).unwrap();
         fs::write(cached_tree.join("marker"), b"cached").unwrap();
 
-        let fetched = fetch_tarball(&url, Some(&digest), &cache).await.unwrap();
+        let fetched = fetch_tarball(&url, Some(&digest), &cache, &FetchOptions::default())
+            .await
+            .unwrap();
         assert_eq!(fetched.tree, cached_tree);
         assert_eq!(fetched.provenance, Provenance::Verified);
         assert_eq!(
@@ -1623,18 +1993,62 @@ mod tests {
         );
     }
 
+    /// The cache is lock-free: losing the install race to an identical
+    /// entry is success, and the losing staging copy is discarded.
+    #[test]
+    fn losing_the_install_race_uses_the_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let kind_dir = dir.path().join("git");
+        let tree = kind_dir.join("abc");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("winner"), b"").unwrap();
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("loser"), b"").unwrap();
+
+        install_into_cache(&staging, &tree, &kind_dir).unwrap();
+        assert!(tree.join("winner").exists());
+        assert!(!staging.exists(), "the staging copy is removed");
+    }
+
+    #[tokio::test]
+    async fn concurrent_installs_of_the_same_tarball_succeed() {
+        let (cache, _dir) = temp_cache();
+        let url = Url::parse("https://example.com/src.tar").unwrap();
+        let bytes = tar_bytes(&[("src/lib.rs", b"fn main() {}")]);
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let (cache, url, bytes) = (cache.clone(), url.clone(), bytes.clone());
+                tokio::task::spawn_blocking(move || {
+                    install_tarball(&bytes, None, &url, &cache, &ExtractionLimits::default())
+                })
+            })
+            .collect();
+        let mut trees = BTreeSet::new();
+        for task in tasks {
+            trees.insert(task.await.unwrap().unwrap().tree);
+        }
+        assert_eq!(trees.len(), 1);
+        let tree = trees.into_iter().next().unwrap();
+        assert!(tree.join("src/lib.rs").exists());
+        let leftovers = fs::read_dir(cache.root().join("tmp")).unwrap().count();
+        assert_eq!(leftovers, 0, "every staging copy is cleaned up");
+    }
+
     #[tokio::test]
     async fn tarball_install_extracts_into_cache() {
         let (cache, _dir) = temp_cache();
         let url = Url::parse("https://example.com/src.tar").unwrap();
         let bytes = tar_bytes(&[("src/lib.rs", b"fn main() {}")]);
 
-        let fetched = install_tarball(&bytes, None, &url, &cache).unwrap();
+        let fetched =
+            install_tarball(&bytes, None, &url, &cache, &ExtractionLimits::default()).unwrap();
         assert_eq!(fetched.provenance, Provenance::Unverified);
         assert!(fetched.tree.join("src").join("lib.rs").exists());
 
         // A second install with the same bytes hits the same tree.
-        let again = install_tarball(&bytes, None, &url, &cache).unwrap();
+        let again =
+            install_tarball(&bytes, None, &url, &cache, &ExtractionLimits::default()).unwrap();
         assert_eq!(again.tree, fetched.tree);
         assert_eq!(again.digest, fetched.digest);
     }
@@ -1644,7 +2058,14 @@ mod tests {
         let (cache, _dir) = temp_cache();
         let url = Url::parse("https://example.com/src.tar").unwrap();
         let bytes = tar_bytes(&[("src/lib.rs", b"fn main() {}")]);
-        let error = install_tarball(&bytes, Some(&"0".repeat(64)), &url, &cache).unwrap_err();
+        let error = install_tarball(
+            &bytes,
+            Some(&"0".repeat(64)),
+            &url,
+            &cache,
+            &ExtractionLimits::default(),
+        )
+        .unwrap_err();
         assert!(matches!(error, FetchError::Checksum { .. }));
     }
 
@@ -1657,9 +2078,14 @@ mod tests {
         fs::create_dir_all(&cached_tree).unwrap();
         fs::write(cached_tree.join("marker"), b"cached").unwrap();
 
-        let fetched = fetch_git(&url, &GitReference::Rev(commit.clone()), &cache)
-            .await
-            .unwrap();
+        let fetched = fetch_git(
+            &url,
+            &GitReference::Rev(commit.clone()),
+            &cache,
+            &FetchOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(fetched.tree, cached_tree);
         assert_eq!(fetched.digest, commit);
         assert_eq!(fetched.provenance, Provenance::Verified);
@@ -1738,5 +2164,428 @@ mod tests {
         assert_eq!(RegistryClient::index_path("abc").unwrap(), "3/a/abc");
         assert_eq!(RegistryClient::index_path("serde").unwrap(), "se/rd/serde");
         assert!(RegistryClient::index_path("../evil").is_err());
+    }
+
+    #[tokio::test]
+    async fn fetched_source_id_is_pinned_by_the_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let fetched = fetch_path(dir.path()).await.unwrap();
+        let source_id = fetched.source_id();
+        assert_eq!(source_id.precise.as_deref(), Some(fetched.digest.as_str()));
+        assert_eq!(
+            source_id.kind,
+            SourceKind::Path {
+                path: dir.path().canonicalize().unwrap()
+            }
+        );
+    }
+
+    // Download limits
+
+    async fn serve(body: Vec<u8>, delay: Duration) -> (wiremock::MockServer, Url) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+        let url = Url::parse(&format!("{}/src.tar", server.uri())).unwrap();
+        (server, url)
+    }
+
+    #[tokio::test]
+    async fn downloads_over_the_size_limit_are_rejected() {
+        let (_server, url) = serve(vec![0u8; 4096], Duration::ZERO).await;
+        let limits = DownloadLimits {
+            max_bytes: 1024,
+            ..DownloadLimits::default()
+        };
+        let error = download(&url, &limits).await.unwrap_err();
+        assert!(error.to_string().contains("download limit"), "{error}");
+        assert_eq!(
+            download(&url, &DownloadLimits::default())
+                .await
+                .unwrap()
+                .len(),
+            4096
+        );
+    }
+
+    #[tokio::test]
+    async fn downloads_time_out() {
+        let (_server, url) = serve(b"late".to_vec(), Duration::from_millis(500)).await;
+        let limits = DownloadLimits {
+            timeout: Duration::from_millis(100),
+            ..DownloadLimits::default()
+        };
+        let error = download(&url, &limits).await.unwrap_err();
+        assert!(matches!(error, FetchError::Download(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn fetch_tarball_applies_the_download_limit() {
+        let (_server, url) = serve(tar_bytes(&[("a.txt", b"0123456789")]), Duration::ZERO).await;
+        let (cache, _dir) = temp_cache();
+        let options = FetchOptions {
+            download: DownloadLimits {
+                max_bytes: 64,
+                ..DownloadLimits::default()
+            },
+            ..FetchOptions::default()
+        };
+        let error = fetch_tarball(&url, None, &cache, &options)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("download limit"), "{error}");
+    }
+
+    /// The registry client caps index and `.crate` bodies and fetches the
+    /// index `config.json` once per client.
+    #[tokio::test]
+    async fn registry_client_limits_and_caches_config() {
+        /// A registry serving `foo` 1.0.0 and 1.1.0 as 2 KiB `.crate` files;
+        /// `config.json` must be requested exactly once.
+        async fn registry() -> (wiremock::MockServer, Url) {
+            let server = wiremock::MockServer::start().await;
+            let big = vec![7u8; 2048];
+            let cksum = crate::model::to_hex(Sha256::digest(&big).as_slice());
+            let records: String = ["1.0.0", "1.1.0"]
+                .iter()
+                .map(|vers| {
+                    format!("{{\"name\":\"foo\",\"vers\":\"{vers}\",\"cksum\":\"{cksum}\"}}\n")
+                })
+                .collect();
+            wiremock::Mock::given(wiremock::matchers::path("/3/f/foo"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(records))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::path("/config.json"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_string(format!("{{\"dl\":\"{}/crates\"}}", server.uri())),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::path_regex("^/crates/foo/"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(big))
+                .mount(&server)
+                .await;
+            let url = Url::parse(&server.uri()).unwrap();
+            (server, url)
+        }
+
+        let (server, index_url) = registry().await;
+        let client = RegistryClient::new(index_url).unwrap();
+        client.download_crate("foo", "1.0.0").await.unwrap();
+        client.download_crate("foo", "1.1.0").await.unwrap();
+        // `expect(1)` on config.json: two downloads, one config fetch.
+        server.verify().await;
+
+        // The index (~200 bytes) fits under a 1 KiB cap; the 2 KiB `.crate`
+        // does not.
+        let (_capped_server, capped_url) = registry().await;
+        let capped = RegistryClient::with_limits(
+            capped_url,
+            DownloadLimits {
+                max_bytes: 1024,
+                ..DownloadLimits::default()
+            },
+        )
+        .unwrap();
+        capped.index_record("foo", "1.0.0").await.unwrap();
+        let error = capped.download_crate("foo", "1.0.0").await.unwrap_err();
+        assert!(error.to_string().contains("download limit"), "{error}");
+    }
+
+    // Git acquisition (local fixture repositories; skipped without `git`)
+
+    /// Runs `git` for fixture setup with an isolated, deterministic config.
+    ///
+    /// The environment is cleared first. Git exports repository variables
+    /// (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, …) to hooks, and this
+    /// repository's pre-commit hook runs `cargo test`: inheriting them made
+    /// these fixture commands operate on the *enclosing* repository —
+    /// `git init` failed on its locked config, and `git commit` committed its
+    /// working tree. `XDG_CONFIG_HOME` and friends are dropped for the same
+    /// reason, so no user configuration leaks in either.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let temp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let target = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        assert!(
+            target.starts_with(&temp),
+            "fixture git commands must run inside {}, not {}",
+            temp.display(),
+            target.display()
+        );
+        let output = std::process::Command::new("git")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("LC_ALL", "C")
+            // Stops repository discovery from climbing out of the fixture.
+            .env("GIT_CEILING_DIRECTORIES", &temp)
+            .args([
+                "-c",
+                "user.name=robigus",
+                "-c",
+                "user.email=robigus@example.invalid",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "protocol.file.allow=always",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn git_available() -> bool {
+        let available = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !available {
+            eprintln!("skipping: git is not installed");
+        }
+        available
+    }
+
+    /// Creates a repository at `dir` with one commit of `files`; returns the
+    /// commit id.
+    fn make_repo(dir: &Path, files: &[(&str, &str)]) -> String {
+        fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q"]);
+        commit_files(dir, files, "initial")
+    }
+
+    fn commit_files(dir: &Path, files: &[(&str, &str)], message: &str) -> String {
+        for (path, contents) in files {
+            let path = dir.join(path);
+            create_parent_dirs(&path).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", message]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    fn file_url(path: &Path) -> Url {
+        Url::from_file_path(path).unwrap()
+    }
+
+    fn with_file_submodules() -> FetchOptions {
+        let mut options = FetchOptions::default();
+        options.git.submodule_schemes.insert("file".to_string());
+        options
+    }
+
+    #[tokio::test]
+    async fn git_clone_resolves_default_and_non_default_branches() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let main = make_repo(&repo, &[("README", "main")]);
+        git(&repo, &["checkout", "-q", "-b", "feature"]);
+        let feature = commit_files(&repo, &[("README", "feature")], "feature");
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let (cache, _cache_dir) = temp_cache();
+        let options = FetchOptions::default();
+        let url = file_url(&repo);
+        let fetched = fetch_git(&url, &GitReference::DefaultBranch, &cache, &options)
+            .await
+            .unwrap();
+        assert_eq!(fetched.digest, main);
+        assert_eq!(
+            fs::read_to_string(fetched.tree.join("README")).unwrap(),
+            "main"
+        );
+        assert_eq!(fetched.source_id().precise.as_deref(), Some(main.as_str()));
+
+        // Regression (Medium): a non-default branch exists only as a
+        // remote-tracking ref after the clone.
+        let fetched = fetch_git(
+            &url,
+            &GitReference::Branch("feature".to_string()),
+            &cache,
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched.digest, feature);
+        assert_eq!(
+            fs::read_to_string(fetched.tree.join("README")).unwrap(),
+            "feature"
+        );
+    }
+
+    /// Builds a superproject whose submodule `vendor/sub` is pinned to the
+    /// submodule's *first* commit, although the submodule has a newer one.
+    /// Returns `(superproject, pinned commit)`.
+    fn superproject_with_submodule(root: &Path) -> (PathBuf, String) {
+        let sub = root.join("sub");
+        let pinned = make_repo(&sub, &[("lib.c", "int v1;")]);
+        commit_files(&sub, &[("lib.c", "int v2;")], "v2");
+
+        let superproject = root.join("super");
+        make_repo(&superproject, &[("Cargo.toml", "[package]")]);
+        git(
+            &superproject,
+            &[
+                "submodule",
+                "add",
+                "-q",
+                file_url(&sub).as_str(),
+                "vendor/sub",
+            ],
+        );
+        git(
+            &superproject.join("vendor/sub"),
+            &["checkout", "-q", &pinned],
+        );
+        git(&superproject, &["add", "-A"]);
+        git(&superproject, &["commit", "-q", "-m", "add submodule"]);
+        (superproject, pinned)
+    }
+
+    #[tokio::test]
+    async fn git_submodules_are_checked_out_at_the_pinned_commit() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (superproject, _pinned) = superproject_with_submodule(dir.path());
+        let (cache, _cache_dir) = temp_cache();
+        let fetched = fetch_git(
+            &file_url(&superproject),
+            &GitReference::DefaultBranch,
+            &cache,
+            &with_file_submodules(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(fetched.tree.join("vendor/sub/lib.c")).unwrap(),
+            "int v1;",
+            "the pinned commit, not the submodule's newest"
+        );
+    }
+
+    /// `.gitmodules` is untrusted: by default only `https` submodules are
+    /// fetched, so a `file://` URL is refused and nothing is cached.
+    #[tokio::test]
+    async fn git_submodule_url_schemes_are_restricted() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (superproject, _) = superproject_with_submodule(dir.path());
+        let (cache, _cache_dir) = temp_cache();
+        let error = fetch_git(
+            &file_url(&superproject),
+            &GitReference::DefaultBranch,
+            &cache,
+            &FetchOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("is not allowed"), "{error}");
+        assert!(
+            !cache.root().join("git").exists()
+                || fs::read_dir(cache.root().join("git")).unwrap().count() == 0,
+            "a rejected fetch caches nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_submodules_with_update_none_are_skipped() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (superproject, _) = superproject_with_submodule(dir.path());
+        git(
+            &superproject,
+            &[
+                "config",
+                "-f",
+                ".gitmodules",
+                "submodule.vendor/sub.update",
+                "none",
+            ],
+        );
+        git(&superproject, &["commit", "-q", "-am", "skip submodule"]);
+        let (cache, _cache_dir) = temp_cache();
+        // Default options would reject the file:// URL if it were fetched.
+        let fetched = fetch_git(
+            &file_url(&superproject),
+            &GitReference::DefaultBranch,
+            &cache,
+            &FetchOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!fetched.tree.join("vendor/sub/lib.c").exists());
+    }
+
+    #[tokio::test]
+    async fn git_checkouts_are_held_to_the_extraction_limits() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        make_repo(&repo, &[("a", "1"), ("b", "2"), ("c", "3")]);
+        let (cache, _cache_dir) = temp_cache();
+        let options = FetchOptions {
+            extraction: ExtractionLimits {
+                max_entries: 2,
+                ..ExtractionLimits::default()
+            },
+            ..FetchOptions::default()
+        };
+        let error = fetch_git(
+            &file_url(&repo),
+            &GitReference::DefaultBranch,
+            &cache,
+            &options,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("entry-count limit"), "{error}");
+    }
+
+    #[test]
+    fn watchdog_fires_only_after_its_timeout() {
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let _watchdog = Watchdog::start(Duration::from_millis(10), flag.clone());
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(flag.load(Ordering::SeqCst), "fired after the timeout");
+
+        let flag = Arc::new(AtomicBool::new(false));
+        drop(Watchdog::start(Duration::from_secs(60), flag.clone()));
+        assert!(!flag.load(Ordering::SeqCst), "dropping it first disarms it");
     }
 }

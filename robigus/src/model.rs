@@ -84,11 +84,120 @@ pub enum GitReference {
 }
 
 /// SourceId: Identifies where artifacts come from. In standard Cargo, sources are registries, git URLs, or directory paths. In a generalized model, this expands to include Debian/Ubuntu repositories (apt/deb), alongside custom package archives.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// Equality, ordering, and hashing follow *identity* (spec §5.1, §22.21),
+/// which matches the persisted identity columns exactly:
+///
+/// - a git source is identified by its URL plus the exact commit
+///   ([`SourceId::precise`]); the requested [`GitReference`] (branch, tag,
+///   …) is kept but is not part of the identity, so requesting the same
+///   commit by branch or by tag yields the same package;
+/// - a tarball is identified by its URL plus its digest, taken from
+///   `precise` or, when that is unset, from the kind's `digest`;
+/// - every other source compares structurally.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceId {
     pub kind: SourceKind,
     /// Exact hash, commit ID, or cryptographic digest locking this source instance
     pub precise: Option<String>,
+}
+
+impl SourceId {
+    /// The exact revision or digest pinning this source: `precise`, or for a
+    /// tarball without `precise`, its `digest`. This is the value persisted
+    /// in `package.source_precise`.
+    pub fn effective_precise(&self) -> Option<&str> {
+        self.precise.as_deref().or(match &self.kind {
+            SourceKind::Tarball { digest, .. } => digest.as_deref(),
+            _ => None,
+        })
+    }
+
+    fn identity_key(&self) -> (SourceIdentityKey<'_>, Option<&str>) {
+        let kind = match &self.kind {
+            SourceKind::CargoRegistry { index_url } => SourceIdentityKey::CargoRegistry(index_url),
+            SourceKind::Git { url, .. } => SourceIdentityKey::Git(url),
+            SourceKind::Path { path } => SourceIdentityKey::Path(path),
+            SourceKind::Tarball { url, .. } => SourceIdentityKey::Tarball(url),
+            SourceKind::Apt {
+                mirror_url,
+                suite,
+                components,
+                arch,
+            } => SourceIdentityKey::Apt(mirror_url, suite, components, arch),
+        };
+        (kind, self.effective_precise())
+    }
+}
+
+/// The identity-relevant part of a [`SourceKind`]; variant order matches
+/// `SourceKind` so identity ordering follows declaration order.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum SourceIdentityKey<'a> {
+    CargoRegistry(&'a Url),
+    Git(&'a Url),
+    Path(&'a Path),
+    Tarball(&'a Url),
+    Apt(
+        &'a Url,
+        &'a Suite,
+        &'a BTreeSet<Component>,
+        &'a Architecture,
+    ),
+}
+
+impl PartialEq for SourceId {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity_key() == other.identity_key()
+    }
+}
+
+impl Eq for SourceId {}
+
+impl PartialOrd for SourceId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SourceId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.identity_key().cmp(&other.identity_key())
+    }
+}
+
+impl std::hash::Hash for SourceId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.identity_key().hash(state);
+    }
+}
+
+impl GitReference {
+    /// The stored form in `package.source_reference` (spec §11.2):
+    /// `default`, `branch:<name>`, `tag:<name>`, or `rev:<rev>`.
+    pub fn to_stored_text(&self) -> String {
+        match self {
+            Self::DefaultBranch => "default".to_string(),
+            Self::Branch(name) => format!("branch:{name}"),
+            Self::Tag(name) => format!("tag:{name}"),
+            Self::Rev(rev) => format!("rev:{rev}"),
+        }
+    }
+
+    /// Parses [`GitReference::to_stored_text`] output.
+    pub fn from_stored_text(text: &str) -> Option<Self> {
+        if text == "default" {
+            return Some(Self::DefaultBranch);
+        }
+        let (kind, value) = text.split_once(':')?;
+        let value = value.to_string();
+        match kind {
+            "branch" => Some(Self::Branch(value)),
+            "tag" => Some(Self::Tag(value)),
+            "rev" => Some(Self::Rev(value)),
+            _ => None,
+        }
+    }
 }
 
 // 2. Package Identity & Ecosystem Abstraction
@@ -424,6 +533,179 @@ impl fmt::Display for AnalysisStatus {
     }
 }
 
+// Analysis plan (spec §2, §7.3, §7.6, §11.2)
+
+/// Generates `as_str`/`parse` for a fieldless enum with a fixed stored form.
+macro_rules! stored_names {
+    ($ty:ident { $($variant:ident => $name:literal),+ $(,)? }) => {
+        impl $ty {
+            /// The stored/serialized name (spec §11.2).
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)+
+                }
+            }
+
+            /// Parses [`Self::as_str`] output.
+            pub fn parse(value: &str) -> Option<Self> {
+                match value {
+                    $($name => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+
+/// The analyzers robigus knows about (spec §7.3). Only [`AnalyzerId::Cargo`]
+/// and [`AnalyzerId::Cpp`] ship in v1; the rest are detected and recorded as
+/// `Skipped` plan rows so the record shows what was seen but not analyzed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyzerId {
+    Cargo,
+    Cpp,
+    Python,
+    Go,
+    Node,
+}
+
+stored_names!(AnalyzerId {
+    Cargo => "cargo",
+    Cpp => "cpp",
+    Python => "python",
+    Go => "go",
+    Node => "node",
+});
+
+impl AnalyzerId {
+    /// True for analyzers shipped in v1 (spec §7.3).
+    pub fn is_shipped(self) -> bool {
+        matches!(self, Self::Cargo | Self::Cpp)
+    }
+}
+
+/// The analysis strategies of spec §7.6, stored in `analysis_plan.strategy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisStrategy {
+    /// Parse declarative manifests and build descriptions.
+    Manifest,
+    /// Run ecosystem tooling in the sandbox (for example `cargo metadata`).
+    ToolIntrospection,
+    /// Execute a build or configure step in the sandbox and observe outputs.
+    BuildObservation,
+    /// Parse README and build instructions, optionally LLM-assisted.
+    Documentation,
+    /// Independently re-analyze or cross-check a node.
+    Validation,
+}
+
+stored_names!(AnalysisStrategy {
+    Manifest => "manifest",
+    ToolIntrospection => "tool_introspection",
+    BuildObservation => "build_observation",
+    Documentation => "documentation",
+    Validation => "validation",
+});
+
+/// The build system a plan row targets, stored in `analysis_plan.build_system`
+/// (spec §7.3). CMake, Meson, Autotools, and Make are strategies inside the
+/// `cpp` analyzer; `BuildScript` is `build.rs` C/C++/assembly discovery inside
+/// the `cargo` analyzer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildSystem {
+    BuildScript,
+    Cmake,
+    Meson,
+    Autotools,
+    Make,
+}
+
+stored_names!(BuildSystem {
+    BuildScript => "build_script",
+    Cmake => "cmake",
+    Meson => "meson",
+    Autotools => "autotools",
+    Make => "make",
+});
+
+/// The lifecycle of one plan row (spec §11.2). Distinct from the node-level
+/// [`AnalysisStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum PlanStatus {
+    Pending,
+    Running,
+    Complete,
+    Failed,
+    Skipped,
+}
+
+stored_names!(PlanStatus {
+    Pending => "Pending",
+    Running => "Running",
+    Complete => "Complete",
+    Failed => "Failed",
+    Skipped => "Skipped",
+});
+
+/// What a plan row is about (spec §22.20): a detected root directory —
+/// detection runs before any package exists — or a package node.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+// Plan rows are few and short-lived; boxing the id would only make
+// construction and matching noisier.
+#[allow(clippy::large_enum_variant)]
+pub enum PlanSubject {
+    /// Workspace-relative root directory; empty for the top level.
+    Root(PathBuf),
+    Package(PackageId),
+}
+
+/// One row of the dependency mapping plan (spec §2, §11.2). Rows are keyed
+/// by `(subject, analyzer, strategy, build_system)`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PlanRow {
+    pub subject: PlanSubject,
+    pub analyzer: AnalyzerId,
+    pub strategy: AnalysisStrategy,
+    pub build_system: Option<BuildSystem>,
+    pub status: PlanStatus,
+    pub attempts: u32,
+    /// The recorded cause of a failure; required for a node marked `Error`.
+    pub error: Option<String>,
+    pub detail: Option<String>,
+}
+
+impl PlanRow {
+    /// A row with no attempts, error, or detail yet.
+    pub fn new(
+        subject: PlanSubject,
+        analyzer: AnalyzerId,
+        strategy: AnalysisStrategy,
+        build_system: Option<BuildSystem>,
+        status: PlanStatus,
+    ) -> Self {
+        Self {
+            subject,
+            analyzer,
+            strategy,
+            build_system,
+            status,
+            attempts: 0,
+            error: None,
+            detail: None,
+        }
+    }
+}
+
 // 7. Requirements
 /// The kind of requirement a dependency edge expresses (spec §5.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -513,11 +795,67 @@ impl EvidenceMethod {
 
     /// The highest confidence this method may produce (spec §5.3).
     /// LLM-derived evidence is capped at tier L3 (§7.6).
-    pub fn max_confidence(&self) -> u8 {
+    pub fn max_confidence(&self) -> Confidence {
         match self {
-            Self::LlmSubAgent => 79,
-            _ => 100,
+            Self::LlmSubAgent => Confidence::new(79),
+            _ => Confidence::MAX,
         }
+    }
+}
+
+/// A confidence score on the 0–100 scale (spec §5.3), shared by evidence,
+/// edges, and detection signals.
+///
+/// A value above 100 cannot exist: [`Confidence::new`] clamps, and
+/// [`TryFrom<u8>`] — also used when deserializing, so JSON and database
+/// values are checked on load — rejects it. Serializes as a plain number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct Confidence(u8);
+
+impl Confidence {
+    /// No confidence.
+    pub const ZERO: Self = Self(0);
+    /// Full confidence.
+    pub const MAX: Self = Self(100);
+
+    /// A confidence, clamping values above 100 to 100.
+    pub const fn new(value: u8) -> Self {
+        Self(if value > 100 { 100 } else { value })
+    }
+
+    /// The raw 0–100 score.
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+
+    /// The qualitative tier this score falls into (§5.3).
+    pub fn tier(self) -> ConfidenceTier {
+        ConfidenceTier::from_confidence(self.0)
+    }
+}
+
+impl TryFrom<u8> for Confidence {
+    type Error = crate::error::ConfidenceOutOfRange;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value > 100 {
+            Err(crate::error::ConfidenceOutOfRange(value))
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
+
+impl From<Confidence> for u8 {
+    fn from(confidence: Confidence) -> Self {
+        confidence.0
+    }
+}
+
+impl fmt::Display for Confidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -533,14 +871,14 @@ pub struct SourceLocation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
     pub method: EvidenceMethod,
-    pub confidence: u8,
+    pub confidence: Confidence,
     pub location: Option<SourceLocation>,
     pub detail: Option<String>,
 }
 
 impl Evidence {
     pub fn tier(&self) -> ConfidenceTier {
-        ConfidenceTier::from_confidence(self.confidence)
+        self.confidence.tier()
     }
 
     /// True when the evidence exceeds its method's confidence cap (§5.3).
@@ -629,7 +967,7 @@ pub struct Edge {
     pub kinds: BTreeSet<DependencyKind>,
     /// Activation condition; `Predicate::TRUE` is always active.
     pub predicate: Predicate,
-    pub confidence: u8,
+    pub confidence: Confidence,
     pub evidence: Vec<Evidence>,
 }
 
@@ -660,9 +998,14 @@ impl DependencyGraph {
     }
 
     /// Inserts a node, deduplicating by `PackageId`. An existing node's
-    /// payload is replaced; its edges are kept.
-    pub fn add_node(&mut self, node: Node) -> NodeIndex {
+    /// payload is replaced and its edges are kept, but its `status` is not:
+    /// status is set only on first insert and otherwise changes only through
+    /// [`DependencyGraph::node_mut`] (in memory) or `Store::update_status`
+    /// (persisted), mirroring the store (spec §22.19). Re-discovering a
+    /// `Complete` dependency therefore never resets it.
+    pub fn add_node(&mut self, mut node: Node) -> NodeIndex {
         if let Some(&ix) = self.index.get(&node.id) {
+            node.status = self.graph[ix].status;
             self.graph[ix] = node;
             ix
         } else {
@@ -1076,11 +1419,11 @@ mod tests {
 
     #[test]
     fn llm_evidence_is_capped_at_l3() {
-        assert_eq!(EvidenceMethod::LlmSubAgent.max_confidence(), 79);
-        assert_eq!(EvidenceMethod::Manifest.max_confidence(), 100);
+        assert_eq!(EvidenceMethod::LlmSubAgent.max_confidence().value(), 79);
+        assert_eq!(EvidenceMethod::Manifest.max_confidence(), Confidence::MAX);
         let evidence = Evidence {
             method: EvidenceMethod::LlmSubAgent,
-            confidence: 90,
+            confidence: Confidence::new(90),
             location: None,
             detail: None,
         };
@@ -1098,6 +1441,23 @@ mod tests {
         assert_eq!(ConfidenceTier::from_confidence(79), ConfidenceTier::L3);
         assert_eq!(ConfidenceTier::from_confidence(80), ConfidenceTier::L4);
         assert_eq!(ConfidenceTier::from_confidence(100), ConfidenceTier::L4);
+    }
+
+    /// A confidence above 100 cannot be constructed or deserialized; it
+    /// serializes as a plain number.
+    #[test]
+    fn confidence_is_bounded() {
+        assert_eq!(Confidence::new(150), Confidence::MAX);
+        assert_eq!(Confidence::try_from(100).unwrap().value(), 100);
+        assert!(Confidence::try_from(101).is_err());
+        assert_eq!(serde_json::to_string(&Confidence::new(42)).unwrap(), "42");
+        assert_eq!(
+            serde_json::from_str::<Confidence>("42").unwrap().value(),
+            42
+        );
+        assert!(serde_json::from_str::<Confidence>("200").is_err());
+        assert_eq!(Confidence::new(79).tier(), ConfidenceTier::L3);
+        assert_eq!(Confidence::new(80).tier(), ConfidenceTier::L4);
     }
 
     fn test_id(name: &str, major: u64) -> PackageId {
@@ -1130,14 +1490,94 @@ mod tests {
             },
             kinds: BTreeSet::from([kind]),
             predicate: Predicate::TRUE,
-            confidence,
+            confidence: Confidence::new(confidence),
             evidence: vec![Evidence {
                 method: EvidenceMethod::Manifest,
-                confidence,
+                confidence: Confidence::new(confidence),
                 location: None,
                 detail: None,
             }],
         }
+    }
+
+    /// High 4: git identity is URL + commit; the requested reference is not
+    /// part of it, and Eq, Ord, and Hash agree.
+    #[test]
+    fn git_source_identity_ignores_the_reference() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let git = |reference, precise: &str| SourceId {
+            kind: SourceKind::Git {
+                url: Url::parse("https://github.com/example/repo").unwrap(),
+                reference,
+            },
+            precise: Some(precise.to_string()),
+        };
+        let hash = |id: &SourceId| {
+            let mut hasher = DefaultHasher::new();
+            id.hash(&mut hasher);
+            hasher.finish()
+        };
+        let branch = git(GitReference::Branch("main".into()), "abc");
+        let tag = git(GitReference::Tag("v1".into()), "abc");
+        assert_eq!(branch, tag);
+        assert_eq!(branch.cmp(&tag), std::cmp::Ordering::Equal);
+        assert_eq!(hash(&branch), hash(&tag));
+        assert_ne!(branch, git(GitReference::Branch("main".into()), "def"));
+
+        // A tarball's digest stands in for an unset `precise`.
+        let url = Url::parse("https://example.com/x.tar.gz").unwrap();
+        let by_digest = SourceId {
+            kind: SourceKind::Tarball {
+                url: url.clone(),
+                digest: Some("d".into()),
+            },
+            precise: None,
+        };
+        let by_precise = SourceId {
+            kind: SourceKind::Tarball {
+                url,
+                digest: Some("d".into()),
+            },
+            precise: Some("d".into()),
+        };
+        assert_eq!(by_digest, by_precise);
+        assert_eq!(by_digest.effective_precise(), Some("d"));
+    }
+
+    #[test]
+    fn stored_names_round_trip() {
+        for reference in [
+            GitReference::DefaultBranch,
+            GitReference::Branch("feature:x".into()),
+            GitReference::Tag("v1.0".into()),
+            GitReference::Rev("abc".into()),
+        ] {
+            assert_eq!(
+                GitReference::from_stored_text(&reference.to_stored_text()),
+                Some(reference)
+            );
+        }
+        assert_eq!(GitReference::from_stored_text(""), None);
+        assert_eq!(GitReference::from_stored_text("bogus:x"), None);
+        for status in [
+            PlanStatus::Pending,
+            PlanStatus::Running,
+            PlanStatus::Complete,
+            PlanStatus::Failed,
+            PlanStatus::Skipped,
+        ] {
+            assert_eq!(PlanStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(
+            AnalysisStrategy::ToolIntrospection.as_str(),
+            "tool_introspection"
+        );
+        assert_eq!(
+            BuildSystem::parse("build_script"),
+            Some(BuildSystem::BuildScript)
+        );
+        assert_eq!(AnalyzerId::parse("cpp"), Some(AnalyzerId::Cpp));
     }
 
     #[test]
@@ -1147,9 +1587,15 @@ mod tests {
         let mut node = Node::new(id.clone());
         node.status = AnalysisStatus::Complete;
         graph.add_node(node);
-        graph.add_node(Node::new(id.clone()));
+        let mut rediscovered = Node::new(id.clone());
+        rediscovered.active_features = BTreeSet::from(["std".to_string()]);
+        graph.add_node(rediscovered);
         assert_eq!(graph.node_count(), 1);
-        assert_eq!(graph.node(&id).unwrap().status, AnalysisStatus::NotStarted);
+        let node = graph.node(&id).unwrap();
+        // The payload is replaced, but status is set only on first insert
+        // (High 2): a re-discovered Complete node stays Complete.
+        assert_eq!(node.status, AnalysisStatus::Complete);
+        assert!(node.active_features.contains("std"));
     }
 
     #[test]
@@ -1175,7 +1621,7 @@ mod tests {
         let edge = edges[0];
         assert!(edge.kinds.contains(&DependencyKind::Normal));
         assert!(edge.kinds.contains(&DependencyKind::Development));
-        assert_eq!(edge.confidence, 80);
+        assert_eq!(edge.confidence.value(), 80);
         assert_eq!(edge.evidence.len(), 2);
     }
 
@@ -1241,7 +1687,7 @@ mod tests {
         assert_eq!(graph.node_count(), 1);
         assert_eq!(graph.edge_count(), 1);
         assert_eq!(graph.unresolved().len(), 1);
-        assert_eq!(graph.unresolved()[0].confidence, 70);
+        assert_eq!(graph.unresolved()[0].confidence.value(), 70);
         assert_eq!(graph.edges_from(&a).len(), 1);
         assert!(graph.edges_to(&a).is_empty());
     }
