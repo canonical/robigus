@@ -5,6 +5,7 @@
 //! a target software project. Ubuntu archive mapping and packaging plans are
 //! Phase 2/3.
 
+pub mod detect;
 pub mod dpkg;
 pub mod error;
 pub mod feature;
@@ -14,9 +15,14 @@ pub mod predicate;
 pub mod solver;
 pub mod store;
 
+pub use detect::{
+    AnalyzerId, CargoAnalyzer, Confidence, CppAnalyzer, DetectionLimits, DetectionReport,
+    DetectionSignal, PlanRow, PlanStatus, ProjectAnalyzer, ProjectRoot, ProjectTree, Strategy,
+    analyzers, detect,
+};
 pub use error::{
-    DpkgError, FetchError, PredicateError, RobigusError, SandboxAttempt, SandboxUnavailable,
-    StoreError,
+    DetectError, DpkgError, FetchError, PredicateError, RobigusError, SandboxAttempt,
+    SandboxUnavailable, StoreError,
 };
 pub use feature::{FeatureExpr, FeatureExprError};
 pub use fetch::{

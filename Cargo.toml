@@ -53,6 +53,7 @@ ignore = "0.4"
 # Git access and manifest/config parsing
 gix = "0.90"
 cargo_metadata = "0.23"
+glob = "0.3"
 toml_edit = "0.25"
 toml = "1"
 

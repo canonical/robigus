@@ -14,6 +14,8 @@ async-trait = "0.1"
 chrono = { workspace = true }
 flate2 = { workspace = true }
 gix = { workspace = true, features = ["blocking-http-transport-reqwest"] }
+glob = { workspace = true }
+ignore = { workspace = true }
 petgraph = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rusqlite = { workspace = true }
@@ -25,6 +27,7 @@ sha2 = { workspace = true }
 thiserror.workspace = true
 tar = { workspace = true }
 tokio = { workspace = true }
+toml_edit = { workspace = true }
 ubuntu-info-rust = { workspace = true }
 url = { version = "2", features = ["serde"] }
 walkdir = { workspace = true }

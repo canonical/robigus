@@ -18,6 +18,8 @@ pub enum RobigusError {
     Dpkg(#[from] DpkgError),
     #[error(transparent)]
     Sandbox(#[from] SandboxUnavailable),
+    #[error(transparent)]
+    Detect(#[from] DetectError),
 }
 
 /// SQLite persistence failures.
@@ -80,6 +82,15 @@ pub struct PredicateError {
     pub span_start: usize,
     pub span_end: usize,
     pub message: String,
+}
+
+/// Project detection failures (spec §7.3).
+#[derive(Debug, thiserror::Error)]
+pub enum DetectError {
+    #[error("project tree walk failed: {0}")]
+    Walk(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Debian version parse failures (see `dpkg`).
