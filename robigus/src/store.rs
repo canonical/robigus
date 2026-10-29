@@ -386,14 +386,20 @@ impl Store {
         tokio::task::spawn_blocking(move || {
             let mut conn = lock(&conn)?;
             let tx = conn.transaction()?;
-            tx.execute(
+            // `RETURNING id` yields the affected row on both the insert and
+            // the update path. `last_insert_rowid()` must not be used here:
+            // SQLite leaves it unchanged when an upsert takes the DO UPDATE
+            // branch, so it would name whichever row was inserted last —
+            // possibly another package's.
+            let package_id: i64 = tx.query_row(
                 "INSERT INTO package (name, version, ecosystem, source_kind, source_uri,
                        source_precise, is_root, status, active_features, path)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9)
                  ON CONFLICT (name, version, ecosystem, source_kind, source_uri, source_precise)
                  DO UPDATE SET status = excluded.status,
                                active_features = excluded.active_features,
-                               path = excluded.path",
+                               path = excluded.path
+                 RETURNING id",
                 params![
                     identity.name,
                     identity.version,
@@ -405,8 +411,8 @@ impl Store {
                     active_features,
                     path,
                 ],
+                |row| row.get(0),
             )?;
-            let package_id = tx.last_insert_rowid();
             // The node payload is replaced wholesale, mirroring
             // `DependencyGraph::add_node` (spec §5.1).
             tx.execute(
@@ -1526,6 +1532,82 @@ mod tests {
         assert_eq!(analysis.graph.node_count(), 2);
         assert_eq!(analysis.graph.edge_count(), 1);
         assert_eq!(analysis.graph.edges_from(&a)[0].evidence.len(), 1);
+    }
+
+    /// Regression: re-upserting an existing node must rewrite *its own*
+    /// targets/provides/conflicts. Taking the row id from
+    /// `last_insert_rowid()` after an upsert that took the DO UPDATE branch
+    /// attached A's payload to B and deleted B's.
+    #[tokio::test]
+    async fn reupsert_rewrites_only_its_own_payload() {
+        let (store, _dir) = open_test_store().await;
+        store.write_metadata(&test_metadata()).await.unwrap();
+        let with_payload = |id: &PackageId, tag: &str| {
+            let mut node = Node::new(id.clone());
+            node.targets = vec![Target {
+                name: format!("{tag}-bin"),
+                kind: TargetKind::Binary,
+                path: None,
+            }];
+            node.provides = vec![Provide {
+                name: format!("{tag}-virtual"),
+                version: None,
+            }];
+            node.conflicts = vec![Conflict {
+                name: format!("{tag}-conflict"),
+                version_req: None,
+            }];
+            node
+        };
+        let a = test_id("a");
+        let b = test_id("b");
+        store.upsert_node(&with_payload(&a, "a1")).await.unwrap();
+        store.upsert_node(&with_payload(&b, "b1")).await.unwrap();
+        store.upsert_node(&with_payload(&a, "a2")).await.unwrap();
+
+        let graph = store.load().await.unwrap().graph;
+        let node_a = graph.node(&a).expect("a");
+        let node_b = graph.node(&b).expect("b");
+        assert_eq!(node_a.targets.len(), 1);
+        assert_eq!(node_a.targets[0].name, "a2-bin");
+        assert_eq!(node_a.provides[0].name, "a2-virtual");
+        assert_eq!(node_a.conflicts[0].name, "a2-conflict");
+        assert_eq!(node_b.targets.len(), 1);
+        assert_eq!(node_b.targets[0].name, "b1-bin");
+        assert_eq!(node_b.provides.len(), 1);
+        assert_eq!(node_b.provides[0].name, "b1-virtual");
+        assert_eq!(node_b.conflicts.len(), 1);
+        assert_eq!(node_b.conflicts[0].name, "b1-conflict");
+    }
+
+    /// Regression (High 5): an edge built through `DependencyGraph` loads back
+    /// identical, including a predicate written in non-canonical order, and
+    /// two spellings of one predicate stay one edge on both sides.
+    #[tokio::test]
+    async fn graph_edges_round_trip_with_equivalent_predicates() {
+        let (store, _dir) = open_test_store().await;
+        store.write_metadata(&test_metadata()).await.unwrap();
+        let a = test_id("a");
+        let b = test_id("b");
+        let mut graph = DependencyGraph::new();
+        for text in [
+            r#"cfg("target_os" = "linux") && feature("tls")"#,
+            r#"feature("tls") && cfg("target_os" = "linux")"#,
+        ] {
+            let mut edge = test_edge(a.clone(), Some(b.clone()), DependencyKind::Normal, 60);
+            edge.predicate = Predicate::parse(text).unwrap();
+            graph.add_edge(edge);
+        }
+        assert_eq!(graph.edge_count(), 1);
+
+        store.upsert_node(&Node::new(a.clone())).await.unwrap();
+        store.upsert_node(&Node::new(b.clone())).await.unwrap();
+        let edges: Vec<Edge> = graph.edges_from(&a).into_iter().cloned().collect();
+        store.upsert_edges(&a, &edges).await.unwrap();
+
+        let loaded = store.load().await.unwrap().graph;
+        assert_eq!(loaded.edge_count(), 1);
+        assert_eq!(loaded.edges_from(&a), graph.edges_from(&a));
     }
 
     #[tokio::test]

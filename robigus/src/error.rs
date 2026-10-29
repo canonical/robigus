@@ -62,6 +62,10 @@ pub enum FetchError {
     Download(String),
     #[error("checksum mismatch: expected {expected}, computed {actual}")]
     Checksum { expected: String, actual: String },
+    #[error("invalid SHA-256 digest '{0}': expected 64 hexadecimal characters")]
+    InvalidDigest(String),
+    #[error("invalid cache key '{0}': must be a single path component of [A-Za-z0-9._-]")]
+    InvalidCacheKey(String),
     #[error("extraction failed: {0}")]
     Extraction(String),
     #[error("source tree walk failed: {0}")]

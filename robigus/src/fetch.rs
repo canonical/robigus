@@ -11,8 +11,10 @@ use crate::error::{FetchError, RobigusError};
 use crate::model::{GitReference, SourceKind, path_tree_digest};
 use flate2::read::GzDecoder;
 use sha2::{Digest as _, Sha256};
+use std::collections::{BTreeMap, VecDeque};
+use std::ffi::OsString;
 use std::fs;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::task::spawn_blocking;
@@ -77,9 +79,60 @@ impl Cache {
         &self.root
     }
 
-    pub fn path_for(&self, kind: &str, digest: &str) -> PathBuf {
-        self.root.join(kind).join(digest)
+    /// The cache location `<root>/<kind>/<key>`. Both parts MUST be a single
+    /// safe path component: keys can originate from untrusted input (for
+    /// example a revision in a TSP's `Cargo.lock`), and a key such as
+    /// `../../x` would otherwise address a directory outside the cache.
+    pub fn path_for(&self, kind: &str, key: &str) -> Result<PathBuf, FetchError> {
+        validate_cache_component(kind)?;
+        validate_cache_component(key)?;
+        Ok(self.root.join(kind).join(key))
     }
+
+    /// A fresh, unique scratch path under `<root>/tmp` for staging work that
+    /// is moved into the cache only once it is complete.
+    fn scratch_path(&self, label: &str) -> PathBuf {
+        static SCRATCH: AtomicU64 = AtomicU64::new(0);
+        self.root.join("tmp").join(format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            SCRATCH.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+}
+
+fn validate_cache_component(component: &str) -> Result<(), FetchError> {
+    let safe = !component.is_empty()
+        && !component.starts_with('.')
+        && component
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if safe {
+        Ok(())
+    } else {
+        Err(FetchError::InvalidCacheKey(component.to_string()))
+    }
+}
+
+/// Normalizes a caller-supplied SHA-256 digest (trimmed, lowercase) and
+/// rejects anything that is not exactly 64 hexadecimal characters.
+fn normalize_sha256(digest: &str) -> Result<String, FetchError> {
+    let normalized = digest.trim().to_ascii_lowercase();
+    if normalized.len() == 64 && normalized.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(normalized)
+    } else {
+        Err(FetchError::InvalidDigest(digest.to_string()))
+    }
+}
+
+/// A full git object id: 40 (SHA-1) or 64 (SHA-256) hex characters,
+/// normalized to lowercase. Abbreviated hashes, branch names, and anything
+/// else return `None` and must be resolved by a fetch.
+fn full_commit_hash(rev: &str) -> Option<String> {
+    let normalized = rev.trim().to_ascii_lowercase();
+    let is_hash =
+        matches!(normalized.len(), 40 | 64) && normalized.chars().all(|c| c.is_ascii_hexdigit());
+    is_hash.then_some(normalized)
 }
 
 // 3. Extraction limits
@@ -136,16 +189,19 @@ pub async fn fetch_tarball(
     expected_digest: Option<&str>,
     cache: &Cache,
 ) -> Result<FetchedSource, RobigusError> {
-    if let Some(digest) = expected_digest {
-        let cached = cache.path_for("tarball", digest);
+    // Validated before any cache lookup or network access: the digest is
+    // used as a cache key.
+    let expected = expected_digest.map(normalize_sha256).transpose()?;
+    if let Some(digest) = &expected {
+        let cached = cache.path_for("tarball", digest)?;
         if cached.is_dir() {
             return Ok(FetchedSource {
                 tree: cached,
-                digest: digest.to_string(),
+                digest: digest.clone(),
                 provenance: Provenance::Verified,
                 kind: SourceKind::Tarball {
                     url: url.clone(),
-                    digest: Some(digest.to_string()),
+                    digest: Some(digest.clone()),
                 },
             });
         }
@@ -153,7 +209,6 @@ pub async fn fetch_tarball(
 
     let bytes = download(url).await?;
     let url = url.clone();
-    let expected = expected_digest.map(str::to_string);
     let cache = cache.clone();
     spawn_blocking(move || {
         install_tarball(&bytes, expected.as_deref(), &url, &cache).map_err(RobigusError::from)
@@ -207,28 +262,19 @@ fn fetch_git_sync(
     reference: &GitReference,
     cache: &Cache,
 ) -> Result<FetchedSource, FetchError> {
-    // A pinned revision that is already cached needs no network access.
-    if let GitReference::Rev(rev) = reference {
-        let cached = cache.path_for("git", rev);
-        if cached.is_dir() {
-            return Ok(FetchedSource {
-                tree: cached,
-                digest: rev.clone(),
-                provenance: Provenance::Verified,
-                kind: SourceKind::Git {
-                    url: url.clone(),
-                    reference: reference.clone(),
-                },
-            });
-        }
+    if let Some((tree, commit)) = git_cache_hit(cache, reference)? {
+        return Ok(FetchedSource {
+            tree,
+            digest: commit,
+            provenance: Provenance::Verified,
+            kind: SourceKind::Git {
+                url: url.clone(),
+                reference: reference.clone(),
+            },
+        });
     }
 
-    static SCRATCH: AtomicU64 = AtomicU64::new(0);
-    let scratch = cache.root.join("tmp").join(format!(
-        "clone-{}-{}",
-        std::process::id(),
-        SCRATCH.fetch_add(1, Ordering::Relaxed)
-    ));
+    let scratch = cache.scratch_path("clone");
     fs::create_dir_all(&scratch)?;
     let cloned = clone_and_checkout(url, reference, &scratch);
     if cloned.is_err() {
@@ -236,11 +282,17 @@ fn fetch_git_sync(
     }
     let commit = cloned?;
 
-    let tree = cache.path_for("git", &commit);
+    let tree = match cache.path_for("git", &commit) {
+        Ok(tree) => tree,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&scratch);
+            return Err(error);
+        }
+    };
     if tree.exists() {
         fs::remove_dir_all(&scratch)?;
     } else {
-        fs::create_dir_all(tree.parent().expect("cache path has a parent"))?;
+        fs::create_dir_all(cache.root.join("git"))?;
         fs::rename(&scratch, &tree)?;
     }
 
@@ -253,6 +305,25 @@ fn fetch_git_sync(
             reference: reference.clone(),
         },
     })
+}
+
+/// A pinned revision that is already cached needs no network access. Only a
+/// full commit hash may address the cache: it is the content address the
+/// cache is keyed by, and any other string (a branch, a short hash, or a
+/// hostile `../..` value from an untrusted lockfile) must be resolved by a
+/// fetch instead.
+fn git_cache_hit(
+    cache: &Cache,
+    reference: &GitReference,
+) -> Result<Option<(PathBuf, String)>, FetchError> {
+    let GitReference::Rev(rev) = reference else {
+        return Ok(None);
+    };
+    let Some(commit) = full_commit_hash(rev) else {
+        return Ok(None);
+    };
+    let cached = cache.path_for("git", &commit)?;
+    Ok(cached.is_dir().then_some((cached, commit)))
 }
 
 fn clone_and_checkout(
@@ -350,6 +421,10 @@ async fn download(url: &Url) -> Result<Vec<u8>, FetchError> {
 
 /// Verifies and installs a downloaded tarball: digest check, extraction into
 /// the content-addressed cache. Sync so tests can drive it without network.
+///
+/// Extraction is staged in a scratch directory and renamed into place only on
+/// success, so an interrupted or rejected extraction never leaves a partial
+/// tree that a later run would treat as a cache hit.
 fn install_tarball(
     bytes: &[u8],
     expected: Option<&str>,
@@ -357,7 +432,7 @@ fn install_tarball(
     cache: &Cache,
 ) -> Result<FetchedSource, FetchError> {
     let (digest, provenance) = verify_digest(expected, bytes)?;
-    let tree = cache.path_for("tarball", &digest);
+    let tree = cache.path_for("tarball", &digest)?;
     if tree.is_dir() {
         return Ok(FetchedSource {
             tree,
@@ -370,10 +445,23 @@ fn install_tarball(
         });
     }
 
-    let archive = cache.path_for("tarball", &format!("{digest}.archive"));
-    fs::create_dir_all(archive.parent().expect("cache path has a parent"))?;
+    let staging = cache.scratch_path("extract");
+    let archive = staging.with_extension("archive");
+    fs::create_dir_all(cache.root.join("tmp"))?;
     fs::write(&archive, bytes)?;
-    extract_tarball(&archive, &tree, &ExtractionLimits::default())?;
+    // `extract_tarball` removes `staging` itself on failure.
+    let extracted = extract_tarball(&archive, &staging, &ExtractionLimits::default());
+    let _ = fs::remove_file(&archive);
+    extracted?;
+
+    fs::create_dir_all(cache.root.join("tarball"))?;
+    if let Err(error) = fs::rename(&staging, &tree) {
+        let _ = fs::remove_dir_all(&staging);
+        // A concurrent install of the same content may have won the race.
+        if !tree.is_dir() {
+            return Err(error.into());
+        }
+    }
 
     Ok(FetchedSource {
         tree,
@@ -393,7 +481,7 @@ fn verify_digest(expected: Option<&str>, bytes: &[u8]) -> Result<(String, Proven
     let digest = crate::model::to_hex(Sha256::digest(bytes).as_slice());
     match expected {
         Some(expected) => {
-            let expected = expected.trim().to_ascii_lowercase();
+            let expected = normalize_sha256(expected)?;
             if expected != digest {
                 return Err(FetchError::Checksum {
                     expected,
@@ -429,12 +517,60 @@ fn detect_compression(archive: &Path) -> Result<Compression, FetchError> {
 
 /// Extracts a (possibly compressed) tar archive into `dest`, enforcing every
 /// §7.2 hardening rule. Nothing is ever executed.
+///
+/// `dest` must not exist or must be an empty directory. On any failure the
+/// partially extracted tree is removed, so a rejected archive never leaves
+/// content behind — in particular never an escaping symlink.
+///
+/// Links are the subtle case: a lexical check alone is not enough, because an
+/// entry path or a link target can traverse a symlink extracted earlier and
+/// land outside `dest` while looking contained. Extraction therefore
+///
+/// 1. never writes through a symlink: every existing component of an entry's
+///    parent path is checked with `symlink_metadata`, and an existing file or
+///    link at the entry's own path is unlinked rather than followed;
+/// 2. defers symlink creation until every file, directory, and hardlink
+///    exists, so no entry is ever written while a symlink is on disk; and
+/// 3. re-resolves every created symlink against the final tree, following
+///    on-disk links, and rejects any that resolve outside `dest`. Checking the
+///    final tree makes the result independent of archive entry order.
 pub fn extract_tarball(
     archive: &Path,
     dest: &Path,
     limits: &ExtractionLimits,
 ) -> Result<(), FetchError> {
-    fs::create_dir_all(dest)?;
+    match fs::symlink_metadata(dest) {
+        Ok(metadata) if metadata.is_dir() => {
+            if fs::read_dir(dest)?.next().is_some() {
+                return Err(FetchError::Extraction(format!(
+                    "destination '{}' is not empty",
+                    dest.display()
+                )));
+            }
+        }
+        Ok(_) => {
+            return Err(FetchError::Extraction(format!(
+                "destination '{}' is not a directory",
+                dest.display()
+            )));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => fs::create_dir_all(dest)?,
+        Err(error) => return Err(error.into()),
+    }
+    let result = dest
+        .canonicalize()
+        .map_err(FetchError::from)
+        .and_then(|root| extract_into(archive, &root, limits));
+    if result.is_err() {
+        // `remove_dir_all` removes symlinks without following them.
+        let _ = fs::remove_dir_all(dest);
+    }
+    result
+}
+
+/// The extraction passes behind [`extract_tarball`]; `root` is the canonical,
+/// empty destination directory.
+fn extract_into(archive: &Path, root: &Path, limits: &ExtractionLimits) -> Result<(), FetchError> {
     let file = fs::File::open(archive)?;
     let decompressed: Box<dyn Read> = match detect_compression(archive)? {
         Compression::Gzip => Box::new(GzDecoder::new(file)),
@@ -452,6 +588,11 @@ pub fn extract_tarball(
         .map_err(|error| FetchError::Extraction(format!("unreadable archive: {error}")))?;
     let mut count: u64 = 0;
     let mut total: u64 = 0;
+    // Pending symlinks, created only after every other entry. Keyed by the
+    // normalized relative path so a later entry for the same path supersedes
+    // an earlier one (tar's last-entry-wins semantics).
+    let mut symlinks: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+
     while let Some(entry) = entries
         .next()
         .transpose()
@@ -474,9 +615,14 @@ pub fn extract_tarball(
                 "entry path '{path:?}' escapes the destination"
             )));
         }
-        let dest_path = dest.join(&path);
         let header = entry.header();
         let entry_type = header.entry_type();
+
+        // Archive-wide pax metadata (for example the commit id `git archive`
+        // records in every GitHub tarball) is never materialized.
+        if entry_type.is_pax_global_extensions() {
+            continue;
+        }
 
         if let Ok(mode) = header.mode()
             && (mode & 0o4000 != 0 || mode & 0o2000 != 0)
@@ -486,107 +632,266 @@ pub fn extract_tarball(
             )));
         }
 
-        match entry_type {
-            tar::EntryType::Directory => {
-                fs::create_dir_all(&dest_path)?;
+        let rel = normalize_lexical(&path);
+        if rel.as_os_str().is_empty() {
+            // A `./` entry names the destination itself.
+            if entry_type.is_dir() {
+                continue;
             }
+            return Err(FetchError::Extraction(format!(
+                "entry '{path:?}' names the destination itself"
+            )));
+        }
+        if let Some(parent) = rel.parent() {
+            ensure_no_symlink_components(root, parent)?;
+        }
+        symlinks.remove(&rel);
+        let dest_path = root.join(&rel);
+
+        match entry_type {
+            tar::EntryType::Directory => match fs::symlink_metadata(&dest_path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(FetchError::Extraction(format!(
+                        "directory entry '{path:?}' conflicts with an existing file"
+                    )));
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    fs::create_dir_all(&dest_path)?;
+                }
+                Err(error) => return Err(error.into()),
+            },
             tar::EntryType::Regular => {
                 let size = header.size().map_err(|error| {
                     FetchError::Extraction(format!("corrupt entry size: {error}"))
                 })?;
-                total += size;
+                total = total.saturating_add(size);
                 if total > limits.max_total_size {
                     return Err(FetchError::Extraction(format!(
                         "total-size limit of {} exceeded",
                         limits.max_total_size
                     )));
                 }
-                if let Some(parent) = dest_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
+                create_parent_dirs(&dest_path)?;
+                clear_slot(&dest_path, &path)?;
+                let mut out = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&dest_path)?;
                 let mut entry = entry;
-                let mut out = fs::File::create(&dest_path)?;
                 std::io::copy(&mut entry, &mut out)?;
             }
             tar::EntryType::Symlink => {
-                let target = entry
-                    .link_name()
-                    .map_err(|error| {
-                        FetchError::Extraction(format!("corrupt link target: {error}"))
-                    })?
-                    .ok_or_else(|| {
-                        FetchError::Extraction(format!(
-                            "entry '{path:?}' is a symlink without a target"
-                        ))
-                    })?;
-                if target.is_absolute() {
+                let target = link_target(&entry, &path, "symlink")?;
+                if target.has_root() {
                     return Err(FetchError::Extraction(format!(
                         "symlink '{path:?}' has an absolute target '{target:?}'"
                     )));
                 }
-                let link_dir = dest_path.parent().unwrap_or(dest);
-                let resolved = normalize_lexical(&link_dir.join(&target));
-                if !resolved.starts_with(dest) {
+                // Early, friendly rejection of the obvious case; the final
+                // on-disk resolution below is the authoritative check.
+                let link_dir = dest_path.parent().unwrap_or(root);
+                if !normalize_lexical(&link_dir.join(&target)).starts_with(root) {
                     return Err(FetchError::Extraction(format!(
                         "symlink '{path:?}' target '{target:?}' escapes the destination"
                     )));
                 }
-                if let Some(parent) = dest_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                #[cfg(unix)]
-                {
-                    std::os::unix::fs::symlink(&target, &dest_path)?;
-                }
-                #[cfg(not(unix))]
-                {
-                    return Err(FetchError::Extraction(
-                        "symlink entries require a unix host".to_string(),
-                    ));
-                }
+                symlinks.insert(rel, target);
             }
             tar::EntryType::Link => {
-                // Hardlink targets are relative to the archive root.
-                let target = entry
-                    .link_name()
-                    .map_err(|error| {
-                        FetchError::Extraction(format!("corrupt link target: {error}"))
-                    })?
-                    .ok_or_else(|| {
-                        FetchError::Extraction(format!(
-                            "entry '{path:?}' is a hardlink without a target"
-                        ))
-                    })?;
-                if target.is_absolute() {
-                    return Err(FetchError::Extraction(format!(
-                        "hardlink '{path:?}' has an absolute target '{target:?}'"
-                    )));
-                }
-                let resolved = normalize_lexical(&dest.join(&target));
-                if !resolved.starts_with(dest) {
+                // Hardlink targets are relative to the archive root and must
+                // name a regular file extracted earlier in this archive.
+                let target = link_target(&entry, &path, "hardlink")?;
+                if target.has_root() || target.components().any(|c| c == Component::ParentDir) {
                     return Err(FetchError::Extraction(format!(
                         "hardlink '{path:?}' target '{target:?}' escapes the destination"
                     )));
                 }
-                if let Some(parent) = dest_path.parent() {
-                    fs::create_dir_all(parent)?;
+                let target_rel = normalize_lexical(&target);
+                ensure_no_symlink_components(root, &target_rel)?;
+                let source = root.join(&target_rel);
+                let is_regular_file = fs::symlink_metadata(&source)
+                    .map(|metadata| metadata.is_file())
+                    .unwrap_or(false);
+                if target_rel.as_os_str().is_empty() || !is_regular_file {
+                    return Err(FetchError::Extraction(format!(
+                        "hardlink '{path:?}' target '{target:?}' is not a previously \
+                         extracted regular file"
+                    )));
                 }
-                #[cfg(unix)]
-                {
-                    fs::hard_link(&resolved, &dest_path)?;
-                }
-                #[cfg(not(unix))]
-                {
-                    return Err(FetchError::Extraction(
-                        "hardlink entries require a unix host".to_string(),
-                    ));
-                }
+                create_parent_dirs(&dest_path)?;
+                clear_slot(&dest_path, &path)?;
+                fs::hard_link(&source, &dest_path)?;
             }
             other => {
                 return Err(FetchError::Extraction(format!(
                     "entry '{path:?}' has an unsupported type ({other:?})"
                 )));
             }
+        }
+    }
+
+    for (rel, target) in &symlinks {
+        if let Some(parent) = rel.parent() {
+            ensure_no_symlink_components(root, parent)?;
+        }
+        let dest_path = root.join(rel);
+        create_parent_dirs(&dest_path)?;
+        clear_slot(&dest_path, rel)?;
+        create_symlink(target, &dest_path)?;
+    }
+    for rel in symlinks.keys() {
+        verify_symlink_confined(root, rel)?;
+    }
+    Ok(())
+}
+
+fn link_target<R: Read>(
+    entry: &tar::Entry<'_, R>,
+    path: &Path,
+    what: &str,
+) -> Result<PathBuf, FetchError> {
+    entry
+        .link_name()
+        .map_err(|error| FetchError::Extraction(format!("corrupt link target: {error}")))?
+        .map(|target| target.into_owned())
+        .ok_or_else(|| {
+            FetchError::Extraction(format!("entry '{path:?}' is a {what} without a target"))
+        })
+}
+
+/// Rejects `rel` (relative to `root`) if any existing component is a
+/// symlink, so nothing is ever created or written through a link. Components
+/// that do not exist yet are fine: they are created as real directories.
+fn ensure_no_symlink_components(root: &Path, rel: &Path) -> Result<(), FetchError> {
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => current.push(name),
+            Component::CurDir => continue,
+            _ => {
+                return Err(FetchError::Extraction(format!(
+                    "entry path '{}' escapes the destination",
+                    rel.display()
+                )));
+            }
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(FetchError::Extraction(format!(
+                    "entry path '{}' traverses the symlink '{}'",
+                    rel.display(),
+                    current.strip_prefix(root).unwrap_or(&current).display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn create_parent_dirs(path: &Path) -> Result<(), FetchError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+/// Makes room for a new entry at `path` without following a link: an
+/// existing file or symlink is unlinked (a later archive entry wins), and an
+/// existing directory is a conflict.
+fn clear_slot(path: &Path, entry: &Path) -> Result<(), FetchError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Err(FetchError::Extraction(format!(
+            "entry '{}' conflicts with an existing directory",
+            entry.display()
+        ))),
+        Ok(_) => Ok(fs::remove_file(path)?),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "symlink entries require a unix host",
+    ))
+}
+
+/// Bound on symlink hops while resolving one link, mirroring the kernel's
+/// `ELOOP` limit.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Resolves the symlink at `link_rel` (relative to `root`) against the
+/// on-disk tree, following every symlink it traverses, and fails if the
+/// resolution ever leaves `root`. Missing components are resolved lexically
+/// (dangling links are allowed as long as they stay inside the tree).
+fn verify_symlink_confined(root: &Path, link_rel: &Path) -> Result<(), FetchError> {
+    enum Step {
+        Parent,
+        Name(OsString),
+    }
+    let escapes = || {
+        FetchError::Extraction(format!(
+            "symlink '{}' resolves outside the destination",
+            link_rel.display()
+        ))
+    };
+    let steps_of = |path: &Path| -> Result<Vec<Step>, FetchError> {
+        let mut steps = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(name) => steps.push(Step::Name(name.to_os_string())),
+                Component::ParentDir => steps.push(Step::Parent),
+                Component::CurDir => {}
+                Component::RootDir | Component::Prefix(_) => return Err(escapes()),
+            }
+        }
+        Ok(steps)
+    };
+
+    let mut pending: VecDeque<Step> = steps_of(link_rel)?.into();
+    // Resolved components below `root`; each is a real, non-symlink entry
+    // (or does not exist), so `root` + `resolved` is a physical path.
+    let mut resolved = PathBuf::new();
+    let mut hops = 0;
+    while let Some(step) = pending.pop_front() {
+        let name = match step {
+            Step::Parent => {
+                if !resolved.pop() {
+                    return Err(escapes());
+                }
+                continue;
+            }
+            Step::Name(name) => name,
+        };
+        let candidate = root.join(&resolved).join(&name);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return Err(FetchError::Extraction(format!(
+                        "symlink '{}' has too many levels of indirection",
+                        link_rel.display()
+                    )));
+                }
+                let target = fs::read_link(&candidate)?;
+                for step in steps_of(&target)?.into_iter().rev() {
+                    pending.push_front(step);
+                }
+            }
+            Ok(_) => resolved.push(&name),
+            Err(error) if error.kind() == ErrorKind::NotFound => resolved.push(&name),
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(())
@@ -848,6 +1153,290 @@ mod tests {
         out
     }
 
+    fn symlink_header(name: &str, target: &str) -> [u8; 512] {
+        raw_header(name, b'2', 0o777, 0, Some(target))
+    }
+
+    fn extract_raw(entries: &[([u8; 512], &[u8])]) -> (TempDir, PathBuf, Result<(), FetchError>) {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.tar");
+        fs::write(&archive, raw_tar(entries)).unwrap();
+        let dest = dir.path().join("dest");
+        let result = extract_tarball(&archive, &dest, &ExtractionLimits::default());
+        (dir, dest, result)
+    }
+
+    /// Regression (C1): `a -> .` then `a/b -> ..` look contained lexically,
+    /// but `a/b` physically names the destination's parent, so writing
+    /// `b/pwned.txt` used to escape.
+    #[test]
+    fn symlink_chain_through_parent_is_rejected() {
+        let (dir, dest, result) = extract_raw(&[
+            (symlink_header("a", "."), &b""[..]),
+            (symlink_header("a/b", ".."), &b""[..]),
+            (
+                raw_header("b/pwned.txt", b'0', 0o644, 5, None),
+                &b"pwned"[..],
+            ),
+        ]);
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("traverses the symlink"),
+            "{error}"
+        );
+        assert!(!dir.path().join("pwned.txt").exists());
+        assert!(!dest.exists(), "a rejected archive leaves no tree behind");
+    }
+
+    /// A symlink whose *target* traverses other symlinks: `s1 -> d` and
+    /// `d/s2 -> ..` are each contained, but `s3 -> s1/s2/..` resolves to the
+    /// destination's parent. Listing `s3` first must not change the outcome.
+    #[test]
+    fn symlink_target_through_symlinks_is_rejected() {
+        for s3_first in [false, true] {
+            let s3 = (symlink_header("s3", "s1/s2/.."), &b""[..]);
+            let mut entries = vec![
+                (raw_header("d/", b'5', 0o755, 0, None), &b""[..]),
+                (symlink_header("s1", "d"), &b""[..]),
+                (symlink_header("d/s2", ".."), &b""[..]),
+            ];
+            if s3_first {
+                entries.insert(0, s3);
+            } else {
+                entries.push(s3);
+            }
+            let (_dir, dest, result) = extract_raw(&entries);
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("resolves outside the destination"),
+                "{error}"
+            );
+            assert!(!dest.exists());
+        }
+    }
+
+    #[test]
+    fn contained_symlink_chains_are_allowed() {
+        let (_dir, dest, result) = extract_raw(&[
+            (raw_header("d/f.txt", b'0', 0o644, 2, None), &b"hi"[..]),
+            (symlink_header("s1", "d"), &b""[..]),
+            (symlink_header("s2", "s1/f.txt"), &b""[..]),
+            (symlink_header("dangling", "missing/file"), &b""[..]),
+        ]);
+        result.unwrap();
+        assert_eq!(fs::read_to_string(dest.join("s2")).unwrap(), "hi");
+        assert!(fs::symlink_metadata(dest.join("dangling")).is_ok());
+    }
+
+    /// A regular file that follows a symlink of the same name replaces the
+    /// link; it is never written through it.
+    #[test]
+    fn regular_file_never_writes_through_a_symlink() {
+        let (_dir, dest, result) = extract_raw(&[
+            (raw_header("real.txt", b'0', 0o644, 4, None), &b"orig"[..]),
+            (symlink_header("link", "real.txt"), &b""[..]),
+            (raw_header("link", b'0', 0o644, 3, None), &b"new"[..]),
+        ]);
+        result.unwrap();
+        assert_eq!(fs::read_to_string(dest.join("real.txt")).unwrap(), "orig");
+        let link = fs::symlink_metadata(dest.join("link")).unwrap();
+        assert!(link.is_file());
+        assert_eq!(fs::read_to_string(dest.join("link")).unwrap(), "new");
+    }
+
+    #[test]
+    fn escaping_hardlink_is_rejected() {
+        let (dir, dest, result) = extract_raw(&[(
+            raw_header("h", b'1', 0o644, 0, Some("../outside")),
+            &b""[..],
+        )]);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("escapes the destination")
+        );
+        assert!(!dir.path().join("outside").exists());
+        assert!(!dest.exists());
+    }
+
+    /// Hardlinks may only point at regular files already extracted; in
+    /// particular not at a symlink (deferred) or a missing path.
+    #[test]
+    fn hardlink_to_non_regular_file_is_rejected() {
+        let (_dir, _dest, result) = extract_raw(&[
+            (symlink_header("s", "d"), &b""[..]),
+            (raw_header("h", b'1', 0o644, 0, Some("s")), &b""[..]),
+        ]);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not a previously extracted regular file")
+        );
+    }
+
+    #[test]
+    fn contained_hardlink_is_allowed() {
+        let (_dir, dest, result) = extract_raw(&[
+            (raw_header("a.txt", b'0', 0o644, 5, None), &b"hello"[..]),
+            (
+                raw_header("sub/b.txt", b'1', 0o644, 0, Some("a.txt")),
+                &b""[..],
+            ),
+        ]);
+        result.unwrap();
+        assert_eq!(fs::read_to_string(dest.join("sub/b.txt")).unwrap(), "hello");
+    }
+
+    /// `git archive` (every GitHub release tarball) starts with a pax global
+    /// header; it is metadata and must be skipped, not rejected.
+    #[test]
+    fn pax_global_header_is_skipped() {
+        let pax = b"15 comment=abc\n";
+        let (_dir, dest, result) = extract_raw(&[
+            (
+                raw_header("pax_global_header", b'g', 0o666, pax.len() as u64, None),
+                &pax[..],
+            ),
+            (raw_header("src/lib.rs", b'0', 0o644, 2, None), &b"//"[..]),
+        ]);
+        result.unwrap();
+        assert!(dest.join("src/lib.rs").exists());
+        assert!(!dest.join("pax_global_header").exists());
+    }
+
+    #[test]
+    fn non_empty_destination_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.tar");
+        fs::write(&archive, raw_tar(&[])).unwrap();
+        let dest = dir.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("keep.txt"), b"user data").unwrap();
+        let error = extract_tarball(&archive, &dest, &ExtractionLimits::default()).unwrap_err();
+        assert!(error.to_string().contains("not empty"));
+        assert!(
+            dest.join("keep.txt").exists(),
+            "existing content is untouched"
+        );
+    }
+
+    /// A rejected archive must not leave a partial tree in the cache that a
+    /// later run would treat as a verified cache hit.
+    #[test]
+    fn rejected_install_leaves_no_cache_entry() {
+        let (cache, _dir) = temp_cache();
+        let url = Url::parse("https://example.com/evil.tar").unwrap();
+        let bytes = raw_tar(&[
+            (raw_header("ok.txt", b'0', 0o644, 2, None), &b"ok"[..]),
+            (symlink_header("a", "."), &b""[..]),
+            (symlink_header("a/b", ".."), &b""[..]),
+        ]);
+        install_tarball(&bytes, None, &url, &cache).unwrap_err();
+        let digest = crate::model::to_hex(Sha256::digest(&bytes).as_slice());
+        assert!(!cache.path_for("tarball", &digest).unwrap().exists());
+        let leftovers = fs::read_dir(cache.root().join("tmp"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(leftovers, 0, "staging files are cleaned up");
+    }
+
+    /// Regression (High 1): cache keys come from untrusted input and must
+    /// not address paths outside the cache.
+    #[test]
+    fn cache_keys_must_be_single_safe_components() {
+        let (cache, _dir) = temp_cache();
+        for bad in [
+            "../../secret",
+            "..",
+            ".",
+            "",
+            "a/b",
+            "/etc",
+            ".hidden",
+            "a\0b",
+        ] {
+            assert!(
+                matches!(
+                    cache.path_for("git", bad),
+                    Err(FetchError::InvalidCacheKey(_))
+                ),
+                "{bad:?} must be rejected"
+            );
+            assert!(cache.path_for(bad, "abc").is_err(), "kind {bad:?}");
+        }
+        assert!(cache.path_for("git", &"a".repeat(40)).is_ok());
+    }
+
+    #[test]
+    fn git_cache_hits_require_a_full_commit_hash() {
+        let (cache, dir) = temp_cache();
+        // A directory reachable by traversal from `<cache>/git`.
+        fs::create_dir_all(cache.root().join("git")).unwrap();
+        fs::create_dir_all(dir.path().join("secret")).unwrap();
+        let rev = |text: &str| GitReference::Rev(text.to_string());
+        assert!(
+            git_cache_hit(&cache, &rev("../../secret"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(git_cache_hit(&cache, &rev("main")).unwrap().is_none());
+
+        // Abbreviated hashes are resolved by a fetch, never by the cache.
+        let commit = "ab".repeat(20);
+        fs::create_dir_all(cache.path_for("git", &commit).unwrap()).unwrap();
+        assert!(
+            git_cache_hit(&cache, &rev(&commit[..12]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            git_cache_hit(&cache, &GitReference::Branch(commit.clone()))
+                .unwrap()
+                .is_none()
+        );
+
+        // A full hash hits, normalized to lowercase.
+        let (tree, digest) = git_cache_hit(&cache, &rev(&commit.to_ascii_uppercase()))
+            .unwrap()
+            .expect("cache hit");
+        assert_eq!(digest, commit);
+        assert_eq!(tree, cache.path_for("git", &commit).unwrap());
+    }
+
+    #[tokio::test]
+    async fn malformed_tarball_digest_is_rejected_before_any_io() {
+        let (cache, dir) = temp_cache();
+        fs::create_dir_all(cache.root().join("tarball")).unwrap();
+        fs::create_dir_all(dir.path().join("secret")).unwrap();
+        // `.invalid` never resolves, so reaching the network would fail
+        // differently.
+        let url = Url::parse("https://robigus.invalid/src.tar").unwrap();
+        let non_hex = "g".repeat(64);
+        for bad in ["../../secret", "abc", non_hex.as_str()] {
+            let error = fetch_tarball(&url, Some(bad), &cache).await.unwrap_err();
+            assert!(
+                matches!(error, RobigusError::Fetch(FetchError::InvalidDigest(_))),
+                "{bad:?}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tarball_cache_hit_normalizes_the_digest() {
+        let (cache, _dir) = temp_cache();
+        let url = Url::parse("https://robigus.invalid/src.tar").unwrap();
+        let digest = crate::model::to_hex(Sha256::digest(b"x").as_slice());
+        fs::create_dir_all(cache.path_for("tarball", &digest).unwrap()).unwrap();
+        let supplied = format!("  {}  ", digest.to_ascii_uppercase());
+        let fetched = fetch_tarball(&url, Some(&supplied), &cache).await.unwrap();
+        assert_eq!(fetched.digest, digest);
+        assert_eq!(fetched.provenance, Provenance::Verified);
+    }
+
     #[test]
     fn traversal_entry_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -1021,7 +1610,7 @@ mod tests {
         let digest = crate::model::to_hex(Sha256::digest(bytes).as_slice());
 
         // Pre-populate the cached tree with a marker.
-        let cached_tree = cache.path_for("tarball", &digest);
+        let cached_tree = cache.path_for("tarball", &digest).unwrap();
         fs::create_dir_all(&cached_tree).unwrap();
         fs::write(cached_tree.join("marker"), b"cached").unwrap();
 
@@ -1064,7 +1653,7 @@ mod tests {
         let (cache, _dir) = temp_cache();
         let url = Url::parse("https://example.com/repo.git").unwrap();
         let commit = "0".repeat(40);
-        let cached_tree = cache.path_for("git", &commit);
+        let cached_tree = cache.path_for("git", &commit).unwrap();
         fs::create_dir_all(&cached_tree).unwrap();
         fs::write(cached_tree.join("marker"), b"cached").unwrap();
 

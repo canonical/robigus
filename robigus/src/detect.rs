@@ -8,7 +8,7 @@
 //! (§6.2).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use ignore::WalkBuilder;
 
@@ -158,6 +158,10 @@ pub struct PlanRow {
 pub struct DetectionReport {
     pub signals: Vec<DetectionSignal>,
     pub roots: Vec<ProjectRoot>,
+    /// Cargo packages inside a root that are neither workspace members nor
+    /// separate roots (test fixtures, examples, …). Recorded so the report
+    /// shows what was seen, but not analyzed as roots (spec §7.3).
+    pub non_member_crates: Vec<PathBuf>,
     pub plan: Vec<PlanRow>,
 }
 
@@ -200,8 +204,12 @@ fn marker_signal(filename: &str) -> Option<(AnalyzerId, Strategy, u8)> {
 #[derive(Debug, Clone, Default)]
 struct CargoManifest {
     is_workspace: bool,
+    /// Normalized `[workspace] members` globs, relative to the manifest's
+    /// directory.
     members: Vec<String>,
-    exclude: Vec<String>,
+    /// Normalized `[workspace] exclude` entries. Cargo treats these as path
+    /// prefixes, not globs.
+    exclude: Vec<PathBuf>,
 }
 
 /// The in-memory result of walking a project tree (spec §7.3). Built once by
@@ -310,54 +318,124 @@ fn parse_cargo_manifest(content: &str) -> CargoManifest {
         return manifest;
     };
     manifest.is_workspace = true;
-    if let Some(members) = workspace
-        .get("members")
-        .and_then(|item| item.as_value())
-        .and_then(|value| value.as_array())
-    {
-        manifest.members = members
-            .iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect();
-    }
-    if let Some(exclude) = workspace
-        .get("exclude")
-        .and_then(|item| item.as_value())
-        .and_then(|value| value.as_array())
-    {
-        manifest.exclude = exclude
-            .iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect();
-    }
+    let entries = |key: &str| -> Vec<String> {
+        workspace
+            .get(key)
+            .and_then(|item| item.as_value())
+            .and_then(|value| value.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .filter_map(normalize_workspace_entry)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    manifest.members = entries("members");
+    manifest.exclude = entries("exclude").into_iter().map(PathBuf::from).collect();
     manifest
 }
 
-/// True when `dir` is a member of an ancestor workspace (spec §7.3): some
-/// strictly-ancestor `Cargo.toml` declares `[workspace]` whose `members` globs
-/// match `dir` and whose `exclude` globs do not.
-fn is_reachable(tree: &ProjectTree, dir: &Path) -> bool {
-    for (ancestor, manifest) in &tree.cargo_manifests {
-        if ancestor.as_path() == dir || !manifest.is_workspace {
-            continue;
-        }
-        if !dir.starts_with(ancestor) {
-            continue;
-        }
-        let rel = dir.strip_prefix(ancestor).unwrap_or(dir).to_string_lossy();
-        let is_member = manifest.members.iter().any(|m| glob_matches(m, &rel));
-        let is_excluded = manifest.exclude.iter().any(|m| glob_matches(m, &rel));
-        if is_member && !is_excluded {
-            return true;
+/// Normalizes a workspace `members`/`exclude` entry relative to the
+/// workspace directory, so `./a` and `a/` both become `a`. Entries that are
+/// absolute or climb above the workspace directory cannot name anything
+/// below it and yield `None`.
+fn normalize_workspace_entry(entry: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for component in Path::new(entry).components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_str()?),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
         }
     }
-    false
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-fn glob_matches(pattern: &str, path: &str) -> bool {
+/// How a Cargo package directory relates to the workspaces above it.
+#[derive(Debug, Clone, Copy, Default)]
+struct Membership {
+    /// Matched by an ancestor workspace's `members` and not excluded.
+    member: bool,
+    /// Named exactly by an ancestor workspace's `exclude`.
+    explicitly_excluded: bool,
+}
+
+/// Classifies `dir` against every strictly-ancestor workspace. Membership
+/// follows Cargo: `members` are globs whose `*` does not cross `/`, and
+/// `exclude` entries are path prefixes that override `members`.
+fn membership(tree: &ProjectTree, dir: &Path) -> Membership {
+    let mut result = Membership::default();
+    for (ancestor, manifest) in &tree.cargo_manifests {
+        if !manifest.is_workspace || ancestor.as_path() == dir {
+            continue;
+        }
+        let Ok(rel) = dir.strip_prefix(ancestor) else {
+            continue;
+        };
+        let excluded = manifest.exclude.iter().any(|ex| rel.starts_with(ex));
+        result.explicitly_excluded |= manifest.exclude.iter().any(|ex| rel == ex);
+        result.member |= !excluded && manifest.members.iter().any(|m| glob_matches(m, rel));
+    }
+    result
+}
+
+/// Cargo's member-glob semantics: `*` and `?` never match `/` (Cargo expands
+/// members with a filesystem glob, component by component).
+const MEMBER_GLOB: glob::MatchOptions = glob::MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+fn glob_matches(pattern: &str, path: &Path) -> bool {
     glob::Pattern::new(pattern)
-        .map(|p| p.matches_path(Path::new(path)))
+        .map(|p| p.matches_path_with(path, MEMBER_GLOB))
         .unwrap_or(false)
+}
+
+/// Decides which Cargo package directories are analysis roots (spec §7.3).
+/// Returns `(roots, non_member_crates)`.
+///
+/// Directories are decided shallowest first, so every enclosing root is known
+/// before the directories inside it. A Cargo directory is:
+///
+/// - part of an enclosing root (not a root itself) when an ancestor
+///   workspace's `members` include it;
+/// - a root when no Cargo root encloses it (the top-level project, or an
+///   independent crate in a monorepo whose top level is not Cargo);
+/// - a separate root when it is enclosed but has its own `[workspace]`, or
+///   is listed explicitly in an ancestor workspace's `exclude`;
+/// - otherwise a *non-member crate* (test fixture, example, …): recorded,
+///   but not a root.
+fn cargo_roots(tree: &ProjectTree) -> (BTreeSet<PathBuf>, Vec<PathBuf>) {
+    let mut dirs: Vec<&PathBuf> = tree.cargo_manifests.keys().collect();
+    dirs.sort_by_key(|dir| (dir.components().count(), (*dir).clone()));
+
+    let mut roots = BTreeSet::new();
+    let mut non_member_crates = Vec::new();
+    for dir in dirs {
+        let membership = membership(tree, dir);
+        if membership.member {
+            continue;
+        }
+        let enclosed = roots.iter().any(|root: &PathBuf| dir.starts_with(root));
+        let has_workspace = tree
+            .cargo_manifests
+            .get(dir)
+            .is_some_and(|manifest| manifest.is_workspace);
+        if !enclosed || has_workspace || membership.explicitly_excluded {
+            roots.insert(dir.clone());
+        } else {
+            non_member_crates.push(dir.clone());
+        }
+    }
+    non_member_crates.sort();
+    (roots, non_member_crates)
 }
 
 /// The deepest root that is an ancestor of (or equal to) `dir`.
@@ -374,10 +452,13 @@ fn nearest_root(
 
 /// Detects analyzers, roots, and plan rows from a walked tree (spec §7.3).
 ///
-/// Deterministic: every field of the returned report is sorted. The top level
-/// is a root whenever it directly contains a marker; Cargo packages/workspaces
-/// in subdirectories are separate roots only when they are not reachable from
-/// an ancestor workspace; `vendor/` is skipped entirely so vendored crates are
+/// Deterministic: every field of the returned report is sorted, and the
+/// result does not depend on marker file names. Cargo roots follow the
+/// workspace rules of `cargo_roots`. Every other marker attaches to the
+/// deepest root enclosing it; a marker with no enclosing root starts a new
+/// root at its directory. Markers are attached shallowest first, so a
+/// directory's markers are always considered before those of its
+/// subdirectories. `vendor/` is skipped entirely, so vendored crates are
 /// never roots.
 pub fn detect(tree: &ProjectTree) -> DetectionReport {
     let mut signals: Vec<DetectionSignal> = tree
@@ -399,20 +480,24 @@ pub fn detect(tree: &ProjectTree) -> DetectionReport {
     // Establish roots: directory -> analyzer -> strategies.
     let mut root_map: BTreeMap<PathBuf, BTreeMap<AnalyzerId, BTreeSet<Strategy>>> = BTreeMap::new();
 
-    for dir in tree.cargo_manifests.keys() {
-        if dir.as_os_str().is_empty() || !is_reachable(tree, dir) {
-            root_map
-                .entry(dir.clone())
-                .or_default()
-                .entry(AnalyzerId::Cargo)
-                .or_default()
-                .insert(Strategy::Manifest);
-        }
+    let (cargo_root_dirs, non_member_crates) = cargo_roots(tree);
+    for dir in cargo_root_dirs {
+        root_map
+            .entry(dir)
+            .or_default()
+            .entry(AnalyzerId::Cargo)
+            .or_default()
+            .insert(Strategy::Manifest);
     }
 
     // Attach every marker to its owning root, creating a new root when no
-    // ancestor root exists yet.
-    for signal in &signals {
+    // ancestor root exists yet. Shallowest first: attaching in plain path
+    // order made the outcome depend on file names (`lib/b/meson.build` sorts
+    // before `lib/configure` but after `lib/Makefile`).
+    let mut by_depth: Vec<&DetectionSignal> = signals.iter().collect();
+    by_depth
+        .sort_by_cached_key(|signal| (signal.marker.components().count(), signal.marker.clone()));
+    for signal in by_depth {
         let dir = signal
             .marker
             .parent()
@@ -467,6 +552,7 @@ pub fn detect(tree: &ProjectTree) -> DetectionReport {
     DetectionReport {
         signals,
         roots,
+        non_member_crates,
         plan,
     }
 }
@@ -637,29 +723,181 @@ mod tests {
         assert_eq!(report.roots[0].path, Path::new(""));
     }
 
+    const PACKAGE: &str = "[package]\nname = \"p\"\nversion = \"0.1.0\"\n";
+
+    /// A nested directory with its own `[workspace]` that the top-level
+    /// workspace does not reach is a separate root (for example a detached
+    /// cargo-fuzz workspace).
     #[test]
-    fn nested_workspace_non_member_is_a_root() {
+    fn unreachable_nested_workspace_is_a_root() {
         let tmp = tempfile::tempdir().unwrap();
         write(
             tmp.path(),
             "Cargo.toml",
             "[workspace]\nmembers = [\"crates/*\"]\n",
         );
+        write(tmp.path(), "crates/a/Cargo.toml", PACKAGE);
         write(
             tmp.path(),
-            "crates/a/Cargo.toml",
-            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
-        );
-        write(
-            tmp.path(),
-            "standalone/Cargo.toml",
-            "[package]\nname = \"s\"\nversion = \"0.1.0\"\n",
+            "fuzz/Cargo.toml",
+            "[package]\nname = \"fuzz\"\nversion = \"0.0.0\"\n\n[workspace]\nmembers = [\".\"]\n",
         );
         let report = detect(&discover(tmp.path()));
-        assert_eq!(
-            root_paths(&report),
-            vec![Path::new(""), Path::new("standalone")]
+        assert_eq!(root_paths(&report), vec![Path::new(""), Path::new("fuzz")]);
+        assert!(report.non_member_crates.is_empty());
+    }
+
+    /// A plain package inside a root that is neither a member, a workspace,
+    /// nor explicitly excluded (a test fixture or example) is recorded but is
+    /// not a root.
+    #[test]
+    fn plain_non_member_crate_is_recorded_not_rooted() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n",
         );
+        write(tmp.path(), "crates/a/Cargo.toml", PACKAGE);
+        write(tmp.path(), "tests/fixtures/demo/Cargo.toml", PACKAGE);
+        let report = detect(&discover(tmp.path()));
+        assert_eq!(root_paths(&report), vec![Path::new("")]);
+        assert_eq!(
+            report.non_member_crates,
+            vec![PathBuf::from("tests/fixtures/demo")]
+        );
+        assert!(
+            report
+                .signals
+                .iter()
+                .any(|s| s.marker == Path::new("tests/fixtures/demo/Cargo.toml")),
+            "the crate is still recorded as a detection signal"
+        );
+    }
+
+    /// Fixture crates nested inside a plain (non-workspace) package are not
+    /// roots either.
+    #[test]
+    fn crates_nested_in_a_package_are_not_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "Cargo.toml", PACKAGE);
+        write(tmp.path(), "examples/demo/Cargo.toml", PACKAGE);
+        let report = detect(&discover(tmp.path()));
+        assert_eq!(root_paths(&report), vec![Path::new("")]);
+        assert_eq!(
+            report.non_member_crates,
+            vec![PathBuf::from("examples/demo")]
+        );
+    }
+
+    /// `exclude` entries are path prefixes: a crate *below* an excluded
+    /// directory is excluded from the workspace, but only a crate named
+    /// exactly by `exclude` becomes a separate root.
+    #[test]
+    fn exclude_prefix_without_explicit_listing_is_not_a_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"examples/*\"]\nexclude = [\"examples\"]\n",
+        );
+        write(tmp.path(), "examples/one/Cargo.toml", PACKAGE);
+        let report = detect(&discover(tmp.path()));
+        assert_eq!(root_paths(&report), vec![Path::new("")]);
+        assert_eq!(
+            report.non_member_crates,
+            vec![PathBuf::from("examples/one")]
+        );
+    }
+
+    /// Regression (High 6): a member glob's `*` must not cross `/`, as in
+    /// Cargo. `crates/*` matched `crates/a/fixture` and hid it.
+    #[test]
+    fn member_globs_do_not_cross_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        );
+        write(tmp.path(), "crates/a/Cargo.toml", PACKAGE);
+        write(tmp.path(), "crates/a/fixture/Cargo.toml", PACKAGE);
+        let report = detect(&discover(tmp.path()));
+        assert_eq!(root_paths(&report), vec![Path::new("")]);
+        assert_eq!(
+            report.non_member_crates,
+            vec![PathBuf::from("crates/a/fixture")],
+            "crates/a/fixture is not a member of crates/*"
+        );
+
+        // `**` still spans directories.
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/**\"]\n",
+        );
+        write(tmp.path(), "crates/a/b/Cargo.toml", PACKAGE);
+        let report = detect(&discover(tmp.path()));
+        assert!(report.non_member_crates.is_empty());
+    }
+
+    /// Regression (High 6): `./a`, `b/`, and `c//d` name the same
+    /// directories as `a`, `b`, and `c/d`.
+    #[test]
+    fn member_and_exclude_spellings_are_normalized() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"./a\", \"b/\", \"c//d\", \"./e\"]\nexclude = [\"./e/\"]\n",
+        );
+        for dir in ["a", "b", "c/d", "e"] {
+            write(tmp.path(), &format!("{dir}/Cargo.toml"), PACKAGE);
+        }
+        let report = detect(&discover(tmp.path()));
+        assert_eq!(root_paths(&report), vec![Path::new(""), Path::new("e")]);
+        assert!(report.non_member_crates.is_empty());
+    }
+
+    #[test]
+    fn normalize_workspace_entry_cases() {
+        assert_eq!(normalize_workspace_entry("./a/").as_deref(), Some("a"));
+        assert_eq!(normalize_workspace_entry("a/./b").as_deref(), Some("a/b"));
+        assert_eq!(normalize_workspace_entry("a/../b").as_deref(), Some("b"));
+        assert_eq!(
+            normalize_workspace_entry("crates/*").as_deref(),
+            Some("crates/*")
+        );
+        assert_eq!(normalize_workspace_entry("../outside"), None);
+        assert_eq!(normalize_workspace_entry("/abs"), None);
+        assert_eq!(normalize_workspace_entry("."), None);
+    }
+
+    /// Regression (High 7): the same layout must give the same roots no
+    /// matter what the marker files are called. Attaching markers in plain
+    /// path order produced `["lib", "lib/b"]` for `lib/configure` but
+    /// `["lib"]` for `lib/Makefile`.
+    #[test]
+    fn roots_do_not_depend_on_marker_names() {
+        for top in [
+            "configure",
+            "Makefile",
+            "CMakeLists.txt",
+            "meson.build",
+            "package.json",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(tmp.path(), &format!("lib/{top}"), "");
+            write(tmp.path(), "lib/b/meson.build", "");
+            write(tmp.path(), "lib/b/c/configure.ac", "");
+            let report = detect(&discover(tmp.path()));
+            assert_eq!(
+                root_paths(&report),
+                vec![Path::new("lib")],
+                "top marker {top}"
+            );
+        }
     }
 
     #[test]

@@ -709,11 +709,18 @@ impl DependencyGraph {
     /// `from`, `to`, `requirement`, and `predicate`): `kinds` are unioned,
     /// confidence is the maximum, and evidence records are merged (§5.2).
     ///
+    /// The edge's predicate is replaced by its canonical form first, so
+    /// identity follows predicate *meaning* (`a && b` is the same edge as
+    /// `b && a`), exactly as in the store, which keys edges by
+    /// [`Predicate::canonical_text`]. A graph therefore round-trips through
+    /// the store unchanged.
+    ///
     /// Endpoints that do not exist yet are inserted as placeholder
     /// `AnalysisStatus::NotStarted` nodes. Edges with `to = None` are
     /// unresolved requirements: they are recorded in the side list and
     /// `EdgeIndex::end()` is returned.
-    pub fn add_edge(&mut self, edge: Edge) -> EdgeIndex {
+    pub fn add_edge(&mut self, mut edge: Edge) -> EdgeIndex {
+        edge.predicate = edge.predicate.canonicalized();
         let from_id = edge.from.clone();
         let from_ix = self.ensure_node(&from_id);
         match edge.to.clone() {
@@ -1187,6 +1194,42 @@ mod tests {
             50,
         ));
         assert_eq!(graph.edge_count(), 2);
+    }
+
+    /// Regression (High 5): edge identity follows predicate meaning, as in
+    /// the store. `a && b` and `b && a` used to be two edges in memory but
+    /// one `dependency_edge` row.
+    #[test]
+    fn equivalent_predicates_are_the_same_edge() {
+        let mut graph = DependencyGraph::new();
+        let a = test_id("a", 1);
+        let b = test_id("b", 1);
+        let with_predicate = |text: &str, kind| {
+            let mut edge = test_edge(a.clone(), Some(b.clone()), kind, 50);
+            edge.predicate = Predicate::parse(text).unwrap();
+            edge
+        };
+        graph.add_edge(with_predicate(
+            r#"feature("x") && feature("y")"#,
+            DependencyKind::Normal,
+        ));
+        graph.add_edge(with_predicate(
+            r#"feature("y") && feature("x") && true"#,
+            DependencyKind::Build,
+        ));
+        assert_eq!(graph.edge_count(), 1);
+        let edge = graph.edges_from(&a)[0];
+        assert_eq!(edge.kinds.len(), 2, "the two declarations were merged");
+        assert_eq!(edge.predicate, edge.predicate.canonicalized());
+
+        // The same holds for unresolved requirements.
+        let mut unresolved =
+            with_predicate(r#"arch("amd64") || arch("arm64")"#, DependencyKind::Normal);
+        unresolved.to = None;
+        graph.add_edge(unresolved.clone());
+        unresolved.predicate = Predicate::parse(r#"arch("arm64") || arch("amd64")"#).unwrap();
+        graph.add_edge(unresolved);
+        assert_eq!(graph.unresolved().len(), 1);
     }
 
     #[test]

@@ -143,7 +143,7 @@ Tasks:
 - [ ] `MachineArch { Ubuntu(Architecture), All, Unsupported(String) }` with expansion helpers; default analysis set = `ubuntu-info-rust` `Architecture::ALL` minus `I386` (i.e. `amd64`, `amd64v3`, `arm64`, `armhf`, `ppc64el`, `riscv64`, `s390x`).
 - [ ] `SourceKind::Tarball { url, digest: Option<String> }`; deterministic tree-digest helper (SHA-256 over the canonical sorted file list + contents) for `SourceKind::Path`.
 - [ ] `Requirement`/`RequirementKind { Crate, PkgConfig, Header, Soname, Tool, Generic }`; `Node` and `Edge` structs per §5.1–§5.2.
-- [ ] `DependencyGraph`: `petgraph::stable_graph::StableDiGraph<Node, Edge>` + `BTreeMap<PackageId, NodeIndex>`; `add_node`, `add_edge` implementing the merge policy (union `kinds`, max confidence, merged evidence), `edges_from`/`edges_to`, `scc()` (Tarjan), roots as `BTreeSet<PackageId>`.
+- [ ] `DependencyGraph`: `petgraph::stable_graph::StableDiGraph<Node, Edge>` + `BTreeMap<PackageId, NodeIndex>`; `add_node`, `add_edge` implementing the merge policy (union `kinds`, max confidence, merged evidence) over canonical-predicate edge identity (the predicate is canonicalized on insert, matching the store), `edges_from`/`edges_to`, `scc()` (Tarjan), roots as `BTreeSet<PackageId>`.
 - [ ] `PackageId` `Display` includes ecosystem and source kind.
 - [ ] `solver.rs`: delete `ModularSolver`, the always-`Equal` `debian_compare_versions` stub, and solver-only `ResolveError` paths; keep `DependencyProvider`/`ConflictPolicy`/`ConflictDomain` as the Phase 2 seam; fix `ConflictDomain::SideBySide` pre-1.0 keying (`major.minor` for `0.x`, `major.minor.patch` for `0.0.x`).
 - [ ] `lib.rs`: public module tree and re-exports matching the §15 sketch.
@@ -224,10 +224,10 @@ Tasks:
 
 - [ ] `ProjectTree`: `ignore`-crate walk with the skip list (`target/`, `vendor/`, `node_modules/`, `.git/`) and a depth limit.
 - [ ] Marker table per §7.3 with per-signal confidence; `DetectionReport { signals }` sorted for determinism.
-- [ ] Nested-workspace rule: separate roots only when unreachable from the top-level workspace; vendored crates are never roots.
+- [ ] Root rule (spec §7.3, §22.17): Cargo `members` globs (`*` does not cross `/`) and `exclude` path prefixes, both normalized; inside a Cargo root, only directories with their own `[workspace]` or crates listed explicitly in `exclude` become separate roots, and other non-member crates are recorded (`DetectionReport::non_member_crates`) but not rooted; markers attach to roots shallowest first so roots never depend on marker file names; vendored crates are never roots.
 - [ ] Analyzer registry: `cargo`, `cpp`; future-ecosystem markers recorded as `Skipped` plan rows.
 
-Tests: fixtures for monorepo, vendored crate, nested workspace, polyglot project.
+Tests: fixtures for monorepo, vendored crate, nested workspace, non-member fixture crate, explicit `exclude`, member-glob and spelling normalization, marker-name independence, polyglot project.
 
 Acceptance: detection is deterministic and matches §7.3 semantics on fixtures.
 
