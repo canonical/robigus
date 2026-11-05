@@ -16,10 +16,12 @@ flate2 = { workspace = true }
 gix = { workspace = true, features = ["blocking-http-transport-reqwest"] }
 glob = { workspace = true }
 ignore = { workspace = true }
+miette = "7"
 petgraph = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rusqlite = { workspace = true }
 rusqlite_migration = { workspace = true }
+rustix = { version = "1", features = ["process"] }
 semver = { version = "1", features = ["serde"] }
 serde.workspace = true
 serde_json = { workspace = true }

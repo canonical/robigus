@@ -140,8 +140,15 @@ pub struct SandboxAttempt {
 /// run unsandboxed, so this error carries every mechanism that was attempted
 /// and why each one failed. The CLI renders the list as the
 /// "no sandbox available" diagnostic (exit code 4).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("no sandbox available")]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, miette::Diagnostic)]
+#[error("no sandbox available{details}", details = format_sandbox_attempts(.attempts))]
 pub struct SandboxUnavailable {
     pub attempts: Vec<SandboxAttempt>,
+}
+
+fn format_sandbox_attempts(attempts: &[SandboxAttempt]) -> String {
+    attempts
+        .iter()
+        .map(|attempt| format!("\n  - {attempt}"))
+        .collect()
 }

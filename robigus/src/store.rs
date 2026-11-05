@@ -730,6 +730,18 @@ impl Store {
         .map_err(join_error)?
     }
 
+    /// Returns whether a package is already stored, without creating a placeholder.
+    pub async fn contains_package(&self, package: &PackageId) -> Result<bool, StoreError> {
+        let identity = PackageIdentity::of(package);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = lock(&conn)?;
+            Ok(find_package_row_id(&conn, &identity)?.is_some())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     /// Records one tool execution (spec §10.2). The caller scrubs `argv` and
     /// `env` of secrets before recording.
     ///
@@ -738,6 +750,11 @@ impl Store {
     /// never fabricates a placeholder package. Use `package_id: None` for
     /// invocations not tied to a node (for example toolchain probes).
     pub async fn record_invocation(&self, invocation: &ToolInvocation) -> Result<(), StoreError> {
+        self.begin_invocation(invocation).await.map(|_| ())
+    }
+
+    /// Persist an invocation before launch, returning its database row id.
+    pub async fn begin_invocation(&self, invocation: &ToolInvocation) -> Result<i64, StoreError> {
         let identity = invocation.package_id.as_ref().map(PackageIdentity::of);
         let argv = serde_json::to_string(&invocation.argv)?;
         let env = serde_json::to_string(&invocation.env)?;
@@ -775,6 +792,33 @@ impl Store {
                     log_path,
                 ],
             )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    /// Complete a previously recorded invocation.
+    pub async fn finish_invocation(
+        &self,
+        id: i64,
+        status: &str,
+        duration_ms: u64,
+    ) -> Result<(), StoreError> {
+        let status = status.to_owned();
+        let duration = i64::try_from(duration_ms).unwrap_or(i64::MAX);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = lock(&conn)?;
+            if conn.execute(
+                "UPDATE tool_invocation SET exit_status = ?1, duration_ms = ?2 WHERE id = ?3",
+                params![status, duration, id],
+            )? == 0
+            {
+                return Err(StoreError::Corrupt(format!(
+                    "tool invocation {id} not found"
+                )));
+            }
             Ok(())
         })
         .await

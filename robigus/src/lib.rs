@@ -17,6 +17,7 @@ pub mod feature;
 pub mod fetch;
 pub mod model;
 pub mod predicate;
+pub mod sandbox;
 pub mod solver;
 pub mod store;
 
@@ -41,4 +42,8 @@ pub use model::{
     SourceKind, Target, TargetKind, VersionConstraint, path_tree_digest,
 };
 pub use predicate::{Atom, Configuration, DEFAULT_DNF_TERM_CAP, DnfError, Evaluator, Predicate};
+pub use sandbox::{
+    CommandSpec, NetworkAccess, ProcessOutput, ProcessStatus, Sandbox, SandboxError, SandboxMode,
+    SandboxPreference, establish_sandbox,
+};
 pub use store::{Analysis, AnalysisMetadata, IntegrityReport, Store, ToolInvocation};

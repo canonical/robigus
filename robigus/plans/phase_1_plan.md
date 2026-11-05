@@ -241,6 +241,8 @@ Acceptance: detection is deterministic and matches §7.3 semantics on fixtures.
 
 Files: `robigus/src/sandbox.rs`.
 
+Implementation in progress: the bubblewrap backend and fail-closed paths are implemented. Namespace-dependent acceptance tests are runner-gated and still need a successful run as an unprivileged user on a host with bubblewrap and user namespaces. Command cancellation terminates the child and leaves its pre-launch invocation marked `running`, indicating an interrupted execution. A bubblewrap setup failure after the probe is currently reported as a nonzero process exit with diagnostics in stderr rather than classified separately as sandbox unavailable. Cgroup/process resource limits remain WP-3.5.
+
 Tasks:
 
 - [ ] `Sandbox` trait, `SandboxMode { Bwrap, Native }`, `SandboxPreference { Auto, Bwrap, Native }`, `CommandSpec`, `ProcessOutput`.
