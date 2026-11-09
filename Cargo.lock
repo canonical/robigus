@@ -1876,9 +1876,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "ubuntu-info-rust"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90268e820db5b315eeb1748770d0344b8f8b1fbde6fd2f78c220748bdcf6e8b8"
+checksum = "e4389e650cf5952f40e6261b7841e5d7d48b7aa49d307611ec1d8ddc4d7b0c2a"
 dependencies = [
  "phf",
  "serde",
