@@ -70,6 +70,8 @@ pub enum FetchError {
     Git(String),
     #[error("download failed: {0}")]
     Download(String),
+    #[error("offline source unavailable in cache: {0}")]
+    OfflineCacheMiss(String),
     #[error("checksum mismatch: expected {expected}, computed {actual}")]
     Checksum { expected: String, actual: String },
     #[error("invalid SHA-256 digest '{0}': expected 64 hexadecimal characters")]

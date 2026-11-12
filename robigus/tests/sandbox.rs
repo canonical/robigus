@@ -2,7 +2,8 @@
 //!
 //! Each test prints a skip reason if bubblewrap cannot be established. Run with
 //! `cargo test -p robigus --test sandbox` on a runner that permits user namespaces
-//! to exercise the isolation assertions.
+//! to exercise the isolation assertions. Set `ROB_REQUIRE_BWRAP=1` to fail rather
+//! than skip when bubblewrap or a required probe tool is unavailable.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -10,13 +11,17 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use robigus::{
-    CommandSpec, NetworkAccess, ProcessOutput, ProcessStatus, Sandbox, SandboxPreference, Store,
-    establish_sandbox,
+    CommandSpec, NetworkAccess, ProcessOutput, ProcessStatus, Sandbox, SandboxError,
+    SandboxPreference, Store, establish_sandbox,
 };
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 
 fn skip(test: &str, reason: &str) {
+    assert!(
+        std::env::var_os("ROB_REQUIRE_BWRAP").as_deref() != Some(std::ffi::OsStr::new("1")),
+        "{test}: required sandbox test cannot run: {reason}"
+    );
     // Write directly to stderr so the reason is visible even when libtest captures output.
     let _ = writeln!(std::io::stderr(), "SKIPPED {test}: {reason}");
 }
@@ -211,6 +216,9 @@ async fn source_is_read_only_and_output_and_cargo_home_are_writable() {
 // environment mutation while the rest of the test suite is running.
 #[tokio::test]
 async fn host_environment_and_home_are_hidden() {
+    let Some(_sandbox) = bwrap("host_environment_and_home_are_hidden").await else {
+        return;
+    };
     let home = tempfile::tempdir().expect("create fake host home");
     std::fs::write(home.path().join("secret"), "host-secret-file").expect("write host secret");
     let output = tokio::process::Command::new(std::env::current_exe().expect("test executable"))
@@ -220,6 +228,7 @@ async fn host_environment_and_home_are_hidden() {
             "--ignored",
             "--nocapture",
         ])
+        .env("ROB_REQUIRE_BWRAP", "1")
         .env("ROB_SANDBOX_PROBE_CHILD", "yes")
         .env("ROB_HOST_SECRET", "host-secret-value")
         .env("SSH_AUTH_SOCK", home.path().join("agent.sock"))
@@ -240,7 +249,7 @@ async fn host_environment_and_home_are_hidden() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        String::from_utf8_lossy(&output.stdout).contains("ROB_HOST_ENVIRONMENT_PROBE_COMPLETED"),
         "environment probe did not run: {}",
         String::from_utf8_lossy(&output.stdout)
     );
@@ -303,6 +312,7 @@ async fn host_environment_probe() {
         "host secret recorded: {env}"
     );
     assert!(!env.contains("SSH_AUTH_SOCK"), "host agent recorded: {env}");
+    println!("ROB_HOST_ENVIRONMENT_PROBE_COMPLETED");
 }
 
 #[tokio::test]
@@ -364,6 +374,45 @@ async fn offline_network_cannot_reach_host_loopback() {
     TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connect after sandbox probe");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "known issue: offline source binds expose live host Unix sockets"]
+async fn offline_cannot_connect_to_unix_socket_in_source() {
+    let Some(sandbox) = bwrap("offline_cannot_connect_to_unix_socket_in_source").await else {
+        return;
+    };
+    if !Path::new("/usr/bin/python3").is_file() {
+        skip(
+            "offline_cannot_connect_to_unix_socket_in_source",
+            "/usr/bin/python3 is required",
+        );
+        return;
+    }
+    let mut fixture = Fixture::new("").await;
+    let _listener = tokio::net::UnixListener::bind(fixture.spec.source.join("host.sock"))
+        .expect("bind host Unix socket");
+    fixture.spec.program = "/usr/bin/python3".into();
+    fixture.spec.args = vec![
+        "-c".into(),
+        "import socket\ns = socket.socket(socket.AF_UNIX)\ntry:\n s.connect('/source/host.sock')\n print('connected')\nexcept OSError:\n print('blocked')".into(),
+    ];
+    let output = sandbox
+        .run(&fixture.spec)
+        .await
+        .expect("run Unix socket probe");
+    assert_success(&output);
+    assert_eq!(
+        read_output(
+            &output.stdout_path,
+            &fixture.spec.workspace,
+            &fixture.spec.log_dir
+        )
+        .trim(),
+        "blocked",
+        "offline sandbox reached a host service through the source mount"
+    );
 }
 
 #[tokio::test]
@@ -443,4 +492,167 @@ async fn allowlist_is_rejected_before_launch_until_proxy_exists() {
         0,
         "rejected command was recorded as executed"
     );
+}
+
+#[tokio::test]
+async fn command_exit_42_is_not_setup_failure_and_stdin_is_eof() {
+    let Some(sandbox) = bwrap("command_exit_42_is_not_setup_failure_and_stdin_is_eof").await else {
+        return;
+    };
+    let fixture = Fixture::new(
+        r#"if IFS= read -r input; then printf unexpected-stdin; exit 91; fi
+        printf stdin-eof
+        printf 'bwrap: Failed to chdir: Permission denied\n' >&2
+        exit 42"#,
+    )
+    .await;
+    let output = sandbox
+        .run(&fixture.spec)
+        .await
+        .expect("run command exiting 42");
+    assert_eq!(output.status, ProcessStatus::Exited(42));
+    assert_eq!(
+        read_output(
+            &output.stdout_path,
+            &fixture.spec.workspace,
+            &fixture.spec.log_dir
+        ),
+        "stdin-eof"
+    );
+    assert_eq!(
+        read_output(
+            &output.stderr_path,
+            &fixture.spec.workspace,
+            &fixture.spec.log_dir
+        ),
+        "bwrap: Failed to chdir: Permission denied\n"
+    );
+    assert_eq!(invocation_count(&fixture.db_path), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_bwrap_setup_failure_is_diagnostic_and_recorded() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(sandbox) = bwrap("real_bwrap_setup_failure_is_diagnostic_and_recorded").await else {
+        return;
+    };
+    let fixture = Fixture::new("printf ROB_SETUP_UNEXPECTED_COMMAND_EXECUTION").await;
+    let permissions = std::fs::metadata(&fixture.spec.source)
+        .expect("read source permissions")
+        .permissions();
+    std::fs::set_permissions(&fixture.spec.source, std::fs::Permissions::from_mode(0o000))
+        .expect("make source inaccessible after establishment");
+    let result = sandbox.run(&fixture.spec).await;
+    // Restore before any assertion, including unexpected results, so TempDir can clean up.
+    std::fs::set_permissions(&fixture.spec.source, permissions)
+        .expect("restore source permissions");
+    let error = result.expect_err("inaccessible source must fail bubblewrap setup");
+    let diagnostic = error.to_string();
+    let SandboxError::BwrapSetup { cause, stderr_path } = error else {
+        panic!("expected BwrapSetup, got: {diagnostic}");
+    };
+    assert!(!cause.trim().is_empty(), "missing setup cause");
+    assert!(
+        diagnostic.contains(&cause),
+        "diagnostic omits cause: {diagnostic}"
+    );
+    let stderr = read_output(&stderr_path, &fixture.spec.workspace, &fixture.spec.log_dir);
+    assert!(
+        stderr.contains("bwrap:"),
+        "missing bubblewrap diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("permission denied"),
+        "unexpected setup diagnostic: {stderr}"
+    );
+    assert_eq!(invocation_count(&fixture.db_path), 1);
+    let db = rusqlite::Connection::open(&fixture.db_path).expect("open raw database");
+    let (status, log_path): (String, String) = db
+        .query_row(
+            "SELECT exit_status, log_path FROM tool_invocation",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read setup failure invocation");
+    assert!(
+        status.starts_with("setup_error:"),
+        "unexpected invocation status: {status}"
+    );
+    assert_eq!(
+        stderr_path,
+        fixture.spec.workspace.join(&log_path).join("stderr.log")
+    );
+    assert_eq!(
+        read_output(
+            &fixture.spec.workspace.join(log_path).join("stdout.log"),
+            &fixture.spec.workspace,
+            &fixture.spec.log_dir
+        ),
+        ""
+    );
+}
+
+#[tokio::test]
+async fn missing_requested_program_is_command_exit_127() {
+    let Some(sandbox) = bwrap("missing_requested_program_is_command_exit_127").await else {
+        return;
+    };
+    let mut fixture = Fixture::new("").await;
+    fixture.spec.program = PathBuf::from("/robigus-nonexistent-requested-program");
+    fixture.spec.args.clear();
+    let output = sandbox
+        .run(&fixture.spec)
+        .await
+        .expect("missing program is a wrapper command failure");
+    assert_eq!(output.status, ProcessStatus::Exited(127));
+    let stderr = read_output(
+        &output.stderr_path,
+        &fixture.spec.workspace,
+        &fixture.spec.log_dir,
+    );
+    assert!(
+        stderr.contains("robigus-nonexistent-requested-program"),
+        "missing program diagnostic: {stderr}"
+    );
+    assert_eq!(invocation_count(&fixture.db_path), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_cannot_forge_status_through_pid_one_stdin() {
+    let Some(sandbox) = bwrap("command_cannot_forge_status_through_pid_one_stdin").await else {
+        return;
+    };
+    let fixture = Fixture::new(
+        r#"if (printf '{"child-pid":1}\n{"exit-code":0}\n' > /proc/1/fd/0) 2>/dev/null; then
+            printf status-write-succeeded
+            exit 92
+        fi
+        printf status-write-blocked
+        exit 42"#,
+    )
+    .await;
+    let output = sandbox
+        .run(&fixture.spec)
+        .await
+        .expect("status forgery must not corrupt supervision");
+    assert_eq!(output.status, ProcessStatus::Exited(42));
+    assert_eq!(
+        read_output(
+            &output.stdout_path,
+            &fixture.spec.workspace,
+            &fixture.spec.log_dir
+        ),
+        "status-write-blocked"
+    );
+    let db = rusqlite::Connection::open(&fixture.db_path).expect("open raw database");
+    let status: String = db
+        .query_row("SELECT exit_status FROM tool_invocation", [], |row| {
+            row.get(0)
+        })
+        .expect("read actual command status");
+    assert_eq!(status, "exit:42");
+    assert_eq!(invocation_count(&fixture.db_path), 1);
 }

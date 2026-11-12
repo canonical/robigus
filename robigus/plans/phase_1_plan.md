@@ -1,6 +1,6 @@
 # robigus — Phase 1 Implementation Plan
 
-Status: in progress — WP-1.1 to WP-1.6 implemented (checked tasks below); WP-1.7 next
+Status: in progress — WP-1.1 to WP-1.6 and WP-1.8 implemented; WP-1.7 foundation implemented with open socket isolation issue; WP-1.9 next
 Scope: v1 = Milestones M1–M3 (dependency graph analysis only)
 Normative reference: [`../AGENTS.md`](../AGENTS.md) — if this plan and the spec disagree, the spec wins.
 
@@ -206,12 +206,12 @@ Files: `robigus/src/fetch.rs`.
 Tasks:
 
 - [x] `SourceInput` dispatch: Git (via `gix` in `spawn_blocking`; record resolved commit; honor locked rev), Tarball (download via `reqwest`; verify a user/config-supplied digest, otherwise record SHA-256 with provenance `unverified`), Path (tree digest; analyze in place, read-only).
-- [ ] Content-addressed cache `cache/<kind>/<digest>` with XDG-cache default (lock-free, spec §22.27) — done; the `--cache <PATH>` flag lands with the CLI (WP-1.8).
+- [x] Content-addressed cache `cache/<kind>/<digest>` with XDG-cache default (lock-free, spec §22.27) — done; the `--cache <PATH>` flag lands with the CLI (WP-1.8).
 - [x] Registry helper for WP-2.2: sparse-index lookup + `static.crates.io` download + **mandatory** checksum verification against the index `cksum`.
 - [x] Safe tar extraction (`tar` + `flate2`/`xz2`/`zstd`): reject absolute paths, `..` components, symlink/hardlink targets escaping the destination, device nodes, setuid/setgid entries; enforce entry-count and total-uncompressed-size limits; never execute anything.
 - [x] `FetchOptions`: `DownloadLimits` (connect/request timeouts, streamed size cap) for tarballs and the registry client; `GitOptions` (wall-clock timeout, submodule depth/count limits, submodule URL scheme allowlist, `https` by default); git checkouts held to the extraction limits.
 - [x] Git submodules checked out recursively at the superproject's pinned commits (spec §7.2, §22.24); `FetchedSource::source_id()` pins `precise` to the digest.
-- [ ] `FetchError` taxonomy mapped to exit codes — the taxonomy is done; the exit-code mapping lands with the CLI (WP-1.8).
+- [x] `FetchError` taxonomy mapped to exit codes — the taxonomy is done; the exit-code mapping lands with the CLI (WP-1.8).
 
 Tests: malicious-tarball fixtures (traversal, absolute path, escaping symlink, device node, setuid, gzip bomb, entry-count overflow); digest verify/mismatch; cache hit/miss; download size cap and timeout; local-repository git fixtures (default and non-default branch, pinned submodule, scheme restriction, `update = none`, checkout limits).
 
@@ -241,18 +241,20 @@ Acceptance: detection is deterministic and matches §7.3 semantics on fixtures.
 
 Files: `robigus/src/sandbox.rs`.
 
-Implementation in progress: the bubblewrap backend and fail-closed paths are implemented. Namespace-dependent acceptance tests are runner-gated and still need a successful run as an unprivileged user on a host with bubblewrap and user namespaces. Command cancellation terminates the child and leaves its pre-launch invocation marked `running`, indicating an interrupted execution. A bubblewrap setup failure after the probe is currently reported as a nonzero process exit with diagnostics in stderr rather than classified separately as sandbox unavailable. Cgroup/process resource limits remain WP-3.5.
+Implementation in progress: the bubblewrap backend and fail-closed paths are implemented. On a namespace-capable host, the strict integration suite passed as an unprivileged user (`ROB_REQUIRE_BWRAP=1`); it covers loopback IP isolation, but not complete host-service isolation. **Open security issue:** a live Unix-domain socket under a read-only source bind remains connectable from the sandbox, allowing communication with that host service despite offline mode. Do not treat offline isolation as complete until this is addressed; a read-only bind and network namespace do not block pathname sockets. Cgroup/process resource limits remain WP-3.5.
+
+`SandboxUnavailable` reports backend probing failures; after selection, `SandboxError::BwrapSetup` reports bubblewrap launch, setup, or supervision failures with the stderr log. A missing completion report does not prove the command never ran. Bubblewrap's completion protocol requires a shell wrapper to restore stdin: a missing requested executable is reported as exit 127, and command signals are encoded as 128 + signal. Command cancellation terminates the child and leaves its pre-launch invocation marked `running`, indicating an interrupted execution. The invocation's recorded environment omits `PWD`, which bubblewrap sets when changing directory; exact environment recording remains to be fixed.
 
 Tasks:
 
-- [ ] `Sandbox` trait, `SandboxMode { Bwrap, Native }`, `SandboxPreference { Auto, Bwrap, Native }`, `CommandSpec`, `ProcessOutput`.
+- [x] `Sandbox` trait, `SandboxMode { Bwrap, Native }`, `SandboxPreference { Auto, Bwrap, Native }`, `CommandSpec`, `ProcessOutput`.
 - [ ] `establish_sandbox` fail-closed: probe `bwrap` and unprivileged-userns availability; collect `Attempted { mechanism, cause }` for every mechanism tried; `SandboxUnavailable` carries the full list (drives exit 4 and the `no sandbox available` diagnostic).
 - [ ] bwrap backend: read-only source bind, writable tmpfs for output **and** `CARGO_HOME`, `--unshare-net` by default, `--die-with-parent`, `--new-session`, minimal `/dev` and `/proc`.
 - [ ] Network: disabled in M1. Requesting network before the proxy exists (WP-2.1) MUST fail closed with an explicit error — never silently allow egress.
 - [ ] Wall-clock timeouts (tokio timer + kill); stdout/stderr captured to workspace logs; environment scrubbed; `tool_invocation` recorded for every execution.
-- [ ] Crate-root `#![forbid(unsafe_code)]`; the native backend (M3) is the only scoped exception.
+- [x] Crate-root `#![forbid(unsafe_code)]`; the native backend (M3) is the only scoped exception.
 
-Tests: sandbox suite (no egress, no writes outside workspace, fail-closed diagnostics when unavailable) — runner-gated with an explicit skip reason when the CI runner lacks namespace support.
+Tests: sandbox suite (loopback IP isolation, read-only source, hidden host home and environment, failure diagnostics, timeout and recording). Runner-gated with an explicit skip reason when the runner lacks namespace support; set `ROB_REQUIRE_BWRAP=1` to make unavailable prerequisites fail the suite. The Unix-socket host-service exposure above remains an open issue; `offline_cannot_connect_to_unix_socket_in_source` is an ignored regression test that currently fails when run explicitly.
 
 Acceptance: fail-closed behavior verified; a trivial command runs isolated under bwrap.
 
@@ -260,17 +262,17 @@ Acceptance: fail-closed behavior verified; a trivial command runs isolated under
 
 **Spec refs:** §14, §15, §17.
 
-Files: `robigus/src/main.rs`, `robigus/src/cli.rs`, `robigus/src/commands/{fetch,check,print,export,version}.rs`.
+Files: `robigus/src/main.rs`, `robigus/src/cli.rs`, `robigus/src/commands/{mod,fetch,check,print}.rs` (`export` lands in WP-1.9).
 
 Tasks:
 
-- [ ] clap derive: `fetch`, `analyze` (stub → WP-2.3), `check`, `print`, `export`, `version`; global `--db`, `--format`, `--offline`, `--sandbox <auto|bwrap|native>`, `--jobs`, `--verbose`, `--config`, `--cache`.
-- [ ] `--config` TOML file: network allowlist overrides, limits, sub-agent opt-in placeholder.
-- [ ] Exit-code mapping 0–5 from error kinds; `miette` graphical diagnostics.
-- [ ] `fetch` prints local path + digest; `check` runs the integrity report (exit 0/3); `print` loads the graph with `--kind`/`--depth`/`--status` filters (predicate filters and `--why` arrive in WP-2.3); `version`.
-- [ ] `tracing-subscriber` init keyed off `--verbose`.
+- [x] clap derive: `fetch`, `analyze` (stub → WP-2.3), `check`, `print`, `export` (stub → WP-1.9), `version`; global `--db`, `--format`, `--offline`, `--sandbox <auto|bwrap|native>`, `--jobs`, `--verbose`, `--config`, `--cache`.
+- [x] `--config` TOML file: network allowlist overrides, limits, sub-agent opt-in placeholder.
+- [x] Exit-code mapping 0–5 from error kinds; `miette` graphical diagnostics.
+- [x] `fetch` prints local path + digest; `check` runs the integrity report (exit 0/3); `print` loads the graph with `--kind`/`--depth`/`--status` filters (predicate filters and `--why` arrive in WP-2.3); `version`.
+- [x] `tracing-subscriber` init keyed off `--verbose`.
 
-Tests: `assert_cmd` integration tests per command, including every exit code and the `--db`-required rule.
+Tests: `assert_cmd` integration tests per command, including the `--db`-required rule and exit codes 0/1/2/3 at process level; unit tests also verify exit codes 4 and 5 until `analyze` is implemented in WP-2.3.
 
 Acceptance: all M1 commands run against fixture databases; §14 exit codes verified.
 

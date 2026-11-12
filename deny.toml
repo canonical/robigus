@@ -48,6 +48,14 @@ name = "icu_locale_core"
 
 [[licenses.exceptions]]
 allow = ["Unicode-3.0"]
+name = "icu_locale_fallback"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "icu_locale_fallback_data"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
 name = "icu_normalizer"
 
 [[licenses.exceptions]]
@@ -65,6 +73,14 @@ name = "icu_properties_data"
 [[licenses.exceptions]]
 allow = ["Unicode-3.0"]
 name = "icu_provider"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "icu_segmenter"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "icu_segmenter_data"
 
 [[licenses.exceptions]]
 allow = ["Unicode-3.0"]

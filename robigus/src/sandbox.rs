@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
 use crate::error::{SandboxAttempt, SandboxUnavailable, StoreError};
@@ -48,6 +49,12 @@ pub enum NetworkAccess {
 /// variables are never passed through. Callers must not put credentials or
 /// other secrets in arguments, since arbitrary command arguments cannot be
 /// reliably identified as secrets and are recorded for reproducibility.
+///
+/// Offline mode blocks IP networking, but live Unix-domain sockets reachable
+/// through the source or runtime mounts can still connect to host services.
+/// Do not rely on it for complete host-service isolation until this is fixed.
+/// Bubblewrap uses a fixed shell wrapper to restore stdin; failure to execute
+/// the requested program is reported as the shell's exit status (126 or 127).
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
     pub program: PathBuf,
@@ -64,7 +71,9 @@ pub struct CommandSpec {
     pub tool_version: Option<String>,
 }
 
-/// Outcome of an execution, including timeouts and signal termination.
+/// Outcome of an execution, including timeouts.
+/// Bubblewrap reports command signals as shell-style exit codes (128 + signal);
+/// `Signaled` is reserved for backends that can distinguish signal termination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessStatus {
     Exited(i32),
@@ -85,6 +94,10 @@ pub struct ProcessOutput {
 pub enum SandboxError {
     #[error("allowlisted network access is unavailable until the sandbox proxy is implemented")]
     NetworkUnavailable,
+    /// Bubblewrap was selected, but setup or supervision did not complete.
+    /// The command may already have run if the supervisor failed afterward.
+    #[error("bubblewrap setup or supervision failed: {cause} (stderr log: {})", stderr_path.display())]
+    BwrapSetup { cause: String, stderr_path: PathBuf },
     #[error("invalid sandbox command: {0}")]
     InvalidCommand(String),
     #[error("sandbox I/O failed: {0}")]
@@ -170,6 +183,8 @@ async fn probe_bwrap() -> Result<PathBuf, String> {
             "/dev",
             "--tmpfs",
             "/tmp",
+            "--json-status-fd",
+            "1",
             "--",
             "/usr/bin/true",
         ]);
@@ -180,7 +195,11 @@ async fn probe_bwrap() -> Result<PathBuf, String> {
                 "failed to launch {}: {error}",
                 executable.display()
             )),
-            Ok(Ok(output)) if output.status.success() => Ok(executable),
+            Ok(Ok(output)) if output.status.success() => {
+                check_bwrap_completion(&output.stdout, output.status)
+                    .map_err(|cause| format!("namespace probe status failed: {cause}"))?;
+                Ok(executable)
+            }
             Ok(Ok(output)) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 Err(format!(
@@ -191,6 +210,44 @@ async fn probe_bwrap() -> Result<PathBuf, String> {
             }
         }
     }
+}
+
+/// Bubblewrap emits JSON objects for setup and, only after successful setup and
+/// exec, a final shell-encoded exit code. Unknown objects/fields are allowed.
+fn check_bwrap_completion(report: &[u8], status: std::process::ExitStatus) -> Result<(), String> {
+    let mut exit_code = None;
+    for value in serde_json::Deserializer::from_slice(report).into_iter::<serde_json::Value>() {
+        let value = value.map_err(|error| format!("invalid bubblewrap status: {error}"))?;
+        let object = value
+            .as_object()
+            .ok_or("invalid bubblewrap status: expected an object")?;
+        if let Some(code) = object.get("exit-code") {
+            if exit_code.is_some() {
+                return Err("invalid bubblewrap status: duplicate exit-code".into());
+            }
+            exit_code = Some(
+                code.as_i64()
+                    .filter(|code| (0..=255).contains(code))
+                    .ok_or("invalid bubblewrap status: invalid exit-code")? as i32,
+            );
+        }
+    }
+    let code = exit_code.ok_or("bubblewrap did not report command completion")?;
+    if status.code() != Some(code) {
+        return Err(format!(
+            "bubblewrap status exit-code {code} disagrees with supervisor status {status}"
+        ));
+    }
+    Ok(())
+}
+
+async fn read_bounded(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    let file = tokio::fs::File::open(path).await?;
+    let mut bytes = Vec::new();
+    file.take((limit + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
 }
 
 /// Bind only the system runtime, not the host root or home directory.
@@ -292,7 +349,11 @@ impl Sandbox for BwrapSandbox {
         let relative_workdir = workdir
             .strip_prefix(&source)
             .map_err(|error| SandboxError::InvalidCommand(error.to_string()))?;
-        let sandbox_workdir = Path::new("/source").join(relative_workdir);
+        let sandbox_workdir = if relative_workdir.as_os_str().is_empty() {
+            PathBuf::from("/source")
+        } else {
+            Path::new("/source").join(relative_workdir)
+        };
         let workspace = tokio::fs::canonicalize(&spec.workspace).await?;
         let mut log_base = workspace.clone();
         for part in spec.log_dir.components() {
@@ -345,6 +406,11 @@ impl Sandbox for BwrapSandbox {
             .write(true)
             .create_new(true)
             .open(&stderr_path)?;
+        let status_path = log_dir.join("bwrap-status.jsonl");
+        let status_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&status_path)?;
 
         let mut env = BTreeMap::from([
             ("PATH".into(), "/usr/bin:/bin".into()),
@@ -357,7 +423,10 @@ impl Sandbox for BwrapSandbox {
         let mut cmd = Command::new(&self.executable);
         cmd.env_clear()
             .kill_on_drop(true)
-            .stdin(Stdio::null())
+            // Only stdio descriptors can be passed to a child without unsafe
+            // pre-exec code. Bubblewrap closes the status fd before exec; the
+            // fixed shell wrapper restores the command's stdin to /dev/null.
+            .stdin(Stdio::from(status_file))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         #[cfg(unix)]
@@ -371,6 +440,8 @@ impl Sandbox for BwrapSandbox {
             "--die-with-parent",
             "--new-session",
             "--clearenv",
+            "--json-status-fd",
+            "0",
         ]);
         bind_runtime(&mut cmd);
         cmd.args([
@@ -397,7 +468,13 @@ impl Sandbox for BwrapSandbox {
         }
         cmd.arg("--chdir")
             .arg(&sandbox_workdir)
-            .arg("--")
+            .args([
+                "--",
+                "/bin/sh",
+                "-c",
+                "exec </dev/null; exec \"$@\"",
+                "robigus-sandbox",
+            ])
             .arg(&spec.program)
             .args(&spec.args);
 
@@ -423,20 +500,59 @@ impl Sandbox for BwrapSandbox {
             .await?;
         let started = Instant::now();
         let outcome = match cmd.spawn() {
-            Err(error) => Err(error),
+            Err(error) => Err(SandboxError::BwrapSetup {
+                cause: format!("could not launch {}: {error}", self.executable.display()),
+                stderr_path: stderr_path.clone(),
+            }),
             Ok(child) => {
                 let group = child.id();
                 let mut guard = ChildGuard { child, group };
                 match tokio::time::timeout(spec.timeout, guard.child.wait()).await {
                     Ok(Ok(status)) => {
                         guard.group = None;
-                        Ok(status
-                            .code()
-                            .map_or(ProcessStatus::Signaled, ProcessStatus::Exited))
+                        const STATUS_LIMIT: usize = 64 * 1024;
+                        let report = read_bounded(&status_path, STATUS_LIMIT).await;
+                        let completion = match report {
+                            Ok(bytes) if bytes.len() <= STATUS_LIMIT => {
+                                check_bwrap_completion(&bytes, status)
+                            }
+                            Ok(_) => Err("bubblewrap status exceeded 64 KiB".into()),
+                            Err(error) => Err(format!("could not read bubblewrap status: {error}")),
+                        };
+                        match completion {
+                            Ok(()) => Ok(ProcessStatus::Exited(
+                                status.code().expect("verified exit code"),
+                            )),
+                            Err(mut cause) => {
+                                cause.push_str(&format!(" (supervisor status: {status})"));
+                                // The log can contain untrusted output if the supervisor failed
+                                // after exec. Bound the diagnostic and retain the complete log.
+                                const DIAGNOSTIC_LIMIT: usize = 4096;
+                                if let Ok(bytes) =
+                                    read_bounded(&stderr_path, DIAGNOSTIC_LIMIT).await
+                                {
+                                    let truncated = bytes.len() > DIAGNOSTIC_LIMIT;
+                                    let text = String::from_utf8_lossy(
+                                        &bytes[..bytes.len().min(DIAGNOSTIC_LIMIT)],
+                                    );
+                                    if !text.trim().is_empty() {
+                                        cause.push_str(&format!(
+                                            ": {}{}",
+                                            text.trim(),
+                                            if truncated { "…" } else { "" }
+                                        ));
+                                    }
+                                }
+                                Err(SandboxError::BwrapSetup {
+                                    cause,
+                                    stderr_path: stderr_path.clone(),
+                                })
+                            }
+                        }
                     }
                     Ok(Err(error)) => {
                         guard.terminate();
-                        Err(error)
+                        Err(SandboxError::Io(error))
                     }
                     Err(_) => {
                         guard.terminate();
@@ -450,7 +566,8 @@ impl Sandbox for BwrapSandbox {
             Ok(ProcessStatus::Exited(code)) => format!("exit:{code}"),
             Ok(ProcessStatus::Signaled) => "signaled".into(),
             Ok(ProcessStatus::TimedOut) => "timeout".into(),
-            Err(error) => format!("launch_error:{error}"),
+            Err(SandboxError::BwrapSetup { cause, .. }) => format!("setup_error:{cause}"),
+            Err(error) => format!("supervision_error:{error}"),
         };
         spec.store
             .finish_invocation(
@@ -494,6 +611,40 @@ mod tests {
             tool_version: None,
         };
         (dir, spec)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checks_bwrap_completion_without_confusing_command_failures() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let exited = |code| std::process::ExitStatus::from_raw(code << 8);
+        assert!(
+            check_bwrap_completion(
+                br#"{"child-pid": 1, "new-field": true}
+               {"future-status": 2}
+               {"exit-code": 42}"#,
+                exited(42)
+            )
+            .is_ok()
+        );
+        for report in [
+            &b""[..],
+            &b"{\"child-pid\":1}"[..],
+            &b"{\"exit-code\":42}{\"exit-code\":42}"[..],
+            &b"{\"exit-code\":256}"[..],
+            &b"{\"exit-code\":42}{"[..],
+            &b"{\"exit-code\":1}"[..],
+        ] {
+            assert!(check_bwrap_completion(report, exited(42)).is_err());
+        }
+        assert!(
+            check_bwrap_completion(
+                br#"{"exit-code": 42}"#,
+                std::process::ExitStatus::from_raw(9)
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -563,7 +714,10 @@ mod tests {
         let sandbox = BwrapSandbox {
             executable: "/does/not/exist".into(),
         };
-        assert!(matches!(sandbox.run(&spec).await, Err(SandboxError::Io(_))));
+        assert!(matches!(
+            sandbox.run(&spec).await,
+            Err(SandboxError::BwrapSetup { .. })
+        ));
         let db = rusqlite::Connection::open(dir.path().join("analysis.db")).unwrap();
         let (status, path): (String, String) = db
             .query_row(
@@ -572,7 +726,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert!(status.starts_with("launch_error:"));
+        assert!(status.starts_with("setup_error:"));
         assert!(spec.workspace.join(path).join("stdout.log").exists());
     }
 

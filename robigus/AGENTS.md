@@ -478,7 +478,7 @@ The SQLite file is the **source of truth** for one analysis of one target projec
 
 ### 11.1 Configuration
 
-Use `rusqlite` with the `bundled` feature. All SQLite work runs inside `tokio::task::spawn_blocking` on a shared `Arc<Mutex<rusqlite::Connection>>` — the §11.1 alternative to `tokio-rusqlite`, which is unused because no released version pairs with an MSRV-compatible `rusqlite_migration`. The mutex serializes access; reads (`load`, `check`) run inside deferred transactions so WAL readers see one consistent snapshot while an analysis writes. Schema migrations use the **`rusqlite_migration`** crate with `PRAGMA user_version`; there is no `schema_version` table. Apply:
+Use `rusqlite` with the `bundled` feature. All SQLite work runs inside `tokio::task::spawn_blocking` on a shared `Arc<Mutex<rusqlite::Connection>>`; `tokio-rusqlite` is unused. The mutex serializes access; reads (`load`, `check`) run inside deferred transactions so WAL readers see one consistent snapshot while an analysis writes. Schema migrations use the **`rusqlite_migration`** crate with `PRAGMA user_version`; there is no `schema_version` table. Apply:
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -840,7 +840,7 @@ Decisions binding on this specification:
 12. Ubuntu Rust package naming follows the Debian Rust packaging policy: `rust-<crate>` sources; `librust-<crate>-dev` and `librust-<crate>+<feature>-dev` binaries; version in the package version, not the name.
 13. `rapt` will grow structured query APIs and Contents support in the future; Phase 1 does not depend on them.
 14. `ubucargo` is published (crates.io, `canonical/ubucargo`, GPL-3.0-or-later); it is currently a binary crate, so Phase 3 integrates via subprocess or a future library target.
-15. Persistence uses `rusqlite` (bundled) with `rusqlite_migration` on `PRAGMA user_version`; all SQLite work runs in `tokio::task::spawn_blocking` on a shared `Arc<Mutex<rusqlite::Connection>>` (§11.1). `tokio-rusqlite` is unused: no released version pairs with `rusqlite_migration` ≤ 2.5 under the workspace MSRV. Turso was evaluated and rejected for v1: `turso-migrate` pins turso 0.4.x, which lacks CHECK-constraint and foreign-key enforcement, and turso 0.8.x does not enforce partial unique indexes — a swap would lose functionality (§11.2, §11.3).
+15. Persistence uses `rusqlite` (bundled) with `rusqlite_migration` on `PRAGMA user_version`; all SQLite work runs in `tokio::task::spawn_blocking` on a shared `Arc<Mutex<rusqlite::Connection>>` (§11.1), so `tokio-rusqlite` is unused. Turso was evaluated and rejected for v1: `turso-migrate` pins turso 0.4.x, which lacks CHECK-constraint and foreign-key enforcement, and turso 0.8.x does not enforce partial unique indexes — a swap would lose functionality (§11.2, §11.3).
 16. `MachineArch` = `Ubuntu(Architecture)` | `All` | `Unsupported(String)`; `All` expands to the `ubuntu-info-rust` set; unsupported architectures are stubbed (`supported = false`, not expanded); the default analysis set excludes `i386` and includes `amd64v3`.
 17. Separate analysis roots inside a Cargo root are limited to directories with their own `[workspace]` and crates listed explicitly in an ancestor workspace's `exclude`; other non-member crates are recorded, not rooted (§7.3).
 18. Dependency-edge identity uses the canonical predicate in memory as well as in the store: `DependencyGraph::add_edge` canonicalizes the predicate, so equivalent spellings merge into one edge and a graph round-trips through the store unchanged (§4.3, §5.2).

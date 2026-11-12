@@ -33,7 +33,7 @@ pub use error::{
 pub use feature::{FeatureExpr, FeatureExprError};
 pub use fetch::{
     Cache, DownloadLimits, ExtractionLimits, FetchOptions, FetchedSource, GitOptions, IndexRecord,
-    Provenance, RegistryClient, SourceInput,
+    Provenance, RegistryClient, SourceInput, fetch_offline,
 };
 pub use model::{
     AnalysisStatus, AnalysisStrategy, AnalyzerId, BuildSystem, ConfidenceTier, Conflict,

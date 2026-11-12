@@ -1738,6 +1738,11 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(journal, "wal");
+        assert!(
+            rusqlite::version_number() >= 3_054_000,
+            "bundled SQLite {} is older than the patched 3.54.0 release",
+            rusqlite::version()
+        );
     }
 
     #[tokio::test]

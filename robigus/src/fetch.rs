@@ -242,6 +242,63 @@ pub async fn fetch(
     }
 }
 
+/// Resolves a source without any network access. Remote sources must have a
+/// full commit or SHA-256 pin and an existing content-addressed cache entry.
+/// This does not fall back to a fetch if a cache entry disappears.
+pub async fn fetch_offline(
+    input: SourceInput,
+    cache: &Cache,
+) -> Result<FetchedSource, RobigusError> {
+    if let SourceInput::Path { path } = input {
+        return fetch_path(&path).await;
+    }
+    let cache = cache.clone();
+    spawn_blocking(move || -> Result<FetchedSource, FetchError> {
+        match input {
+            SourceInput::Path { .. } => unreachable!("local paths were handled above"),
+            SourceInput::Git { url, reference } => {
+                let (tree, digest) = git_cache_hit(&cache, &reference)?.ok_or_else(|| {
+                    FetchError::OfflineCacheMiss(
+                        "git requires a cached, full commit ID supplied with --rev".into(),
+                    )
+                })?;
+                Ok(FetchedSource {
+                    tree,
+                    digest,
+                    provenance: Provenance::Verified,
+                    kind: SourceKind::Git { url, reference },
+                })
+            }
+            SourceInput::Tarball { url, digest } => {
+                let digest = digest.ok_or_else(|| {
+                    FetchError::OfflineCacheMiss(
+                        "tarball requires a cached SHA-256 digest supplied with --sha256".into(),
+                    )
+                })?;
+                let digest = normalize_sha256(&digest)?;
+                let tree = cache.path_for("tarball", &digest)?;
+                if !tree.is_dir() {
+                    return Err(FetchError::OfflineCacheMiss(format!(
+                        "tarball digest {digest} is not cached"
+                    )));
+                }
+                Ok(FetchedSource {
+                    tree,
+                    digest: digest.clone(),
+                    provenance: Provenance::Verified,
+                    kind: SourceKind::Tarball {
+                        url,
+                        digest: Some(digest),
+                    },
+                })
+            }
+        }
+    })
+    .await
+    .map_err(|error| FetchError::Walk(format!("offline cache lookup task failed: {error}")))?
+    .map_err(RobigusError::from)
+}
+
 /// Fetches a git repository: clone into a scratch directory, resolve the
 /// requested revision to a commit, check that commit out together with its
 /// submodules (each at the commit the superproject pins), and move the tree
