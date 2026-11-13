@@ -1,6 +1,6 @@
 # robigus — Phase 1 Implementation Plan
 
-Status: in progress — WP-1.1 to WP-1.6 and WP-1.8 implemented; WP-1.7 foundation implemented with open socket isolation issue; WP-1.9 next
+Status: in progress — WP-1.1 to WP-1.6 and WP-1.8 to WP-1.9 implemented; WP-1.7 foundation implemented with open socket isolation issue
 Scope: v1 = Milestones M1–M3 (dependency graph analysis only)
 Normative reference: [`../AGENTS.md`](../AGENTS.md) — if this plan and the spec disagree, the spec wins.
 
@@ -262,11 +262,11 @@ Acceptance: fail-closed behavior verified; a trivial command runs isolated under
 
 **Spec refs:** §14, §15, §17.
 
-Files: `robigus/src/main.rs`, `robigus/src/cli.rs`, `robigus/src/commands/{mod,fetch,check,print}.rs` (`export` lands in WP-1.9).
+Files: `robigus/src/main.rs`, `robigus/src/cli.rs`, `robigus/src/commands/{mod,fetch,check,print}.rs` (export dispatch is in `mod.rs`).
 
 Tasks:
 
-- [x] clap derive: `fetch`, `analyze` (stub → WP-2.3), `check`, `print`, `export` (stub → WP-1.9), `version`; global `--db`, `--format`, `--offline`, `--sandbox <auto|bwrap|native>`, `--jobs`, `--verbose`, `--config`, `--cache`.
+- [x] clap derive: `fetch`, `analyze` (stub → WP-2.3), `check`, `print`, `export`, `version`; global `--db`, `--format`, `--offline`, `--sandbox <auto|bwrap|native>`, `--jobs`, `--verbose`, `--config`, `--cache`.
 - [x] `--config` TOML file: network allowlist overrides, limits, sub-agent opt-in placeholder.
 - [x] Exit-code mapping 0–5 from error kinds; `miette` graphical diagnostics.
 - [x] `fetch` prints local path + digest; `check` runs the integrity report (exit 0/3); `print` loads the graph with `--kind`/`--depth`/`--status` filters (predicate filters and `--why` arrive in WP-2.3); `version`.
@@ -280,14 +280,14 @@ Acceptance: all M1 commands run against fixture databases; §14 exit codes verif
 
 **Spec refs:** §11.3, §14.
 
-Files: `robigus/src/commands/export.rs` (+ `src/export.rs` helpers).
+Files: `robigus/src/export.rs`, `robigus/src/store.rs`, `robigus/src/commands/mod.rs`.
 
 Tasks:
 
-- [ ] JSON export: serde serialization of the full `Analysis` (metadata, nodes, edges, plans, invocations) — lossless by construction.
-- [ ] DOT export via `petgraph` `Dot` with node/edge labels — documented as lossy.
+- [x] JSON export: one consistent database snapshot with metadata, full nodes, resolved and unresolved edges, roots, plans, and invocations; serde round-trip and `AnalysisSnapshot::to_analysis` reconstruction. Stored command arguments and environments are included without further redaction.
+- [x] DOT export via `petgraph` `Dot` with labeled nodes and edges, including synthetic nodes for unresolved requirements — documented as lossy. `export` requires `--format json` or `--format dot`.
 
-Tests: JSON → `Analysis` round-trip equality; DOT smoke test.
+Tests: JSON snapshot round-trip and `Analysis` reconstruction; concurrent WAL snapshot; malformed records; DOT escaping, disconnected nodes, cycles and unresolved edges; CLI fixture databases and errors. Verification also covers lossy-value rejection before writes, semantic duplicate identities and edges, JSON nesting boundaries, and control-character predicates. Existing databases containing legacy lossy values or duplicate graph identities fail closed during export; no automatic migration or repair is performed. DOT escaping is tested at the document level; external Graphviz rendering is not part of the test suite.
 
 Acceptance: §11.3 losslessness holds for JSON.
 

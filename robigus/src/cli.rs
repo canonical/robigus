@@ -43,7 +43,7 @@ pub struct Cli {
     /// Database path; required for analyze, check, print, and export.
     #[arg(long, global = true, value_name = "PATH")]
     pub db: Option<PathBuf>,
-    /// Output representation; DOT is reserved for the unimplemented export command.
+    /// Output representation; export requires json or dot (DOT is lossy).
     #[arg(long, global = true, value_enum, default_value = "text")]
     pub format: OutputFormat,
     /// Forbid network acquisition (local sources and supported cache hits only).
@@ -95,7 +95,10 @@ pub enum Command {
     /// Print an existing graph; predicates are displayed, not evaluated.
     /// Predicate filters and --why are future work (WP-2.3).
     Print(PrintArgs),
-    /// Not implemented yet: lossless JSON or lossy DOT graph export.
+    /// Export the full analysis as JSON or a lossy DOT graph.
+    ///
+    /// Requires --format json or --format dot. JSON includes recorded command
+    /// arguments and environment; treat the output as potentially sensitive.
     Export,
     /// Print the tool version.
     Version,
@@ -114,7 +117,12 @@ impl Cli {
         }
         if self.format == OutputFormat::Dot && !matches!(self.command, Command::Export) {
             return Err(CliError::Usage(
-                "--format dot is only supported by export (not implemented yet)".into(),
+                "--format dot is only supported by export".into(),
+            ));
+        }
+        if matches!(self.command, Command::Export) && self.format == OutputFormat::Text {
+            return Err(CliError::Usage(
+                "export requires --format json or --format dot".into(),
             ));
         }
         Ok(())
@@ -350,6 +358,9 @@ mod tests {
             let mut args = vec!["tsp-analyzer", command];
             if command == "analyze" {
                 args.push("source");
+            }
+            if command == "export" {
+                args.extend(["--format", "json"]);
             }
             let cli = Cli::try_parse_from(&args).unwrap();
             assert_eq!(cli.validate().unwrap_err().exit_code(), 2);

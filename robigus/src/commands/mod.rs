@@ -47,7 +47,20 @@ pub async fn run(cli: &Cli, config: &Config) -> Result<CommandOutput, CliError> 
             Ok(CommandOutput::success(text))
         }
         Command::Analyze { .. } => Err(CliError::NotImplemented("analyze")),
-        Command::Export => Err(CliError::NotImplemented("export")),
+        Command::Export => {
+            let store = open_reader(database_path(cli)?).await?;
+            let snapshot = store.export_snapshot().await?;
+            let text = match cli.format {
+                OutputFormat::Json => robigus::export::json(&snapshot).map_err(output_error)?,
+                OutputFormat::Dot => robigus::export::dot(&snapshot)?,
+                OutputFormat::Text => {
+                    return Err(CliError::Usage(
+                        "export requires --format json or --format dot".into(),
+                    ));
+                }
+            };
+            Ok(CommandOutput::success(text))
+        }
         Command::Version => {
             let text = if json {
                 format!(
@@ -168,27 +181,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stubs_fail_without_opening_database_or_establishing_sandbox() {
+    async fn analyze_stub_fails_without_opening_database_or_establishing_sandbox() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("absent.db");
-        for command in ["analyze", "export"] {
-            let mut args = vec![
-                "tsp-analyzer",
-                "--db",
-                path.to_str().unwrap(),
-                "--sandbox",
-                "native",
-                command,
-            ];
-            if command == "analyze" {
-                args.push("https://example.invalid/source.tar.gz");
-            }
-            let cli = Cli::try_parse_from(args).unwrap();
-            let error = run(&cli, &Config::default()).await.unwrap_err();
-            assert!(matches!(error, CliError::NotImplemented(_)));
-            assert_eq!(error.exit_code(), 1);
-            assert!(!path.exists());
-        }
+        let cli = Cli::try_parse_from([
+            "tsp-analyzer",
+            "--db",
+            path.to_str().unwrap(),
+            "--sandbox",
+            "native",
+            "analyze",
+            "https://example.invalid/source.tar.gz",
+        ])
+        .unwrap();
+        let error = run(&cli, &Config::default()).await.unwrap_err();
+        assert!(matches!(error, CliError::NotImplemented(_)));
+        assert_eq!(error.exit_code(), 1);
+        assert!(!path.exists());
     }
 
     #[tokio::test]

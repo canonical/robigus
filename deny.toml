@@ -20,6 +20,7 @@ confidence-threshold = 0.93
 # when a new dependency legitimately needs it.
 allow = [
     "Apache-2.0",
+    "BSD-2-Clause",
     "BSD-3-Clause",
     "CC0-1.0",
     "GPL-3.0-only",

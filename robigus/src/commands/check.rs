@@ -64,6 +64,7 @@ pub fn render(report: &IntegrityReport, json: bool) -> Result<String, serde_json
         "Duplicate identities: {}",
         report.duplicate_identities
     );
+    let _ = writeln!(output, "Duplicate edges: {}", report.duplicate_edges);
     let _ = writeln!(
         output,
         "Invalid JSON columns: {}",
@@ -162,6 +163,7 @@ mod tests {
             schema_version: 2,
             foreign_keys_ok: false,
             duplicate_identities: 3,
+            duplicate_edges: 6,
             invalid_json_columns: 4,
             corrupt_identities: 5,
             status_violations: vec![package("bad-status")],
@@ -173,6 +175,7 @@ mod tests {
         assert_eq!(json["is_ok"], false);
         assert_eq!(json["foreign_keys_ok"], false);
         assert_eq!(json["duplicate_identities"], 3);
+        assert_eq!(json["duplicate_edges"], 6);
         assert_eq!(json["invalid_json_columns"], 4);
         assert_eq!(json["corrupt_identities"], 5);
         assert_eq!(json["status_violations"][0]["name"], "bad-status");
@@ -183,6 +186,7 @@ mod tests {
             "Schema version: 2",
             "Foreign keys: FAILED",
             "Duplicate identities: 3",
+            "Duplicate edges: 6",
             "Invalid JSON columns: 4",
             "Corrupt identities: 5",
             "bad-status",

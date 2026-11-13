@@ -208,7 +208,7 @@ fn write_escaped(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
             '\n' => f.write_str("\\n")?,
             '\r' => f.write_str("\\r")?,
             '\t' => f.write_str("\\t")?,
-            c if (c as u32) < 0x20 => write!(f, "\\u{:x}", c as u32)?,
+            c if (c as u32) < 0x20 => write!(f, "\\u{{{:x}}}", c as u32)?,
             c => write!(f, "{c}")?,
         }
     }
@@ -1258,6 +1258,67 @@ mod tests {
         let parsed = Predicate::parse("cfg(\"k\\u{a}\" = \"v\")").unwrap();
         assert_eq!(parsed, Predicate::cfg("k\n", "v"));
         assert_eq!(parsed.to_string(), "cfg(\"k\\n\" = \"v\")");
+    }
+
+    #[test]
+    fn control_characters_round_trip_through_display_and_parse() {
+        // Cover all C0 controls (including NUL), DEL, and C1 controls.
+        for code in (0u32..0x20).chain(0x7f..=0x9f) {
+            let ch = char::from_u32(code).unwrap();
+            let predicate = Predicate::feature(format!("a{ch}b"));
+            let escaped = format!("feature(\"a\\u{{{code:x}}}b\")");
+            assert_eq!(Predicate::parse(&escaped).unwrap(), predicate);
+
+            let text = predicate.to_string();
+            let expected = match ch {
+                '\n' => "feature(\"a\\nb\")".to_string(),
+                '\r' => "feature(\"a\\rb\")".to_string(),
+                '\t' => "feature(\"a\\tb\")".to_string(),
+                _ if code < 0x20 => escaped,
+                _ => format!("feature(\"a{ch}b\")"),
+            };
+            assert_eq!(text, expected, "control character {code:#x}");
+            let reloaded =
+                Predicate::parse(&text).unwrap_or_else(|error| panic!("code {code:#x}: {error}"));
+            assert_eq!(reloaded, predicate, "code {code:#x} round trip");
+            assert_eq!(reloaded.to_string(), text);
+            assert_eq!(reloaded.canonical_text(), text);
+        }
+    }
+
+    #[test]
+    fn control_characters_round_trip_in_nested_values() {
+        let controls: String = (0u32..0x20)
+            .chain(0x7f..=0x9f)
+            .map(|code| char::from_u32(code).unwrap())
+            .collect();
+        // Exercise every string-valued atom position with adjacent controls,
+        // quotes, a literal Unicode escape, and non-ASCII text.
+        let value = format!("prefix{controls}\"\\u{{0}}é suffix");
+        let predicate = Predicate::and(vec![
+            Predicate::or(vec![
+                Predicate::qualified_feature(&value, &value),
+                Predicate::cfg(&value, &value),
+            ]),
+            Predicate::env(&value, &value),
+            Predicate::series(&value),
+            !Predicate::platform(&value),
+            Predicate::build_profile(&value),
+            Predicate::arch(MachineArch::Unsupported(value.clone())),
+            Predicate::feature(&value),
+        ]);
+        let text = predicate.to_string();
+        let reloaded = Predicate::parse(&text).unwrap();
+        assert_eq!(reloaded, predicate);
+        assert_eq!(reloaded.to_string(), text);
+        assert!(text.contains("\\u{0}"), "NUL must be escaped: {text}");
+
+        // Canonical text is the persistence format; it must reload as the
+        // full canonical AST, not just produce the same display string.
+        let canonical = predicate.canonical_text();
+        let reloaded = Predicate::parse(&canonical).unwrap();
+        assert_eq!(reloaded, predicate.canonicalized());
+        assert_eq!(reloaded.canonical_text(), canonical);
     }
 
     fn asm_config(arch: Architecture) -> Configuration {

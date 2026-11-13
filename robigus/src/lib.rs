@@ -13,6 +13,7 @@
 pub mod detect;
 pub mod dpkg;
 pub mod error;
+pub mod export;
 pub mod feature;
 pub mod fetch;
 pub mod model;
@@ -46,4 +47,7 @@ pub use sandbox::{
     CommandSpec, NetworkAccess, ProcessOutput, ProcessStatus, Sandbox, SandboxError, SandboxMode,
     SandboxPreference, establish_sandbox,
 };
-pub use store::{Analysis, AnalysisMetadata, IntegrityReport, Store, ToolInvocation};
+pub use store::{
+    Analysis, AnalysisMetadata, AnalysisSnapshot, IntegrityReport, SnapshotEdge,
+    SnapshotInvocation, SnapshotNode, SnapshotPlan, Store, ToolInvocation,
+};

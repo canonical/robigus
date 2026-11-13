@@ -1,4 +1,4 @@
-//! WP-1.8 process-level CLI contracts. Analysis/export remain explicit stubs;
+//! WP-1.8 process-level CLI contracts. Analysis remains an explicit stub;
 //! sandbox-unavailable and incomplete-analysis exits belong to later WPs.
 
 use std::{
@@ -753,11 +753,4 @@ fn placeholder_commands_explicitly_fail_instead_of_claiming_success() {
         .assert()
         .failure()
         .stderr(placeholder.clone());
-    for format in ["text", "json", "dot"] {
-        with_db(&dir, &db)
-            .args(["--format", format, "export"])
-            .assert()
-            .failure()
-            .stderr(placeholder.clone());
-    }
 }

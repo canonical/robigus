@@ -2,10 +2,9 @@
 //!
 //! One database is created per analysis; the database is the source of truth
 //! and supports resumable expansion (§7.7). All SQLite work runs inside
-//! `tokio::task::spawn_blocking` on a shared connection behind a mutex —
-//! the §11.1 alternative to `tokio-rusqlite`, which is unused because no
-//! released version pairs with an MSRV-compatible `rusqlite_migration`.
-//! Reads (`load`, `check`) run inside a deferred transaction so WAL readers
+//! `tokio::task::spawn_blocking` on a shared connection behind a mutex;
+//! `tokio-rusqlite` is unused. Reads (`load`, `check`, `export_snapshot`)
+//! run inside a deferred transaction so WAL readers
 //! see one consistent snapshot while an analysis writes.
 
 use crate::error::StoreError;
@@ -25,6 +24,8 @@ use url::Url;
 
 mod migrations;
 mod schema;
+#[cfg(test)]
+mod snapshot_tests;
 
 /// One analysis: the persisted metadata plus the rebuilt dependency graph
 /// (spec §15).
@@ -32,6 +33,135 @@ mod schema;
 pub struct Analysis {
     pub metadata: AnalysisMetadata,
     pub graph: DependencyGraph,
+}
+
+/// A lossless, serde-ready view of one persisted analysis (spec §11.3).
+///
+/// Vectors are ordered by their database row IDs. Package references in edges,
+/// roots, plans, and invocations use the full [`PackageId`]; row IDs identify
+/// the corresponding persisted records. Target, provide, and conflict rows
+/// are included in their owning nodes, since their database IDs are internal.
+/// Like the underlying model, `PartialEq` compares package source identities:
+/// for example, Git references are serialized but do not affect equality.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AnalysisSnapshot {
+    pub metadata: AnalysisMetadata,
+    pub nodes: Vec<SnapshotNode>,
+    pub edges: Vec<SnapshotEdge>,
+    pub roots: Vec<PackageId>,
+    pub plans: Vec<SnapshotPlan>,
+    pub invocations: Vec<SnapshotInvocation>,
+}
+
+impl AnalysisSnapshot {
+    /// Reconstructs the metadata and graph without importing into a database.
+    /// Rejects dangling or inconsistent references and graph records that
+    /// would otherwise be deduplicated. Plans and invocations remain in the
+    /// snapshot; their package references are validated but are not in `Analysis`.
+    pub fn to_analysis(&self) -> Result<Analysis, StoreError> {
+        let mut graph = DependencyGraph::new();
+        let mut node_rows = BTreeSet::new();
+        for item in &self.nodes {
+            if !node_rows.insert(item.id) || graph.node(&item.node.id).is_some() {
+                return Err(StoreError::Corrupt(format!(
+                    "duplicate snapshot node {}",
+                    item.node.id
+                )));
+            }
+            graph.add_node(item.node.clone());
+        }
+        let validate = |id: &PackageId, context: &str| -> Result<(), StoreError> {
+            let node = graph.node(id).ok_or_else(|| {
+                StoreError::Corrupt(format!("{context} references missing package {id}"))
+            })?;
+            if node.id.source_id.kind != id.source_id.kind
+                || node.id.source_id.precise != id.source_id.precise
+            {
+                return Err(StoreError::Corrupt(format!(
+                    "{context} has inconsistent source for package {id}"
+                )));
+            }
+            Ok(())
+        };
+        let mut roots = BTreeSet::new();
+        for root in &self.roots {
+            validate(root, "root")?;
+            if !roots.insert(root.clone()) {
+                return Err(StoreError::Corrupt(format!(
+                    "duplicate snapshot root {root}"
+                )));
+            }
+        }
+        for item in &self.edges {
+            validate(&item.edge.from, "edge source")?;
+            if let Some(to) = &item.edge.to {
+                validate(to, "edge target")?;
+            }
+        }
+        for plan in &self.plans {
+            if let PlanSubject::Package(id) = &plan.row.subject {
+                validate(id, "plan")?;
+            }
+        }
+        for invocation in &self.invocations {
+            if let Some(id) = &invocation.invocation.package_id {
+                validate(id, "invocation")?;
+            }
+        }
+        for root in roots {
+            graph.add_root(root);
+        }
+        let mut edge_rows = BTreeSet::new();
+        for item in &self.edges {
+            if !edge_rows.insert(item.id) {
+                return Err(StoreError::Corrupt(format!(
+                    "duplicate snapshot edge row {}",
+                    item.id
+                )));
+            }
+            let count = graph.edge_count();
+            graph.add_edge(item.edge.clone());
+            if graph.edge_count() == count {
+                return Err(StoreError::Corrupt(format!(
+                    "snapshot edge {} would merge with another edge",
+                    item.id
+                )));
+            }
+        }
+        Ok(Analysis {
+            metadata: self.metadata.clone(),
+            graph,
+        })
+    }
+}
+
+/// A graph node and its persisted package row ID.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotNode {
+    pub id: i64,
+    pub node: Node,
+}
+
+/// A resolved or unresolved graph edge and its persisted row ID.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotEdge {
+    pub id: i64,
+    pub edge: Edge,
+}
+
+/// A persisted plan row, including its ID and last update timestamp.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotPlan {
+    pub id: i64,
+    pub updated_at: String,
+    pub row: PlanRow,
+}
+
+/// A persisted tool invocation and its row ID.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotInvocation {
+    pub id: i64,
+    pub invocation: ToolInvocation,
 }
 
 /// The single-row `metadata` table (spec §11.2).
@@ -81,7 +211,11 @@ pub struct ToolInvocation {
 pub struct IntegrityReport {
     pub schema_version: u32,
     pub foreign_keys_ok: bool,
+    /// Duplicate identity groups, using PackageId semantics when reconstructable
+    /// and SQL identity otherwise. Exact SQL duplicates are not counted twice.
     pub duplicate_identities: usize,
+    /// Persisted edges that would merge with another edge during graph reconstruction.
+    pub duplicate_edges: usize,
     pub invalid_json_columns: usize,
     /// Rows whose ecosystem/source-kind cannot be parsed back.
     pub corrupt_identities: usize,
@@ -98,6 +232,7 @@ impl IntegrityReport {
     pub fn is_ok(&self) -> bool {
         self.foreign_keys_ok
             && self.duplicate_identities == 0
+            && self.duplicate_edges == 0
             && self.invalid_json_columns == 0
             && self.corrupt_identities == 0
             && self.status_violations.is_empty()
@@ -340,11 +475,36 @@ impl Store {
     }
 
     /// Writes the metadata row (upsert). The store stamps `updated_at`;
-    /// `created_at` is preserved from an existing row on update.
+    /// `created_at` is preserved from an existing row on update. Options must
+    /// round-trip through `serde_json`'s default decoder inside the exact
+    /// [`AnalysisSnapshot`] envelope; excessively nested values are rejected
+    /// before any metadata is mutated.
     pub async fn write_metadata(&self, metadata: &AnalysisMetadata) -> Result<(), StoreError> {
+        // Preflight before cloning: cloning a recursively nested Value also uses
+        // the call stack and must not precede the bounded iterative check.
+        if json_value_exceeds_depth(&metadata.options, JSON_NESTING_PRECHECK_LIMIT) {
+            return Err(StoreError::Unrepresentable(format!(
+                "metadata options exceed the safe JSON serialization nesting preflight limit of {JSON_NESTING_PRECHECK_LIMIT}"
+            )));
+        }
         let metadata = metadata.clone();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
+            let snapshot = AnalysisSnapshot {
+                metadata,
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                roots: Vec::new(),
+                plans: Vec::new(),
+                invocations: Vec::new(),
+            };
+            if let Err(error) = snapshot_json_for_default_decoder(&snapshot, false) {
+                return Err(StoreError::Unrepresentable(format!(
+                    "metadata options cannot be represented in the AnalysisSnapshot JSON envelope with serde_json's default recursion limit: {error}"
+                )));
+            }
+            let metadata = snapshot.metadata;
+            let options = checked_metadata_options(&metadata.options)?;
             let conn = lock(&conn)?;
             let now = Utc::now().to_rfc3339();
             // Only a missing row means "first write"; any other error is real.
@@ -356,7 +516,6 @@ impl Store {
             let created_at = created_at.unwrap_or(metadata.created_at);
             let configuration = serde_json::to_string(&metadata.configuration)?;
             let toolchain = serde_json::to_string(&metadata.toolchain)?;
-            let options = serde_json::to_string(&metadata.options)?;
             conn.execute(
                 "INSERT INTO metadata (id, robigus_version, project_name, project_version,
                            source_kind, source_uri, source_digest, configuration, toolchain,
@@ -410,14 +569,19 @@ impl Store {
     /// source's recorded reference is kept from the first insert.
     ///
     /// Fails with [`StoreError::Unrepresentable`] when the node's identity
-    /// or a provide's version would not load back unchanged.
+    /// or payload would not load back unchanged (including paths, provide
+    /// versions, and optional conflict constraints). A different stored version
+    /// spelling with the same semantic identity is also rejected: callers must
+    /// reuse the recorded spelling, not silently merge or replace its payload.
+    /// The check and write reserve the SQLite writer in one immediate transaction.
     pub async fn upsert_node(&self, node: &Node) -> Result<(), StoreError> {
         let identity = PackageIdentity::checked(&node.id)?;
         for provide in &node.provides {
             if let Some(version) = &provide.version {
-                let reloaded =
-                    PackageVersion::from_stored_text(node.id.ecosystem, &version.to_string());
-                if &reloaded != version {
+                let text = version.to_string();
+                let reloaded = (!text.is_empty())
+                    .then(|| PackageVersion::from_stored_text(node.id.ecosystem, &text));
+                if reloaded.as_ref() != Some(version) {
                     return Err(StoreError::Unrepresentable(format!(
                         "provide '{}' version {version:?} of a {} package would load back as {reloaded:?}",
                         provide.name, node.id.ecosystem
@@ -427,11 +591,7 @@ impl Store {
         }
         let status = node.status.as_str().to_string();
         let active_features = serde_json::to_string(&node.active_features)?;
-        let path = node
-            .path
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let path = checked_optional_path(node.path.as_deref(), "node path")?;
         let targets = node
             .targets
             .iter()
@@ -442,11 +602,7 @@ impl Store {
                     } => soname.clone(),
                     _ => String::new(),
                 };
-                let target_path = target
-                    .path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+                let target_path = checked_optional_path(target.path.as_deref(), "target path")?;
                 Ok((
                     target.name.clone(),
                     serde_json::to_string(&target.kind)?,
@@ -475,18 +631,15 @@ impl Store {
             .map(|conflict| {
                 Ok((
                     conflict.name.clone(),
-                    conflict
-                        .version_req
-                        .as_ref()
-                        .map(|req| req.requirement_text())
-                        .unwrap_or_default(),
+                    checked_optional_constraint(conflict.version_req.as_ref(), "conflict")?,
                 ))
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = lock(&conn)?;
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            reject_semantic_version_alias(&tx, &identity)?;
             // `RETURNING id` yields the affected row on both the insert and
             // the update path. `last_insert_rowid()` must not be used here:
             // SQLite leaves it unchanged when an upsert takes the DO UPDATE
@@ -596,7 +749,12 @@ impl Store {
     /// merged evidence) rather than duplicated (spec §5.2, §11.2): on a
     /// partial-unique-index violation the existing row is selected, merged
     /// in Rust, and updated — `ON CONFLICT` is not used against partial
-    /// indexes.
+    /// indexes. Optional version constraints that would not round-trip
+    /// unchanged (including `Some(VersionConstraint::Any)`) are rejected with
+    /// [`StoreError::Unrepresentable`] before any edge or placeholder is written.
+    /// Predicates must also decode within the exact [`AnalysisSnapshot`] JSON
+    /// envelope. Placeholder identities follow the same version-spelling policy
+    /// as nodes; a rejection rolls back the entire edge batch.
     pub async fn upsert_edges(&self, from: &PackageId, edges: &[Edge]) -> Result<(), StoreError> {
         for edge in edges {
             if &edge.from != from {
@@ -605,12 +763,41 @@ impl Store {
                     edge.from
                 )));
             }
+            checked_optional_constraint(edge.requirement.version_req.as_ref(), "edge")?;
+            if predicate_exceeds_depth(&edge.predicate, JSON_NESTING_PRECHECK_LIMIT) {
+                return Err(StoreError::Unrepresentable(format!(
+                    "edge predicate exceeds the safe JSON serialization nesting preflight limit of {JSON_NESTING_PRECHECK_LIMIT}"
+                )));
+            }
         }
+        // Only bounded predicates reach this clone; unbounded ASTs are rejected
+        // by the iterative preflight above.
         let edges = edges.to_vec();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
+            let snapshot = AnalysisSnapshot {
+                metadata: metadata_for_edge_validation(),
+                nodes: Vec::new(),
+                edges: edges
+                    .into_iter()
+                    .map(|edge| SnapshotEdge { id: 0, edge })
+                    .collect(),
+                roots: Vec::new(),
+                plans: Vec::new(),
+                invocations: Vec::new(),
+            };
+            if let Err(error) = snapshot_json_for_default_decoder(&snapshot, false) {
+                return Err(StoreError::Unrepresentable(format!(
+                    "edge predicate cannot be represented in the AnalysisSnapshot JSON envelope with serde_json's default recursion limit: {error}"
+                )));
+            }
+            let edges = snapshot
+                .edges
+                .into_iter()
+                .map(|item| item.edge)
+                .collect::<Vec<_>>();
             let mut conn = lock(&conn)?;
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             for edge in &edges {
                 upsert_edge(&tx, edge)?;
             }
@@ -754,6 +941,7 @@ impl Store {
     }
 
     /// Persist an invocation before launch, returning its database row id.
+    /// Durations above `i64::MAX` are rejected as unrepresentable before writing.
     pub async fn begin_invocation(&self, invocation: &ToolInvocation) -> Result<i64, StoreError> {
         let identity = invocation.package_id.as_ref().map(PackageIdentity::of);
         let argv = serde_json::to_string(&invocation.argv)?;
@@ -763,7 +951,7 @@ impl Store {
         let sandbox_mode = invocation.sandbox_mode.clone();
         let exit_status = invocation.exit_status.clone();
         let started_at = invocation.started_at.clone();
-        let duration_ms = invocation.duration_ms as i64;
+        let duration_ms = checked_duration(invocation.duration_ms)?;
         let log_path = invocation.log_path.clone();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -799,6 +987,7 @@ impl Store {
     }
 
     /// Complete a previously recorded invocation.
+    /// Durations above `i64::MAX` are rejected without updating the invocation.
     pub async fn finish_invocation(
         &self,
         id: i64,
@@ -806,7 +995,7 @@ impl Store {
         duration_ms: u64,
     ) -> Result<(), StoreError> {
         let status = status.to_owned();
-        let duration = i64::try_from(duration_ms).unwrap_or(i64::MAX);
+        let duration = checked_duration(duration_ms)?;
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = lock(&conn)?;
@@ -941,7 +1130,8 @@ impl Store {
     }
 
     /// Rebuilds the full [`Analysis`] (metadata + graph). Every JSON column
-    /// is validated; parse failures are [`StoreError::Corrupt`].
+    /// is validated; parse failures and persisted graph records that would be
+    /// deduplicated during reconstruction are [`StoreError::Corrupt`].
     pub async fn load(&self) -> Result<Analysis, StoreError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -952,6 +1142,57 @@ impl Store {
             let graph = read_graph(&tx)?;
             tx.commit()?;
             Ok(Analysis { metadata, graph })
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    /// Reads a consistent, serde-ready snapshot of the complete analysis.
+    ///
+    /// Metadata is required, as in [`Store::load`]. Plans and invocations are
+    /// read in the same transaction as the graph; malformed stored values,
+    /// dangling package references, graph records that would be deduplicated,
+    /// or values exceeding the default snapshot JSON nesting limit cause an
+    /// error rather than being omitted.
+    ///
+    /// ```no_run
+    /// # async fn example(store: &robigus::Store) -> Result<(), Box<dyn std::error::Error>> {
+    /// let snapshot = store.export_snapshot().await?;
+    /// let json = robigus::export::json(&snapshot)?;
+    /// let decoded: robigus::AnalysisSnapshot = serde_json::from_str(&json)?;
+    /// let analysis = decoded.to_analysis()?;
+    /// # let _ = analysis;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn export_snapshot(&self) -> Result<AnalysisSnapshot, StoreError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = lock(&conn)?;
+            let tx = conn.transaction()?;
+            let metadata = read_metadata(&tx)?
+                .ok_or_else(|| StoreError::Corrupt("metadata row missing".to_string()))?;
+            let (nodes, edges, roots) = read_graph_snapshot(&tx)?;
+            // A successful export must be accepted by AnalysisSnapshot::to_analysis;
+            // in particular, do not emit persisted edges that reconstruction merges.
+            reconstruct_graph(&nodes, &edges, &roots)?;
+            let plans = read_snapshot_plans(&tx)?;
+            let invocations = read_snapshot_invocations(&tx)?;
+            let snapshot = AnalysisSnapshot {
+                metadata,
+                nodes,
+                edges,
+                roots,
+                plans,
+                invocations,
+            };
+            snapshot_json_for_default_decoder(&snapshot, false).map_err(|error| {
+                StoreError::Corrupt(format!(
+                    "stored analysis cannot be represented in the AnalysisSnapshot JSON envelope with serde_json's default recursion limit: {error}"
+                ))
+            })?;
+            tx.commit()?;
+            Ok(snapshot)
         })
         .await
         .map_err(join_error)?
@@ -1004,13 +1245,23 @@ fn find_package_row_id(
 }
 
 fn read_plan_rows(conn: &rusqlite::Connection) -> Result<Vec<PlanRow>, StoreError> {
+    let mut rows: Vec<_> = read_snapshot_plans(conn)?
+        .into_iter()
+        .map(|plan| plan.row)
+        .collect();
+    rows.sort();
+    Ok(rows)
+}
+
+fn read_snapshot_plans(conn: &rusqlite::Connection) -> Result<Vec<SnapshotPlan>, StoreError> {
     let package_columns = IDENTITY_COLUMNS
         .split(", ")
         .map(|column| format!("p.{column}"))
         .collect::<Vec<_>>()
         .join(", ");
     let mut statement = conn.prepare(&format!(
-        "SELECT ap.package_id, ap.root_path, ap.analyzer, ap.strategy, ap.build_system,
+        "SELECT ap.id AS plan_id, ap.updated_at, ap.package_id, p.id AS joined_package_id,
+                ap.root_path, ap.analyzer, ap.strategy, ap.build_system,
                 ap.status AS plan_status, ap.attempts, ap.error, ap.detail, {package_columns}
          FROM analysis_plan ap LEFT JOIN package p ON p.id = ap.package_id
          ORDER BY ap.id"
@@ -1024,7 +1275,14 @@ fn read_plan_rows(conn: &rusqlite::Connection) -> Result<Vec<PlanRow>, StoreErro
         let package_id: Option<i64> = row.get("package_id")?;
         let root_path: Option<String> = row.get("root_path")?;
         let subject = match (package_id, root_path) {
-            (Some(_), None) => PlanSubject::Package(PackageIdentity::from_row(row)?.package_id()?),
+            (Some(id), None) => {
+                if row.get::<_, Option<i64>>("joined_package_id")?.is_none() {
+                    return Err(StoreError::Corrupt(format!(
+                        "analysis_plan references unknown package {id}"
+                    )));
+                }
+                PlanSubject::Package(PackageIdentity::from_row(row)?.package_id()?)
+            }
             (None, Some(path)) => PlanSubject::Root(PathBuf::from(path)),
             _ => {
                 return Err(StoreError::Corrupt(
@@ -1037,7 +1295,7 @@ fn read_plan_rows(conn: &rusqlite::Connection) -> Result<Vec<PlanRow>, StoreErro
         let strategy: String = row.get("strategy")?;
         let build_system: String = row.get("build_system")?;
         let status: String = row.get("plan_status")?;
-        out.push(PlanRow {
+        let plan = PlanRow {
             subject,
             analyzer: AnalyzerId::parse(&analyzer).ok_or_else(|| corrupt("analyzer", &analyzer))?,
             strategy: AnalysisStrategy::parse(&strategy)
@@ -1052,10 +1310,106 @@ fn read_plan_rows(conn: &rusqlite::Connection) -> Result<Vec<PlanRow>, StoreErro
             attempts: row.get("attempts")?,
             error: row.get("error")?,
             detail: row.get("detail")?,
+        };
+        out.push(SnapshotPlan {
+            id: row.get("plan_id")?,
+            updated_at: row.get("updated_at")?,
+            row: plan,
         });
     }
-    out.sort();
     Ok(out)
+}
+
+fn read_snapshot_invocations(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<SnapshotInvocation>, StoreError> {
+    let package_columns = IDENTITY_COLUMNS
+        .split(", ")
+        .map(|column| format!("p.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut statement = conn.prepare(&format!(
+        "SELECT ti.id AS invocation_id, ti.package_id, p.id AS joined_package_id,
+                ti.tool, ti.argv, ti.env, ti.tool_version, ti.sandbox_mode,
+                ti.exit_status, ti.started_at, ti.duration_ms, ti.log_path, {package_columns}
+         FROM tool_invocation ti LEFT JOIN package p ON p.id = ti.package_id
+         ORDER BY ti.id"
+    ))?;
+    let mut rows = statement.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let package_id: Option<i64> = row.get("package_id")?;
+        let package_id = match package_id {
+            Some(id) => {
+                if row.get::<_, Option<i64>>("joined_package_id")?.is_none() {
+                    return Err(StoreError::Corrupt(format!(
+                        "tool_invocation references unknown package {id}"
+                    )));
+                }
+                Some(PackageIdentity::from_row(row)?.package_id()?)
+            }
+            None => None,
+        };
+        let duration_ms: i64 = row.get("duration_ms")?;
+        let duration_ms = u64::try_from(duration_ms).map_err(|_| {
+            StoreError::Corrupt(format!(
+                "negative tool_invocation.duration_ms {duration_ms}"
+            ))
+        })?;
+        out.push(SnapshotInvocation {
+            id: row.get("invocation_id")?,
+            invocation: ToolInvocation {
+                package_id,
+                tool: row.get("tool")?,
+                argv: serde_json::from_str(&row.get::<_, String>("argv")?)?,
+                env: serde_json::from_str(&row.get::<_, String>("env")?)?,
+                tool_version: row.get("tool_version")?,
+                sandbox_mode: row.get("sandbox_mode")?,
+                exit_status: row.get("exit_status")?,
+                started_at: row.get("started_at")?,
+                duration_ms,
+                log_path: row.get("log_path")?,
+            },
+        });
+    }
+    Ok(out)
+}
+
+// Call while holding the SQLite writer reservation, before inserting a package.
+fn reject_semantic_version_alias(
+    conn: &rusqlite::Connection,
+    identity: &PackageIdentity,
+) -> Result<(), StoreError> {
+    let ecosystem = Ecosystem::parse(&identity.ecosystem).ok_or_else(|| {
+        StoreError::Corrupt(format!("unknown ecosystem '{}'", identity.ecosystem))
+    })?;
+    let version = PackageVersion::from_stored_text(ecosystem, &identity.version);
+    // The name index bounds candidates; filter the other non-version identity
+    // columns in SQL, excluding exact-spelling upserts and Git reference metadata.
+    let mut statement = conn.prepare(
+        "SELECT id, version FROM package INDEXED BY idx_package_name
+         WHERE name = ?1 AND ecosystem = ?2 AND source_kind = ?3
+           AND source_uri = ?4 AND source_precise = ?5 AND version <> ?6",
+    )?;
+    let mut rows = statement.query(params![
+        identity.name,
+        identity.ecosystem,
+        identity.source_kind,
+        identity.source_uri,
+        identity.source_precise,
+        identity.version,
+    ])?;
+    while let Some(row) = rows.next()? {
+        let stored: String = row.get("version")?;
+        if PackageVersion::from_stored_text(ecosystem, &stored) == version {
+            let row_id: i64 = row.get("id")?;
+            return Err(StoreError::Unrepresentable(format!(
+                "package '{}' version '{}' is semantically equal to stored version '{}' in row {row_id}; reuse the stored spelling",
+                identity.name, identity.version, stored
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn package_row_id(
@@ -1078,6 +1432,7 @@ fn package_row_id(
     ) {
         Ok(id) => Ok(id),
         Err(rusqlite::Error::QueryReturnedNoRows) => {
+            reject_semantic_version_alias(conn, identity)?;
             // Placeholder node for an endpoint that has not been analyzed yet
             // — mirrors `DependencyGraph::add_edge` (spec §5.2).
             conn.execute(
@@ -1099,6 +1454,158 @@ fn package_row_id(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+// Recursive serde serialization must be bounded before the authoritative
+// default-decoder check. This preflight neither replaces nor relaxes that check.
+const JSON_NESTING_PRECHECK_LIMIT: usize = 128;
+
+fn json_value_exceeds_depth(value: &serde_json::Value, limit: usize) -> bool {
+    let mut pending = vec![(value, 0usize)];
+    while let Some((value, depth)) = pending.pop() {
+        match value {
+            serde_json::Value::Array(children) => {
+                if depth >= limit {
+                    return true;
+                }
+                pending.extend(children.iter().map(|child| (child, depth + 1)));
+            }
+            serde_json::Value::Object(children) => {
+                if depth >= limit {
+                    return true;
+                }
+                pending.extend(children.values().map(|child| (child, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn predicate_exceeds_depth(predicate: &Predicate, limit: usize) -> bool {
+    let mut pending = vec![(predicate, 0usize)];
+    while let Some((predicate, depth)) = pending.pop() {
+        match predicate {
+            Predicate::And(children) | Predicate::Or(children) => {
+                if depth >= limit {
+                    return true;
+                }
+                pending.extend(children.iter().map(|child| (child, depth + 1)));
+            }
+            Predicate::Not(child) => {
+                if depth >= limit {
+                    return true;
+                }
+                pending.push((child, depth + 1));
+            }
+            Predicate::Atom(_) => {}
+        }
+    }
+    false
+}
+
+fn nesting_error(field: &str) -> serde_json::Error {
+    <serde_json::Error as serde::de::Error>::custom(format!(
+        "{field} exceeds the safe JSON serialization nesting preflight limit of {JSON_NESTING_PRECHECK_LIMIT}"
+    ))
+}
+
+/// Serializes an exact snapshot envelope and proves that the default decoder
+/// accepts it. The iterative preflight bounds recursive serialization first.
+pub(crate) fn snapshot_json_for_default_decoder(
+    snapshot: &AnalysisSnapshot,
+    pretty: bool,
+) -> Result<String, serde_json::Error> {
+    if json_value_exceeds_depth(&snapshot.metadata.options, JSON_NESTING_PRECHECK_LIMIT) {
+        return Err(nesting_error("metadata options"));
+    }
+    for item in &snapshot.edges {
+        if predicate_exceeds_depth(&item.edge.predicate, JSON_NESTING_PRECHECK_LIMIT) {
+            return Err(nesting_error("edge predicate"));
+        }
+    }
+    let output = if pretty {
+        serde_json::to_string_pretty(snapshot)?
+    } else {
+        serde_json::to_string(snapshot)?
+    };
+    serde_json::from_str::<AnalysisSnapshot>(&output)?;
+    Ok(output)
+}
+
+fn metadata_for_edge_validation() -> AnalysisMetadata {
+    AnalysisMetadata {
+        robigus_version: String::new(),
+        project_name: String::new(),
+        project_version: String::new(),
+        source_kind: String::new(),
+        source_uri: String::new(),
+        source_digest: String::new(),
+        configuration: Configuration::default(),
+        toolchain: BTreeMap::new(),
+        network_mode: String::new(),
+        sandbox_mode: String::new(),
+        options: serde_json::Value::Null,
+        created_at: String::new(),
+        updated_at: String::new(),
+    }
+}
+
+fn checked_metadata_options(options: &serde_json::Value) -> Result<String, StoreError> {
+    let text = serde_json::to_string(options).map_err(|error| {
+        StoreError::Unrepresentable(format!("metadata options cannot be serialized: {error}"))
+    })?;
+    let reloaded = serde_json::from_str::<serde_json::Value>(&text).map_err(|error| {
+        StoreError::Unrepresentable(format!(
+            "metadata options cannot be read back with serde_json's default recursion limit: {error}"
+        ))
+    })?;
+    if reloaded != *options {
+        return Err(StoreError::Unrepresentable(
+            "metadata options would not round-trip through JSON unchanged".to_string(),
+        ));
+    }
+    Ok(text)
+}
+
+fn checked_optional_path(path: Option<&Path>, context: &str) -> Result<String, StoreError> {
+    let Some(path) = path else {
+        return Ok(String::new());
+    };
+    path.to_str()
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            StoreError::Unrepresentable(format!("{context} {path:?} must be non-empty UTF-8"))
+        })
+}
+
+fn checked_optional_constraint(
+    constraint: Option<&VersionConstraint>,
+    context: &str,
+) -> Result<String, StoreError> {
+    let Some(constraint) = constraint else {
+        return Ok(String::new());
+    };
+    let text = constraint.requirement_text();
+    // Empty SQL text means None, not Some(Any). Other variants must also
+    // survive the text parser without changing their payload or variant.
+    if text.is_empty()
+        || !matches!(VersionConstraint::from_requirement_text(&text), Ok(ref loaded) if loaded == constraint)
+    {
+        return Err(StoreError::Unrepresentable(format!(
+            "{context} constraint {constraint:?} does not round-trip through stored text"
+        )));
+    }
+    Ok(text)
+}
+
+fn checked_duration(duration_ms: u64) -> Result<i64, StoreError> {
+    i64::try_from(duration_ms).map_err(|_| {
+        StoreError::Unrepresentable(format!(
+            "tool invocation duration_ms {duration_ms} exceeds i64::MAX"
+        ))
+    })
 }
 
 fn upsert_edge(tx: &rusqlite::Transaction<'_>, edge: &Edge) -> Result<(), StoreError> {
@@ -1254,9 +1761,61 @@ fn read_metadata(conn: &rusqlite::Connection) -> Result<Option<AnalysisMetadata>
 }
 
 fn read_graph(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError> {
+    let (nodes, edges, roots) = read_graph_snapshot(conn)?;
+    reconstruct_graph(&nodes, &edges, &roots)
+}
+
+fn reconstruct_graph(
+    nodes: &[SnapshotNode],
+    edges: &[SnapshotEdge],
+    roots: &[PackageId],
+) -> Result<DependencyGraph, StoreError> {
     let mut graph = DependencyGraph::new();
+    for item in nodes {
+        graph.add_node(item.node.clone());
+    }
+    for root in roots {
+        graph.add_root(root.clone());
+    }
+    for item in edges {
+        let count = graph.edge_count();
+        graph.add_edge(item.edge.clone());
+        if graph.edge_count() == count {
+            return Err(StoreError::Corrupt(format!(
+                "snapshot edge {} would merge with another edge during graph reconstruction",
+                item.id
+            )));
+        }
+    }
+    Ok(graph)
+}
+
+// Checks retain best-effort informational cycle reporting. Load and export use
+// reconstruct_graph instead, so persisted semantic duplicates cannot disappear.
+fn read_graph_allowing_merges(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError> {
+    let (nodes, edges, roots) = read_graph_snapshot(conn)?;
+    let mut graph = DependencyGraph::new();
+    for node in nodes {
+        graph.add_node(node.node);
+    }
+    for root in roots {
+        graph.add_root(root);
+    }
+    for edge in edges {
+        graph.add_edge(edge.edge);
+    }
+    Ok(graph)
+}
+
+type GraphSnapshot = (Vec<SnapshotNode>, Vec<SnapshotEdge>, Vec<PackageId>);
+
+fn read_graph_snapshot(conn: &rusqlite::Connection) -> Result<GraphSnapshot, StoreError> {
+    let mut nodes = BTreeMap::new();
+    let mut roots = Vec::new();
+    let mut edges = Vec::new();
     let mut by_row_id: HashMap<i64, PackageId> = HashMap::new();
     let mut ecosystems: HashMap<i64, Ecosystem> = HashMap::new();
+    let mut identities = BTreeMap::new();
 
     {
         let mut statement = conn.prepare(&format!(
@@ -1268,6 +1827,11 @@ fn read_graph(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError
             let row_id: i64 = row.get("id")?;
             let identity = PackageIdentity::from_row(row)?;
             let package_id = identity.package_id()?;
+            if let Some(previous_row) = identities.insert(package_id.clone(), row_id) {
+                return Err(StoreError::Corrupt(format!(
+                    "duplicate package identity {package_id} in rows {previous_row} and {row_id}"
+                )));
+            }
             let ecosystem = Ecosystem::parse(&identity.ecosystem).ok_or_else(|| {
                 StoreError::Corrupt(format!("unknown ecosystem '{}'", identity.ecosystem))
             })?;
@@ -1276,17 +1840,20 @@ fn read_graph(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError
                 serde_json::from_str(&row.get::<_, String>("active_features")?)?;
             let path_text: String = row.get("path")?;
             let is_root: bool = row.get("is_root")?;
-            graph.add_node(Node {
-                id: package_id.clone(),
-                path: (!path_text.is_empty()).then(|| PathBuf::from(path_text)),
-                status,
-                active_features,
-                targets: Vec::new(),
-                provides: Vec::new(),
-                conflicts: Vec::new(),
-            });
+            nodes.insert(
+                row_id,
+                Node {
+                    id: package_id.clone(),
+                    path: (!path_text.is_empty()).then(|| PathBuf::from(path_text)),
+                    status,
+                    active_features,
+                    targets: Vec::new(),
+                    provides: Vec::new(),
+                    conflicts: Vec::new(),
+                },
+            );
             if is_root {
-                graph.add_root(package_id.clone());
+                roots.push(package_id.clone());
             }
             by_row_id.insert(row_id, package_id);
             ecosystems.insert(row_id, ecosystem);
@@ -1294,24 +1861,33 @@ fn read_graph(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError
     }
 
     {
-        let mut statement =
-            conn.prepare("SELECT package_id, name, kind, path FROM package_target ORDER BY id")?;
+        let mut statement = conn.prepare(
+            "SELECT package_id, name, kind, soname, path FROM package_target ORDER BY id",
+        )?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let package_row: i64 = row.get("package_id")?;
             let kind: TargetKind = serde_json::from_str(&row.get::<_, String>("kind")?)?;
+            let soname: String = row.get("soname")?;
+            let expected_soname = match &kind {
+                TargetKind::SharedLibrary {
+                    soname: Some(value),
+                } => value.as_str(),
+                _ => "",
+            };
+            if soname != expected_soname {
+                return Err(StoreError::Corrupt(format!(
+                    "target '{}' has inconsistent soname {soname:?}; kind specifies {expected_soname:?}",
+                    row.get::<_, String>("name")?
+                )));
+            }
             let path_text: String = row.get("path")?;
             let target = Target {
                 name: row.get("name")?,
                 kind,
                 path: (!path_text.is_empty()).then(|| PathBuf::from(path_text)),
             };
-            let Some(package_id) = by_row_id.get(&package_row) else {
-                return Err(StoreError::Corrupt(
-                    "target references unknown package".to_string(),
-                ));
-            };
-            let Some(node) = graph.node_mut(package_id) else {
+            let Some(node) = nodes.get_mut(&package_row) else {
                 return Err(StoreError::Corrupt(
                     "target references unknown package".to_string(),
                 ));
@@ -1336,12 +1912,7 @@ fn read_graph(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError
                 version: (!version_text.is_empty())
                     .then(|| PackageVersion::from_stored_text(ecosystem, &version_text)),
             };
-            let Some(package_id) = by_row_id.get(&package_row) else {
-                return Err(StoreError::Corrupt(
-                    "provide references unknown package".to_string(),
-                ));
-            };
-            let Some(node) = graph.node_mut(package_id) else {
+            let Some(node) = nodes.get_mut(&package_row) else {
                 return Err(StoreError::Corrupt(
                     "provide references unknown package".to_string(),
                 ));
@@ -1364,12 +1935,7 @@ fn read_graph(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError
                     .then(|| VersionConstraint::from_requirement_text(&version_req_text))
                     .transpose()?,
             };
-            let Some(package_id) = by_row_id.get(&package_row) else {
-                return Err(StoreError::Corrupt(
-                    "conflict references unknown package".to_string(),
-                ));
-            };
-            let Some(node) = graph.node_mut(package_id) else {
+            let Some(node) = nodes.get_mut(&package_row) else {
                 return Err(StoreError::Corrupt(
                     "conflict references unknown package".to_string(),
                 ));
@@ -1380,7 +1946,7 @@ fn read_graph(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError
 
     {
         let mut statement = conn.prepare(
-            "SELECT from_package_id, to_package_id, requirement, requirement_kind,
+            "SELECT id, from_package_id, to_package_id, requirement, requirement_kind,
                     version_req, kinds, predicate, confidence, evidence
              FROM dependency_edge ORDER BY id",
         )?;
@@ -1424,19 +1990,50 @@ fn read_graph(conn: &rusqlite::Connection) -> Result<DependencyGraph, StoreError
             let confidence = Confidence::try_from(row.get::<_, u8>("confidence")?)
                 .map_err(|error| StoreError::Corrupt(error.to_string()))?;
             let evidence: Vec<Evidence> = serde_json::from_str(&row.get::<_, String>("evidence")?)?;
-            graph.add_edge(Edge {
-                from,
-                to,
-                requirement,
-                kinds,
-                predicate,
-                confidence,
-                evidence,
+            edges.push(SnapshotEdge {
+                id: row.get("id")?,
+                edge: Edge {
+                    from,
+                    to,
+                    requirement,
+                    kinds,
+                    predicate,
+                    confidence,
+                    evidence,
+                },
             });
         }
     }
 
-    Ok(graph)
+    let nodes = nodes
+        .into_iter()
+        .map(|(id, node)| SnapshotNode { id, node })
+        .collect();
+    Ok((nodes, edges, roots))
+}
+
+fn count_duplicate_identities(conn: &rusqlite::Connection) -> Result<usize, StoreError> {
+    // Group exact SQL identities first, then combine reconstructable groups by
+    // model identity. A group with both textual aliases and exact duplicates is
+    // one integrity finding, not one per spelling or extra row.
+    let mut statement = conn.prepare(&format!(
+        "SELECT {IDENTITY_COLUMNS}, COUNT(*) AS copies FROM package
+         GROUP BY name, version, ecosystem, source_kind, source_uri, source_precise"
+    ))?;
+    let mut rows = statement.query([])?;
+    let mut counts = BTreeMap::<PackageId, i64>::new();
+    let mut duplicates = 0;
+    while let Some(row) = rows.next()? {
+        let copies: i64 = row.get("copies")?;
+        match PackageIdentity::from_row(row)?.package_id() {
+            Ok(id) => *counts.entry(id).or_default() += copies,
+            // Malformed identities are reported separately; retain the old SQL
+            // duplicate check for groups that cannot be compared semantically.
+            Err(_) if copies > 1 => duplicates += 1,
+            Err(_) => {}
+        }
+    }
+    Ok(duplicates + counts.values().filter(|&&copies| copies > 1).count())
 }
 
 fn run_checks(conn: &rusqlite::Connection) -> Result<IntegrityReport, StoreError> {
@@ -1451,15 +2048,7 @@ fn run_checks(conn: &rusqlite::Connection) -> Result<IntegrityReport, StoreError
         report.foreign_keys_ok = rows.next()?.is_none();
     }
 
-    report.duplicate_identities = conn.query_row(
-        "SELECT COUNT(*) FROM (
-            SELECT 1 FROM package
-            GROUP BY name, version, ecosystem, source_kind, source_uri, source_precise
-            HAVING COUNT(*) > 1
-         )",
-        [],
-        |row| row.get::<_, i64>(0),
-    )? as usize;
+    report.duplicate_identities = count_duplicate_identities(conn)?;
 
     // JSON validity, identity corruption, and confidence caps.
     {
@@ -1606,13 +2195,17 @@ fn run_checks(conn: &rusqlite::Connection) -> Result<IntegrityReport, StoreError
         }
     }
 
-    // Cycles require the graph; only computed when the data is clean.
+    // Graph findings are computed only when the data is clean. The merge-allowing
+    // graph preserves best-effort cycle reporting and exposes edges that strict
+    // load/export reconstruction would reject.
     if report.foreign_keys_ok
         && report.duplicate_identities == 0
         && report.invalid_json_columns == 0
         && report.corrupt_identities == 0
     {
-        let graph = read_graph(conn)?;
+        let persisted_edges = read_graph_snapshot(conn)?.1.len();
+        let graph = read_graph_allowing_merges(conn)?;
+        report.duplicate_edges = persisted_edges - graph.edge_count();
         report.cycles = graph.cycles();
     }
 
