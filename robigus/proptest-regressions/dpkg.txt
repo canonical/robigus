@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 80455a5b6cdd39d1cc6358481df1204d8ba73f1efe4c29e56a875e702e2bb563 # shrinks to a = DpkgVersion { epoch: 0, upstream_version: "A", debian_revision: "-" }

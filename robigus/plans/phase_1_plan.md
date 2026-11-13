@@ -1,6 +1,6 @@
 # robigus — Phase 1 Implementation Plan
 
-Status: proposed
+Status: in progress — WP-1.1 to WP-1.6 and WP-1.8 to WP-1.9 implemented; WP-1.7 foundation implemented with open socket isolation issue
 Scope: v1 = Milestones M1–M3 (dependency graph analysis only)
 Normative reference: [`../AGENTS.md`](../AGENTS.md) — if this plan and the spec disagree, the spec wins.
 
@@ -29,7 +29,7 @@ Ubuntu archive mapping (M4) and packaging plans (M5) are explicitly out of scope
 - **Determinism.** Analyzers MUST produce identical output for identical inputs: `BTreeMap`/`BTreeSet` ordering everywhere, sorted fixture output, redacted snapshots.
 - **Fail closed.** If the sandbox cannot be established, nothing runs (exit 4). There is no `none` mode.
 - **One database per analysis.** The store is the source of truth; resume reads and writes it.
-- **Blocking work in `spawn_blocking`** (SQLite via `tokio-rusqlite`, `gix`, extraction, CPU-bound parsing).
+- **Blocking work in `spawn_blocking`** (SQLite on a shared `Arc<Mutex<rusqlite::Connection>>`, `gix`, extraction, CPU-bound parsing).
 
 ## 3. Sequencing overview
 
@@ -116,12 +116,12 @@ Goal (spec §21): predicate AST and parser (including `cfg` atoms), model extens
 
 Tasks:
 
-- [ ] `robigus/Cargo.toml`: add `description`, `license = "GPL-3.0-only"`, `repository`, `keywords`, `categories`, `rust-version = "1.93.1"`.
-- [ ] Workspace `Cargo.toml`: add shared deps — `petgraph`, `rusqlite` (bundled), `tokio-rusqlite`, `rusqlite_migration`, `tracing`, `tracing-subscriber`, `miette`, `sha2`, `tar`, `zstd`, `walkdir`, `ignore`, `toml`, `gix`, `cargo_metadata`, `toml_edit`; dev-deps `insta`, `proptest`, `wiremock`. (`reqwest`, `clap`, `flate2`, `xz2`, `chrono`, `regex`, `serde*`, `thiserror`, `tokio`, `ubuntu-info-rust` already exist.)
-- [ ] Add `deny.toml` and a `cargo deny` CI job (licenses must accept GPL-3.0-only family; advisories on).
-- [ ] Add a robigus `SECURITY.md` with its own reporting path (the workspace one points at `rapt`).
-- [ ] CI: add an MSRV job pinned to 1.93.1; trigger workflows on pushes as well as PRs; reserve a nightly fuzz job (wired up once targets exist in WP-1.2/WP-1.3).
-- [ ] Baseline: `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo doc --locked --no-deps --all-features` clean.
+- [x] `robigus/Cargo.toml`: add `description`, `license = "GPL-3.0-only"`, `repository`, `keywords`, `categories`, `rust-version = "1.93.1"`.
+- [x] Workspace `Cargo.toml`: add shared deps — `petgraph`, `rusqlite` (bundled), `rusqlite_migration`, `tracing`, `tracing-subscriber`, `miette`, `sha2`, `tar`, `zstd`, `walkdir`, `ignore`, `toml`, `gix`, `cargo_metadata`, `toml_edit`; dev-deps `insta`, `proptest`, `wiremock`. (`reqwest`, `clap`, `flate2`, `xz2`, `chrono`, `regex`, `serde*`, `thiserror`, `tokio`, `ubuntu-info-rust` already exist.)
+- [x] Add `deny.toml` and a `cargo deny` CI job (licenses must accept GPL-3.0-only family; advisories on).
+- [x] Add a robigus `SECURITY.md` with its own reporting path (the workspace one points at `rapt`).
+- [x] CI: add an MSRV job pinned to 1.93.1; trigger workflows on pushes as well as PRs; reserve a nightly fuzz job (wired up once targets exist in WP-1.2/WP-1.3).
+- [x] Baseline: `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo doc --locked --no-deps --all-features` clean.
 
 Acceptance: CI green on PR and push; `cargo deny check` passes; manifest carries all §18 metadata.
 
@@ -133,20 +133,20 @@ Files: `robigus/src/error.rs` (new), `robigus/src/model.rs`, `robigus/src/dpkg.r
 
 Tasks:
 
-- [ ] `error.rs`: `RobigusError` plus sub-errors (`StoreError`, `FetchError`, `PredicateError`, `DpkgError`, `SandboxUnavailable`) via `thiserror`; all implement `std::error::Error`.
-- [ ] `dpkg.rs`: fix the `Eq`/`Ord` contract — `PartialEq` MUST agree with `Ord` (today `1.02 != 1.2` under `==` while `Ord` says `Equal`). Add a proptest asserting `a == b ⇔ a.cmp(b) == Equal`. Convert `parse` to a typed `DpkgError`.
-- [ ] `model.rs`: unify `PackageVersion::Debian` with `DpkgVersion` (variant becomes `Debian(DpkgVersion)`; `Display` omits epoch `0` and empty revision). Keep identity ordering (`Ord` on `PackageId`) separate from semantic version ordering.
-- [ ] `DependencyKind::Runtime`; correct the `Normal` doc comment; `Dependency.kind` becomes `BTreeSet<DependencyKind>`.
-- [ ] `Dependency.platform: Option<String>` → `predicate: Predicate`; `Dependency.features` → `BTreeSet<FeatureExpr>`.
-- [ ] `feature.rs`: `FeatureExpr` — `Simple("foo")`, `Optional("foo?")`, `DepFeature { dep, feature, weak }` (`foo/bar`, `foo?/bar`), `Dep("dep:foo")` — with parse/display round-trip against Cargo syntax.
-- [ ] `AnalysisStatus { NotStarted, Started, Complete, Error }` serialized exactly as `"Not_Started"`, `"Started"`, `"Complete"`, `"Error"`.
-- [ ] `MachineArch { Ubuntu(Architecture), All, Unsupported(String) }` with expansion helpers; default analysis set = `ubuntu-info-rust` `Architecture::ALL` minus `I386` (i.e. `amd64`, `amd64v3`, `arm64`, `armhf`, `ppc64el`, `riscv64`, `s390x`).
-- [ ] `SourceKind::Tarball { url, digest: Option<String> }`; deterministic tree-digest helper (SHA-256 over the canonical sorted file list + contents) for `SourceKind::Path`.
-- [ ] `Requirement`/`RequirementKind { Crate, PkgConfig, Header, Soname, Tool, Generic }`; `Node` and `Edge` structs per §5.1–§5.2.
-- [ ] `DependencyGraph`: `petgraph::stable_graph::StableDiGraph<Node, Edge>` + `BTreeMap<PackageId, NodeIndex>`; `add_node`, `add_edge` implementing the merge policy (union `kinds`, max confidence, merged evidence), `edges_from`/`edges_to`, `scc()` (Tarjan), roots as `BTreeSet<PackageId>`.
-- [ ] `PackageId` `Display` includes ecosystem and source kind.
-- [ ] `solver.rs`: delete `ModularSolver`, the always-`Equal` `debian_compare_versions` stub, and solver-only `ResolveError` paths; keep `DependencyProvider`/`ConflictPolicy`/`ConflictDomain` as the Phase 2 seam; fix `ConflictDomain::SideBySide` pre-1.0 keying (`major.minor` for `0.x`, `major.minor.patch` for `0.0.x`).
-- [ ] `lib.rs`: public module tree and re-exports matching the §15 sketch.
+- [x] `error.rs`: `RobigusError` plus sub-errors (`StoreError`, `FetchError`, `PredicateError`, `DpkgError`, `SandboxUnavailable`) via `thiserror`; all implement `std::error::Error`.
+- [x] `dpkg.rs`: fix the `Eq`/`Ord` contract — `PartialEq` MUST agree with `Ord` (today `1.02 != 1.2` under `==` while `Ord` says `Equal`). Add a proptest asserting `a == b ⇔ a.cmp(b) == Equal`. Convert `parse` to a typed `DpkgError`.
+- [x] `model.rs`: unify `PackageVersion::Debian` with `DpkgVersion` (variant becomes `Debian(DpkgVersion)`; `Display` omits epoch `0` and empty revision). Keep identity ordering (`Ord` on `PackageId`) separate from semantic version ordering.
+- [x] `DependencyKind::Runtime`; correct the `Normal` doc comment; `Dependency.kind` becomes `BTreeSet<DependencyKind>`.
+- [x] `Dependency.platform: Option<String>` → `predicate: Predicate`; `Dependency.features` → `BTreeSet<FeatureExpr>`.
+- [x] `feature.rs`: `FeatureExpr` — `Simple("foo")`, `Optional("foo?")`, `DepFeature { dep, feature, weak }` (`foo/bar`, `foo?/bar`), `Dep("dep:foo")` — with parse/display round-trip against Cargo syntax.
+- [x] `AnalysisStatus { NotStarted, Started, Complete, Error }` serialized exactly as `"Not_Started"`, `"Started"`, `"Complete"`, `"Error"`.
+- [x] `MachineArch { Ubuntu(Architecture), All, Unsupported(String) }` with expansion helpers; default analysis set = `ubuntu-info-rust` `Architecture::ALL` minus `I386` (i.e. `amd64`, `amd64v3`, `arm64`, `armhf`, `ppc64el`, `riscv64`, `s390x`).
+- [x] `SourceKind::Tarball { url, digest: Option<String> }`; deterministic tree-digest helper (SHA-256 over the canonical sorted file list + contents) for `SourceKind::Path`.
+- [x] `Requirement`/`RequirementKind { Crate, PkgConfig, Header, Soname, Tool, Generic }`; `Node` and `Edge` structs per §5.1–§5.2.
+- [x] `DependencyGraph`: `petgraph::stable_graph::StableDiGraph<Node, Edge>` + `BTreeMap<PackageId, NodeIndex>`; `add_node`, `add_edge` implementing the merge policy (union `kinds`, max confidence, merged evidence) over canonical-predicate edge identity (the predicate is canonicalized on insert, matching the store), `edges_from`/`edges_to`, `scc()` (Tarjan), roots as `BTreeSet<PackageId>`.
+- [x] `PackageId` `Display` includes ecosystem and source kind.
+- [x] `solver.rs`: delete `ModularSolver`, the always-`Equal` `debian_compare_versions` stub, and solver-only `ResolveError` paths; keep `DependencyProvider`/`ConflictPolicy`/`ConflictDomain` as the Phase 2 seam; fix `ConflictDomain::SideBySide` pre-1.0 keying (`major.minor` for `0.x`, `major.minor.patch` for `0.0.x`).
+- [x] `lib.rs`: public module tree and re-exports matching the §15 sketch.
 
 Tests: unit tests per type; serde round-trips; dpkg property test; merge-policy unit tests.
 
@@ -160,16 +160,16 @@ Files: `robigus/src/predicate.rs`, `fuzz/` (new cargo-fuzz crate).
 
 Tasks:
 
-- [ ] Lexer: identifiers, escaped strings, `!` `&&` `||`, parens, `true`/`false`; byte-span errors feeding `PredicateError` (miette-friendly).
-- [ ] Recursive-descent parser implementing the §4.2 EBNF exactly, including `cfg("key" = "value")` and qualified `feature("pkg/name")`.
-- [ ] Canonicalization: constant folding, de-duplication and sorting of operands under `&&`/`||`; idempotent; `canonical_text()` used for storage and equality.
-- [ ] `Display` renders the canonical text; serde (JSON) round-trip.
-- [ ] Evaluation: `Configuration { arches, platform, features: package → set, build_profiles, env, series, target_cfg }`; `Evaluator` with per-`Configuration` memoization; lazy evaluation; no cross-product enumeration.
-- [ ] `cfg` atoms evaluate against `target_cfg`; `arch("all")` expands to the `ubuntu-info-rust` set; `Unsupported` arch atoms evaluate `false`; `arch("amd64")` ≡ `cfg("target_arch" = "x86_64")` at evaluation time, and the store never rewrites between the forms.
-- [ ] DNF on demand with a node/term cap.
-- [ ] proptest: canonicalization idempotence; De Morgan equivalence; `eval(canonical(p)) == eval(p)`; `parse(display(p)) == p`.
-- [ ] cargo-fuzz target: `parse → canonicalize → display → parse` must succeed and be stable.
-- [ ] Unit tests for every §4.5 example.
+- [x] Lexer: identifiers, escaped strings, `!` `&&` `||`, parens, `true`/`false`; byte-span errors feeding `PredicateError` (miette-friendly).
+- [x] Recursive-descent parser implementing the §4.2 EBNF exactly, including `cfg("key" = "value")` and qualified `feature("pkg/name")`.
+- [x] Canonicalization: constant folding, de-duplication and sorting of operands under `&&`/`||`; idempotent; `canonical_text()` used for storage and equality.
+- [x] `Display` renders the predicate as written; `canonical_text()` (the `Display` of `canonicalized()`) is the storage and equality form; serde (JSON) round-trip.
+- [x] Evaluation: `Configuration { arches, platform, features: package → set, build_profiles, env, series, target_cfg }`; `Evaluator` with per-`Configuration` memoization; lazy evaluation; no cross-product enumeration.
+- [x] `cfg` atoms evaluate against `target_cfg`; `arch("all")` expands to the `ubuntu-info-rust` set; `Unsupported` arch atoms evaluate `false`; `arch("amd64")` ≡ `cfg("target_arch" = "x86_64")` at evaluation time, and the store never rewrites between the forms.
+- [x] DNF on demand with a node/term cap.
+- [x] proptest: canonicalization idempotence; De Morgan equivalence; `eval(canonical(p)) == eval(p)`; `parse(display(p)) == p`.
+- [x] cargo-fuzz target: `parse → canonicalize → display → parse` must succeed and be stable.
+- [x] Unit tests for every §4.5 example.
 
 Acceptance: fuzz + property tests wired into CI (nightly for fuzz); all §4.5 examples pass.
 
@@ -181,16 +181,17 @@ Files: `robigus/src/store.rs` (+ `store/schema.rs`, `store/migrations.rs`).
 
 Tasks:
 
-- [ ] Migration v1 = the full §11.2 DDL (`metadata`, `package`, `dependency_edge`, `package_target`, `package_provides`, `package_conflicts`, `analysis_plan`, `tool_invocation` + indexes) via `rusqlite_migration` on `PRAGMA user_version`; forward-only; opening a newer-version database → `StoreError::SchemaTooNew` (exit 3).
-- [ ] Pragmas on open: WAL, `synchronous = NORMAL`, `mmap_size`, `foreign_keys = ON`, `temp_store = MEMORY`.
-- [ ] `Store` over a `tokio-rusqlite` handle; async API: `open`, `metadata` (read/write single row), `upsert_node`, `upsert_edges`, `update_status`, `record_invocation`, `load`, `check`.
-- [ ] `upsert_node`: identity conflict on `(name, version, ecosystem, source_kind, source_uri, source_precise)` → update `status`/`active_features`/`path`.
-- [ ] `upsert_edges`: single transaction; on partial-unique-index violation, SELECT the existing row and merge in Rust (union `kinds`, max confidence, merged evidence) then UPDATE — do not rely on `ON CONFLICT` against partial indexes.
-- [ ] `''` (not NULL) for absent values in unique-index columns (`path`, `soname`, `version`, `version_req`).
-- [ ] `update_status` enforces transitions: `Not_Started → Started → Complete | Error`; `Error → Started` (retry); `Complete` is terminal.
-- [ ] `load()`: rebuild `DependencyGraph`; validate every JSON column (`configuration`, `toolchain`, `options`, `kinds`, `predicate`, `evidence`, `active_features`) — parse failures are integrity failures.
-- [ ] `check()` → `IntegrityReport` per §11.3: schema version, `foreign_key_check`, duplicate identities, JSON validity, confidence bounds and tier caps (`LlmSubAgent` ≤ 79), status invariants (`Complete` ⇒ targeted deps `Complete`; `Started`/`Error` ⇒ plan rows exist; `Error` ⇒ recorded cause), unresolved-requirement counts by kind, SCC cycles, orphan nodes.
-- [ ] `record_invocation` writes scrubbed argv/env and a workspace-relative `log_path`.
+- [x] Migration v1 = the full §11.2 DDL (`metadata`, `package`, `dependency_edge`, `package_target`, `package_provides`, `package_conflicts`, `analysis_plan`, `tool_invocation` + indexes) via `rusqlite_migration` on `PRAGMA user_version`; forward-only; opening a newer-version database → `StoreError::SchemaTooNew` (exit 3).
+- [x] Pragmas on open: WAL, `synchronous = NORMAL`, `mmap_size`, `foreign_keys = ON`, `temp_store = MEMORY`.
+- [x] `Store` over a shared `Arc<Mutex<rusqlite::Connection>>` with every operation in `tokio::task::spawn_blocking` (§11.1); async API: `open`, `metadata` (read/write single row), `upsert_node`, `upsert_edges`, `upsert_plan_rows`, `plan_rows`, `update_status`, `record_invocation`, `load`, `check`.
+- [x] `upsert_node`: identity conflict on `(name, version, ecosystem, source_kind, source_uri, source_precise)` → update `active_features`/`path`/targets/provides/conflicts. `status` is written on first insert only; later changes go through `update_status` (spec §22.19). Git identity is URL + commit; the requested reference goes in `source_reference` (not identity, §22.21). Ids that would not load back equal are rejected (`StoreError::Unrepresentable`).
+- [x] `upsert_plan_rows` / `plan_rows`: rows keyed by subject (`root_path` for detection rows, `package_id` for node rows; exactly one), analyzer, §7.6 strategy, and `build_system` (spec §22.20); package rows require an existing package (no placeholder).
+- [x] `upsert_edges`: single transaction; on partial-unique-index violation, SELECT the existing row and merge in Rust (union `kinds`, max confidence, merged evidence) then UPDATE — do not rely on `ON CONFLICT` against partial indexes.
+- [x] `''` (not NULL) for absent values in unique-index columns (`path`, `soname`, `version`, `version_req`).
+- [x] `update_status` enforces transitions: `Not_Started → Started → Complete | Error`; `Error → Started` (retry); `Complete` is terminal. It also enforces the plan invariants at write time: `Started` requires a plan row; `Error` requires a plan row with a recorded `error` (§22.19).
+- [x] `load()`: rebuild `DependencyGraph`; validate every JSON column (`configuration`, `toolchain`, `options`, `kinds`, `predicate`, `evidence`, `active_features`) — parse failures are integrity failures.
+- [x] `check()` → `IntegrityReport` per §11.3: schema version, `foreign_key_check`, duplicate identities, JSON validity, confidence bounds and tier caps (`LlmSubAgent` ≤ 79), status invariants (`Complete` ⇒ targeted deps `Complete`; `Started`/`Error` ⇒ plan rows exist; `Error` ⇒ recorded cause), unresolved-requirement counts by kind, SCC cycles, orphan nodes.
+- [x] `record_invocation` writes scrubbed argv/env and a workspace-relative `log_path`.
 
 Tests: migration from empty DB; `SchemaTooNew` rejection; save/load round-trip; idempotent double-save (row counts unchanged); status-transition violations detected; corrupted JSON detected; concurrent reader during writer (WAL).
 
@@ -204,13 +205,15 @@ Files: `robigus/src/fetch.rs`.
 
 Tasks:
 
-- [ ] `SourceInput` dispatch: Git (via `gix` in `spawn_blocking`; record resolved commit; honor locked rev), Tarball (download via `reqwest`; verify a user/config-supplied digest, otherwise record SHA-256 with provenance `unverified`), Path (tree digest; analyze in place, read-only).
-- [ ] Content-addressed cache `cache/<kind>/<digest>`; `--cache <PATH>` with XDG-cache default.
-- [ ] Registry helper for WP-2.2: sparse-index lookup + `static.crates.io` download + **mandatory** checksum verification against the index `cksum`.
-- [ ] Safe tar extraction (`tar` + `flate2`/`xz2`/`zstd`): reject absolute paths, `..` components, symlink/hardlink targets escaping the destination, device nodes, setuid/setgid entries; enforce entry-count and total-uncompressed-size limits; never execute anything.
-- [ ] `FetchError` taxonomy mapped to exit codes.
+- [x] `SourceInput` dispatch: Git (via `gix` in `spawn_blocking`; record resolved commit; honor locked rev), Tarball (download via `reqwest`; verify a user/config-supplied digest, otherwise record SHA-256 with provenance `unverified`), Path (tree digest; analyze in place, read-only).
+- [x] Content-addressed cache `cache/<kind>/<digest>` with XDG-cache default (lock-free, spec §22.27) — done; the `--cache <PATH>` flag lands with the CLI (WP-1.8).
+- [x] Registry helper for WP-2.2: sparse-index lookup + `static.crates.io` download + **mandatory** checksum verification against the index `cksum`.
+- [x] Safe tar extraction (`tar` + `flate2`/`xz2`/`zstd`): reject absolute paths, `..` components, symlink/hardlink targets escaping the destination, device nodes, setuid/setgid entries; enforce entry-count and total-uncompressed-size limits; never execute anything.
+- [x] `FetchOptions`: `DownloadLimits` (connect/request timeouts, streamed size cap) for tarballs and the registry client; `GitOptions` (wall-clock timeout, submodule depth/count limits, submodule URL scheme allowlist, `https` by default); git checkouts held to the extraction limits.
+- [x] Git submodules checked out recursively at the superproject's pinned commits (spec §7.2, §22.24); `FetchedSource::source_id()` pins `precise` to the digest.
+- [x] `FetchError` taxonomy mapped to exit codes — the taxonomy is done; the exit-code mapping lands with the CLI (WP-1.8).
 
-Tests: malicious-tarball fixtures (traversal, absolute path, escaping symlink, device node, setuid, gzip bomb, entry-count overflow); digest verify/mismatch; cache hit/miss.
+Tests: malicious-tarball fixtures (traversal, absolute path, escaping symlink, device node, setuid, gzip bomb, entry-count overflow); digest verify/mismatch; cache hit/miss; download size cap and timeout; local-repository git fixtures (default and non-default branch, pinned submodule, scheme restriction, `update = none`, checkout limits).
 
 Acceptance: every §7.2 hardening rule has a passing test.
 
@@ -222,12 +225,13 @@ Files: `robigus/src/detect.rs`.
 
 Tasks:
 
-- [ ] `ProjectTree`: `ignore`-crate walk with the skip list (`target/`, `vendor/`, `node_modules/`, `.git/`) and a depth limit.
-- [ ] Marker table per §7.3 with per-signal confidence; `DetectionReport { signals }` sorted for determinism.
-- [ ] Nested-workspace rule: separate roots only when unreachable from the top-level workspace; vendored crates are never roots.
-- [ ] Analyzer registry: `cargo`, `cpp`; future-ecosystem markers recorded as `Skipped` plan rows.
+- [x] `ProjectTree`: async `discover` (blocking walk in `spawn_blocking`) using the `ignore` crate with the skip list (`target/`, `vendor/`, `node_modules/`, `.git/`) and `DetectionLimits` (depth 64, 500,000 entries, 1 MiB build descriptions by default); problems are `DetectionDiagnostic`s, not silent (spec §7.3, §22.25).
+- [x] `ProjectCharacteristics` (spec §7.4): name/version, languages, analyzers, build systems, test systems; architectures and platforms come from analyzers.
+- [x] Marker table per §7.3 with per-signal confidence; `DetectionReport { signals }` sorted for determinism.
+- [x] Root rule (spec §7.3, §22.17): Cargo `members` globs (`*` does not cross `/`) and `exclude` path prefixes, both normalized; inside a Cargo root, only directories with their own `[workspace]` or crates listed explicitly in `exclude` become separate roots, and other non-member crates are recorded (`DetectionReport::non_member_crates`) but not rooted; markers attach to roots shallowest first so roots never depend on marker file names; vendored crates are never roots.
+- [x] Analyzer registry: `cargo`, `cpp`; detection emits root-keyed `manifest` plan rows with the build system in its own field (§22.20); future-ecosystem markers are recorded as `Skipped` plan rows.
 
-Tests: fixtures for monorepo, vendored crate, nested workspace, polyglot project.
+Tests: fixtures for monorepo, vendored crate, nested workspace, non-member fixture crate, explicit `exclude`, member-glob and spelling normalization, marker-name independence, polyglot project, malformed/oversized/unreadable manifests, depth and entry limits, characteristics.
 
 Acceptance: detection is deterministic and matches §7.3 semantics on fixtures.
 
@@ -237,16 +241,20 @@ Acceptance: detection is deterministic and matches §7.3 semantics on fixtures.
 
 Files: `robigus/src/sandbox.rs`.
 
+Implementation in progress: the bubblewrap backend and fail-closed paths are implemented. On a namespace-capable host, the strict integration suite passed as an unprivileged user (`ROB_REQUIRE_BWRAP=1`); it covers loopback IP isolation, but not complete host-service isolation. **Open security issue:** a live Unix-domain socket under a read-only source bind remains connectable from the sandbox, allowing communication with that host service despite offline mode. Do not treat offline isolation as complete until this is addressed; a read-only bind and network namespace do not block pathname sockets. Cgroup/process resource limits remain WP-3.5.
+
+`SandboxUnavailable` reports backend probing failures; after selection, `SandboxError::BwrapSetup` reports bubblewrap launch, setup, or supervision failures with the stderr log. A missing completion report does not prove the command never ran. Bubblewrap's completion protocol requires a shell wrapper to restore stdin: a missing requested executable is reported as exit 127, and command signals are encoded as 128 + signal. Command cancellation terminates the child and leaves its pre-launch invocation marked `running`, indicating an interrupted execution. The invocation's recorded environment omits `PWD`, which bubblewrap sets when changing directory; exact environment recording remains to be fixed.
+
 Tasks:
 
-- [ ] `Sandbox` trait, `SandboxMode { Bwrap, Native }`, `SandboxPreference { Auto, Bwrap, Native }`, `CommandSpec`, `ProcessOutput`.
+- [x] `Sandbox` trait, `SandboxMode { Bwrap, Native }`, `SandboxPreference { Auto, Bwrap, Native }`, `CommandSpec`, `ProcessOutput`.
 - [ ] `establish_sandbox` fail-closed: probe `bwrap` and unprivileged-userns availability; collect `Attempted { mechanism, cause }` for every mechanism tried; `SandboxUnavailable` carries the full list (drives exit 4 and the `no sandbox available` diagnostic).
 - [ ] bwrap backend: read-only source bind, writable tmpfs for output **and** `CARGO_HOME`, `--unshare-net` by default, `--die-with-parent`, `--new-session`, minimal `/dev` and `/proc`.
 - [ ] Network: disabled in M1. Requesting network before the proxy exists (WP-2.1) MUST fail closed with an explicit error — never silently allow egress.
 - [ ] Wall-clock timeouts (tokio timer + kill); stdout/stderr captured to workspace logs; environment scrubbed; `tool_invocation` recorded for every execution.
-- [ ] Crate-root `#![forbid(unsafe_code)]`; the native backend (M3) is the only scoped exception.
+- [x] Crate-root `#![forbid(unsafe_code)]`; the native backend (M3) is the only scoped exception.
 
-Tests: sandbox suite (no egress, no writes outside workspace, fail-closed diagnostics when unavailable) — runner-gated with an explicit skip reason when the CI runner lacks namespace support.
+Tests: sandbox suite (loopback IP isolation, read-only source, hidden host home and environment, failure diagnostics, timeout and recording). Runner-gated with an explicit skip reason when the runner lacks namespace support; set `ROB_REQUIRE_BWRAP=1` to make unavailable prerequisites fail the suite. The Unix-socket host-service exposure above remains an open issue; `offline_cannot_connect_to_unix_socket_in_source` is an ignored regression test that currently fails when run explicitly.
 
 Acceptance: fail-closed behavior verified; a trivial command runs isolated under bwrap.
 
@@ -254,17 +262,17 @@ Acceptance: fail-closed behavior verified; a trivial command runs isolated under
 
 **Spec refs:** §14, §15, §17.
 
-Files: `robigus/src/main.rs`, `robigus/src/cli.rs`, `robigus/src/commands/{fetch,check,print,export,version}.rs`.
+Files: `robigus/src/main.rs`, `robigus/src/cli.rs`, `robigus/src/commands/{mod,fetch,check,print}.rs` (export dispatch is in `mod.rs`).
 
 Tasks:
 
-- [ ] clap derive: `fetch`, `analyze` (stub → WP-2.3), `check`, `print`, `export`, `version`; global `--db`, `--format`, `--offline`, `--sandbox <auto|bwrap|native>`, `--jobs`, `--verbose`, `--config`, `--cache`.
-- [ ] `--config` TOML file: network allowlist overrides, limits, sub-agent opt-in placeholder.
-- [ ] Exit-code mapping 0–5 from error kinds; `miette` graphical diagnostics.
-- [ ] `fetch` prints local path + digest; `check` runs the integrity report (exit 0/3); `print` loads the graph with `--kind`/`--depth`/`--status` filters (predicate filters and `--why` arrive in WP-2.3); `version`.
-- [ ] `tracing-subscriber` init keyed off `--verbose`.
+- [x] clap derive: `fetch`, `analyze` (stub → WP-2.3), `check`, `print`, `export`, `version`; global `--db`, `--format`, `--offline`, `--sandbox <auto|bwrap|native>`, `--jobs`, `--verbose`, `--config`, `--cache`.
+- [x] `--config` TOML file: network allowlist overrides, limits, sub-agent opt-in placeholder.
+- [x] Exit-code mapping 0–5 from error kinds; `miette` graphical diagnostics.
+- [x] `fetch` prints local path + digest; `check` runs the integrity report (exit 0/3); `print` loads the graph with `--kind`/`--depth`/`--status` filters (predicate filters and `--why` arrive in WP-2.3); `version`.
+- [x] `tracing-subscriber` init keyed off `--verbose`.
 
-Tests: `assert_cmd` integration tests per command, including every exit code and the `--db`-required rule.
+Tests: `assert_cmd` integration tests per command, including the `--db`-required rule and exit codes 0/1/2/3 at process level; unit tests also verify exit codes 4 and 5 until `analyze` is implemented in WP-2.3.
 
 Acceptance: all M1 commands run against fixture databases; §14 exit codes verified.
 
@@ -272,14 +280,14 @@ Acceptance: all M1 commands run against fixture databases; §14 exit codes verif
 
 **Spec refs:** §11.3, §14.
 
-Files: `robigus/src/commands/export.rs` (+ `src/export.rs` helpers).
+Files: `robigus/src/export.rs`, `robigus/src/store.rs`, `robigus/src/commands/mod.rs`.
 
 Tasks:
 
-- [ ] JSON export: serde serialization of the full `Analysis` (metadata, nodes, edges, plans, invocations) — lossless by construction.
-- [ ] DOT export via `petgraph` `Dot` with node/edge labels — documented as lossy.
+- [x] JSON export: one consistent database snapshot with metadata, full nodes, resolved and unresolved edges, roots, plans, and invocations; serde round-trip and `AnalysisSnapshot::to_analysis` reconstruction. Stored command arguments and environments are included without further redaction.
+- [x] DOT export via `petgraph` `Dot` with labeled nodes and edges, including synthetic nodes for unresolved requirements — documented as lossy. `export` requires `--format json` or `--format dot`.
 
-Tests: JSON → `Analysis` round-trip equality; DOT smoke test.
+Tests: JSON snapshot round-trip and `Analysis` reconstruction; concurrent WAL snapshot; malformed records; DOT escaping, disconnected nodes, cycles and unresolved edges; CLI fixture databases and errors. Verification also covers lossy-value rejection before writes, semantic duplicate identities and edges, JSON nesting boundaries, and control-character predicates. Existing databases containing legacy lossy values or duplicate graph identities fail closed during export; no automatic migration or repair is performed. DOT escaping is tested at the document level; external Graphviz rendering is not part of the test suite.
 
 Acceptance: §11.3 losslessness holds for JSON.
 

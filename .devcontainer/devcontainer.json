@@ -1,4 +1,10 @@
 {
     "name": "Ubuntu 26.04 Rust 1.93 Distro DevContainer",
-    "image": "ghcr.io/canonical/ubuntu-26.04-rust-1.93-distro-devcontainer:latest"
+    "image": "ghcr.io/canonical/ubuntu-26.04-rust-1.93-distro-devcontainer:latest",
+    "securityOpt": [
+        "seccomp=unconfined",
+        "apparmor=unconfined",
+        "label=disable",
+        "unmask=ALL"
+    ]
 }
