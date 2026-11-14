@@ -1,6 +1,6 @@
 # robigus — Phase 1 Implementation Plan
 
-Status: in progress — most M1 foundations, the CLI skeleton, and export are implemented. M1 is **not accepted**: WP-1.2 has open dpkg correctness defects; WP-1.6 has a root-rule discrepancy to resolve; WP-1.7 has a known offline isolation failure and no mandatory sandbox-capable CI gate; security-policy and lossless-model boundaries need resolution. `analyze`, the proxy, expansion, and M2/M3 analysis remain unimplemented.
+Status: in progress — most M1 foundations, the CLI skeleton, and export are implemented. M1 is **not accepted**: WP-1.2 has open dpkg correctness defects; WP-1.6 has a root-rule discrepancy to resolve; WP-1.7 has known host IPC/descriptor isolation failures; its new mandatory sandbox CI gate cannot pass until they are fixed; security-policy and lossless-model boundaries need resolution. `analyze`, the proxy, expansion, and M2/M3 analysis remain unimplemented.
 Scope: v1 = Milestones M1–M3 (dependency graph analysis only)
 Normative reference: [`../AGENTS.md`](../AGENTS.md) — if this plan and the spec disagree, the spec wins.
 
@@ -249,7 +249,7 @@ Acceptance: detection is deterministic and matches §7.3 semantics on fixtures.
 
 Files: `robigus/src/sandbox.rs`.
 
-Implementation in progress: the bubblewrap backend and fail-closed paths are implemented. On a namespace-capable host, the strict integration suite passed as an unprivileged user (`ROB_REQUIRE_BWRAP=1`); it covers loopback IP isolation, but not complete host-service isolation. **Open security issue:** a live Unix-domain socket under a read-only source bind remains connectable from the sandbox, allowing communication with that host service despite offline mode. Do not treat offline isolation as complete until this is addressed; a read-only bind and network namespace do not block pathname sockets. Cgroup/process resource limits remain WP-3.5.
+Implementation in progress: the bubblewrap backend and fail-closed paths are implemented. On a namespace-capable host, the strict integration suite passed as an unprivileged user (`ROB_REQUIRE_BWRAP=1`); it covers loopback IP isolation, but not complete host-service isolation. **Open security issue:** a live Unix-domain socket under a read-only source bind remains connectable from the sandbox, allowing communication with that host service despite offline mode. Do not treat offline isolation as complete until this is addressed; a read-only bind and network namespace do not block pathname sockets. Further isolation review reproduced host FIFO communication through a read-only bind and leakage of unrelated inherited file descriptors through bubblewrap. Blocking Unix socket creation alone does not close those channels. A race-resistant filesystem policy and descriptor sanitation are also needed; no partial filter should be treated as complete isolation. Cgroup/process resource limits remain WP-3.5.
 
 `SandboxUnavailable` reports backend probing failures; after selection, `SandboxError::BwrapSetup` reports bubblewrap launch, setup, or supervision failures with the stderr log. A missing completion report does not prove the command never ran. Bubblewrap's completion protocol requires a shell wrapper to restore stdin: a missing requested executable is reported as exit 127, and command signals are encoded as 128 + signal. Command cancellation terminates the child and leaves its pre-launch invocation marked `running`, indicating an interrupted execution. The invocation's recorded environment omits `PWD`, which bubblewrap sets when changing directory; exact environment recording remains to be fixed.
 
@@ -262,7 +262,7 @@ Tasks:
 - [ ] Wall-clock timeouts (tokio timer + kill); stdout/stderr captured to workspace logs; environment scrubbed; `tool_invocation` recorded for every execution.
 - [x] Crate-root `#![forbid(unsafe_code)]`; the native backend (M3) is the only scoped exception.
 
-Tests: sandbox suite (loopback IP isolation, read-only source, hidden host home and environment, failure diagnostics, timeout and recording). Runner-gated with an explicit skip reason when the runner lacks namespace support; set `ROB_REQUIRE_BWRAP=1` to make unavailable prerequisites fail the suite. The Unix-socket host-service exposure above remains an open issue; `offline_cannot_connect_to_unix_socket_in_source` is an ignored regression test that currently fails when run explicitly.
+Tests: sandbox suite (loopback IP isolation, read-only source, hidden host home and environment, failure diagnostics, timeout and recording). Runner-gated with an explicit skip reason when the runner lacks namespace support; set `ROB_REQUIRE_BWRAP=1` to make unavailable prerequisites fail the suite. A required CI job now runs as an unprivileged user and explicitly executes the ignored `offline_cannot_connect_to_unix_socket_in_source` regression; that gate intentionally fails until isolation is fixed. Add regressions for host FIFOs, inherited descriptors, and runtime mounts.
 
 Acceptance: fail-closed behavior verified; a trivial command runs isolated under bwrap.
 
@@ -508,7 +508,7 @@ Tests: fixture with a known divergence between methods.
 | MSRV CI job (1.93.1) | WP-1.1 | Configured; remote job results not verified in this review |
 | `cargo deny` (licenses + advisories) | WP-1.1 | Configured; local `cargo deny check` passed in this review |
 | Nightly fuzz CI job | WP-1.3 | Scheduled/manual workflow configured; both current targets exercise predicates, not dpkg. Remove the stale missing-target success fallback and verify actual runs |
-| Sandbox-capable CI job | WP-1.7 | **Missing:** require an unprivileged namespace-capable runner with `ROB_REQUIRE_BWRAP=1`; otherwise tests can skip while the suite is green |
+| Sandbox-capable CI job | WP-1.7 | Required unprivileged `ROB_REQUIRE_BWRAP=1` job configured; explicitly runs the currently failing ignored socket regression. Hosted-runner AppArmor setup still needs verification |
 | Push-trigger CI | WP-1.1 | Build/test workflow triggers on pushes to `main` and PRs targeting `main` |
 | rustdoc with examples | each WP | Warning-strict doc build configured; CI's `cargo test --all-targets` does not run doctests, and public-API example coverage remains incomplete |
 | Security policy | WP-1.1 | Root `SECURITY.md` covers both crates; separate robigus file required by current spec is absent |
