@@ -21,22 +21,35 @@ use crate::store::{Store, ToolInvocation};
 /// Available sandbox mechanisms. Native is reserved for WP-3.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxMode {
+    /// Bubblewrap (`/usr/bin/bwrap`, version 0.11 or newer) with user, mount,
+    /// PID, network, IPC and UTS namespaces and a seccomp filter.
     Bwrap,
+    /// Landlock, seccomp and namespaces without bubblewrap. Reserved for
+    /// WP-3.5; no established sandbox reports this mode yet.
     Native,
 }
 
 /// Requested sandbox mechanism. There is intentionally no unsandboxed mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxPreference {
+    /// Bubblewrap if it can be established, otherwise native (spec §10.2
+    /// default).
     Auto,
+    /// Bubblewrap only; fails if it cannot be established.
     Bwrap,
+    /// Native only. Until WP-3.5 this always fails with
+    /// [`SandboxUnavailable`].
     Native,
 }
 
 /// Network policy for a command. Allowlisted networking requires WP-2.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkAccess {
+    /// No network: the command runs in its own empty network namespace.
     Offline,
+    /// Egress through robigus's allowlisting proxy (spec §10.2). Not yet
+    /// implemented: [`Sandbox::run`] rejects it with
+    /// [`SandboxError::NetworkUnavailable`] rather than running unrestricted.
     Allowlist,
 }
 
@@ -66,17 +79,43 @@ pub enum NetworkAccess {
 /// the requested program is reported as the shell's exit status (126 or 127).
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
+    /// Absolute path, inside the sandbox, of the executable to run (for
+    /// example `/usr/bin/cargo`). Also recorded as the invocation's tool.
     pub program: PathBuf,
+    /// Arguments passed to `program`. Recorded verbatim in the invocation
+    /// record, so they must not contain secrets.
     pub args: Vec<String>,
+    /// Host directory holding the source tree; mounted read-only at `/source`.
     pub source: PathBuf,
+    /// Working directory relative to `source` (empty for `source` itself). It
+    /// must contain no `..` and must resolve to a directory inside `source`.
     pub source_subdir: PathBuf,
+    /// Additional environment variables. Only `LANG`, `LC_ALL`,
+    /// `RUST_BACKTRACE`, `CARGO_NET_OFFLINE` and `SOURCE_DATE_EPOCH` are
+    /// accepted, with values free of NUL bytes; any other key rejects the
+    /// command. They extend the fixed sandbox environment (`PATH`, `HOME`,
+    /// `CARGO_HOME`, `CARGO_TARGET_DIR`, `TMPDIR`, `PWD`) and are recorded with it.
     pub env: BTreeMap<String, String>,
+    /// Wall-clock limit for the execution; must be nonzero. When it expires
+    /// the sandbox's process group is killed and the status is
+    /// [`ProcessStatus::TimedOut`].
     pub timeout: Duration,
+    /// Network policy; currently only [`NetworkAccess::Offline`] is accepted.
     pub network: NetworkAccess,
+    /// Existing host directory that receives the logs. It is not mounted into
+    /// the sandbox.
     pub workspace: PathBuf,
+    /// Log directory relative to `workspace`, created if missing. It must
+    /// contain no `..`, traverse no symlinks and stay outside `source`.
     pub log_dir: PathBuf,
+    /// Store in which the invocation is recorded (spec §10.2, `tool_invocation`):
+    /// as `running` before launch, then updated with the final status and
+    /// duration.
     pub store: Store,
+    /// Package the invocation is attributed to, which must already be in
+    /// `store`; `None` for invocations not tied to a node.
     pub package_id: Option<PackageId>,
+    /// Version of `program`, recorded as given (robigus does not probe it).
     pub tool_version: Option<String>,
 }
 
@@ -85,40 +124,70 @@ pub struct CommandSpec {
 /// `Signaled` is reserved for backends that can distinguish signal termination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessStatus {
+    /// The command finished with this exit code (126 or 127 if `program`
+    /// could not be executed, 128 + N if killed by signal N).
     Exited(i32),
+    /// Terminated by a signal; never reported by the bubblewrap backend.
     Signaled,
+    /// Killed after [`CommandSpec::timeout`] elapsed.
     TimedOut,
 }
 
 /// Result and host paths of the captured output streams.
 #[derive(Debug, Clone)]
 pub struct ProcessOutput {
+    /// How the command ended.
     pub status: ProcessStatus,
+    /// Host path of the captured standard output (`stdout.log` in this
+    /// execution's log directory).
     pub stdout_path: PathBuf,
+    /// Host path of the captured standard error (`stderr.log` in this
+    /// execution's log directory).
     pub stderr_path: PathBuf,
 }
 
 /// Failure to prepare, launch, or record an execution.
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
+    /// [`NetworkAccess::Allowlist`] was requested; rejected before anything
+    /// runs because the allowlisting proxy is not implemented yet.
     #[error("allowlisted network access is unavailable until the sandbox proxy is implemented")]
     NetworkUnavailable,
     /// Bubblewrap was selected, but setup or supervision did not complete.
     /// The command may already have run if the supervisor failed afterward.
     #[error("bubblewrap setup or supervision failed: {cause} (stderr log: {})", stderr_path.display())]
-    BwrapSetup { cause: String, stderr_path: PathBuf },
+    BwrapSetup {
+        /// What failed, possibly followed by a bounded excerpt of the stderr log.
+        cause: String,
+        /// Host path of the complete stderr log.
+        stderr_path: PathBuf,
+    },
+    /// The [`CommandSpec`] was rejected before launch; the message says why.
     #[error("invalid sandbox command: {0}")]
     InvalidCommand(String),
+    /// A host I/O operation failed: resolving paths, creating logs, or
+    /// waiting for the sandbox process.
     #[error("sandbox I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    /// Recording the invocation failed, or [`CommandSpec::package_id`] is not
+    /// in the store.
     #[error("failed to record sandbox invocation: {0}")]
     Store(#[from] StoreError),
 }
 
 /// Runs commands inside an established sandbox; never falls back to host execution.
+///
+/// Obtain one with [`establish_sandbox`], which has an example.
 #[async_trait]
 pub trait Sandbox: Send + Sync {
+    /// The mechanism this sandbox uses.
     fn mode(&self) -> SandboxMode;
+    /// Runs `command` to completion or timeout, capturing its output to
+    /// files and recording the invocation in [`CommandSpec::store`].
+    ///
+    /// A nonzero exit or a timeout is `Ok`; `Err` means the command was
+    /// rejected, or could not be set up, supervised or recorded. The command
+    /// never runs outside the sandbox.
     async fn run(&self, command: &CommandSpec) -> Result<ProcessOutput, SandboxError>;
 }
 
@@ -130,6 +199,53 @@ struct BwrapSandbox {
 /// Probes the selected mechanism and returns every failure when none works.
 /// This performs a real namespace setup, not just an executable lookup.
 /// The native mechanism is deliberately unavailable until WP-3.5.
+///
+/// Fails closed: bubblewrap counts as unavailable when robigus runs as root,
+/// `/usr/bin/bwrap` is missing or older than 0.11, or the probe fails, and
+/// there is never an unsandboxed fallback.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::collections::BTreeMap;
+/// use std::time::Duration;
+///
+/// use robigus::{
+///     CommandSpec, NetworkAccess, ProcessStatus, SandboxPreference, Store, establish_sandbox,
+/// };
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// // Requires unprivileged user namespaces and bubblewrap 0.11 or newer.
+/// let sandbox = establish_sandbox(SandboxPreference::Auto).await?;
+///
+/// let dir = tempfile::tempdir()?;
+/// let source = dir.path().join("source");
+/// let workspace = dir.path().join("workspace");
+/// std::fs::create_dir(&source)?;
+/// std::fs::create_dir(&workspace)?;
+/// let store = Store::open(&dir.path().join("analysis.db")).await?;
+///
+/// let output = sandbox
+///     .run(&CommandSpec {
+///         program: "/usr/bin/true".into(),
+///         args: Vec::new(),
+///         source,
+///         source_subdir: "".into(),
+///         env: BTreeMap::new(),
+///         timeout: Duration::from_secs(30),
+///         network: NetworkAccess::Offline,
+///         workspace,
+///         log_dir: "logs".into(),
+///         store,
+///         package_id: None,
+///         tool_version: None,
+///     })
+///     .await?;
+/// assert_eq!(output.status, ProcessStatus::Exited(0));
+/// # Ok(())
+/// # }
+/// ```
 pub async fn establish_sandbox(
     preference: SandboxPreference,
 ) -> Result<Box<dyn Sandbox>, SandboxUnavailable> {

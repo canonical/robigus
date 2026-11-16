@@ -31,7 +31,9 @@ mod snapshot_tests;
 /// (spec §15).
 #[derive(Debug, Clone)]
 pub struct Analysis {
+    /// The single metadata row.
     pub metadata: AnalysisMetadata,
+    /// The graph rebuilt from the package and edge tables, including roots.
     pub graph: DependencyGraph,
 }
 
@@ -45,11 +47,17 @@ pub struct Analysis {
 /// for example, Git references are serialized but do not affect equality.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AnalysisSnapshot {
+    /// The single metadata row.
     pub metadata: AnalysisMetadata,
+    /// Every package, with its targets, provides, and conflicts.
     pub nodes: Vec<SnapshotNode>,
+    /// Every dependency edge; unresolved edges have `to: None`.
     pub edges: Vec<SnapshotEdge>,
+    /// The packages marked as analysis roots, in package row order.
     pub roots: Vec<PackageId>,
+    /// Every analysis-plan row, root- or package-keyed.
     pub plans: Vec<SnapshotPlan>,
+    /// Every recorded tool execution.
     pub invocations: Vec<SnapshotInvocation>,
 }
 
@@ -138,41 +146,62 @@ impl AnalysisSnapshot {
 /// A graph node and its persisted package row ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotNode {
+    /// The `package.id` row ID; unique within a snapshot.
     pub id: i64,
+    /// The node, including its targets, provides, and conflicts.
     pub node: Node,
 }
 
 /// A resolved or unresolved graph edge and its persisted row ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotEdge {
+    /// The `dependency_edge.id` row ID; unique within a snapshot.
     pub id: i64,
+    /// The edge; its endpoints reference nodes by [`PackageId`].
     pub edge: Edge,
 }
 
 /// A persisted plan row, including its ID and last update timestamp.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotPlan {
+    /// The `analysis_plan.id` row ID.
     pub id: i64,
+    /// When the row was last written (RFC 3339, UTC), stamped by
+    /// [`Store::upsert_plan_rows`].
     pub updated_at: String,
+    /// The plan row itself.
     pub row: PlanRow,
 }
 
 /// A persisted tool invocation and its row ID.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotInvocation {
+    /// The `tool_invocation.id` row ID, as returned by
+    /// [`Store::begin_invocation`].
     pub id: i64,
+    /// The recorded invocation.
     pub invocation: ToolInvocation,
 }
 
 /// The single-row `metadata` table (spec §11.2).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AnalysisMetadata {
+    /// Version of robigus that wrote the analysis.
     pub robigus_version: String,
+    /// Name of the analyzed project.
     pub project_name: String,
+    /// Version of the analyzed project.
     pub project_version: String,
+    /// Kind of the project source, using the [`SourceKind::kind_name`]
+    /// spelling (for example `git`, `tarball`, or `path`).
     pub source_kind: String,
+    /// Where the project source came from: repository URL, tarball URL, or
+    /// filesystem path.
     pub source_uri: String,
+    /// Digest pinning the fetched source (resolved commit, archive SHA-256,
+    /// or tree digest); `''` when not recorded.
     pub source_digest: String,
+    /// The primary configuration that predicates were evaluated against.
     pub configuration: Configuration,
     /// Tool name → version, recorded for reproducibility (spec §10.2).
     pub toolchain: BTreeMap<String, String>,
@@ -183,7 +212,11 @@ pub struct AnalysisMetadata {
     /// The applied analysis options as JSON; typed when the `analyze`
     /// command lands (WP-2.3).
     pub options: serde_json::Value,
+    /// When the analysis was first written (RFC 3339, UTC). Taken from the
+    /// first [`Store::write_metadata`] call and preserved on later writes.
     pub created_at: String,
+    /// When the metadata was last written (RFC 3339, UTC). Always stamped
+    /// by [`Store::write_metadata`]; the value passed in is ignored.
     pub updated_at: String,
 }
 
@@ -191,14 +224,27 @@ pub struct AnalysisMetadata {
 /// scrubbed by the caller before recording.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolInvocation {
+    /// The package the tool ran for, which must already be stored; `None`
+    /// for invocations not tied to a node (for example toolchain probes).
     pub package_id: Option<PackageId>,
+    /// The tool that ran (for example `cargo metadata`).
     pub tool: String,
+    /// The full command line, program first.
     pub argv: Vec<String>,
+    /// The environment passed to the tool.
     pub env: BTreeMap<String, String>,
+    /// The tool's reported version, if known.
     pub tool_version: Option<String>,
+    /// The sandbox mechanism the tool ran under (for example `bwrap`).
     pub sandbox_mode: String,
+    /// Free-form outcome text. The bubblewrap sandbox records `running`
+    /// until [`Store::finish_invocation`], then `exit:<code>`, `signaled`,
+    /// `timeout`, or a setup/supervision error.
     pub exit_status: String,
+    /// When the tool was launched (RFC 3339).
     pub started_at: String,
+    /// Wall-clock run time in milliseconds; at most `i64::MAX`, or the
+    /// store rejects it.
     pub duration_ms: u64,
     /// Workspace-relative path to the full stdout/stderr capture.
     pub log_path: Option<String>,
@@ -209,26 +255,68 @@ pub struct ToolInvocation {
 /// integrity failures.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IntegrityReport {
+    /// The database's `PRAGMA user_version`. Informational: [`Store::open`]
+    /// has already rejected newer versions and migrated older ones.
     pub schema_version: u32,
+    /// Whether `PRAGMA foreign_key_check` reported no violations.
     pub foreign_keys_ok: bool,
     /// Duplicate identity groups, using PackageId semantics when reconstructable
     /// and SQL identity otherwise. Exact SQL duplicates are not counted twice.
     pub duplicate_identities: usize,
     /// Persisted edges that would merge with another edge during graph reconstruction.
+    /// Only computed when foreign keys, identities, and JSON columns are all
+    /// clean; otherwise `0`.
     pub duplicate_edges: usize,
+    /// Count of JSON (or predicate) column values that do not parse into
+    /// their model types. An edge row counts once, however many of its
+    /// columns are invalid.
     pub invalid_json_columns: usize,
     /// Rows whose ecosystem/source-kind cannot be parsed back.
     pub corrupt_identities: usize,
+    /// Packages breaking a §11.3 status invariant: a `Complete` node with a
+    /// non-`Complete` resolved dependency, a `Started` or `Error` node
+    /// without plan rows, or an `Error` node without a recorded error. A
+    /// package appears once per invariant it breaks.
     pub status_violations: Vec<PackageId>,
+    /// Human-readable descriptions of edge evidence exceeding its method's
+    /// confidence cap, and of edges with confidence outside `0..=100`.
     pub confidence_violations: Vec<String>,
+    /// Informational: unresolved edge count per requirement kind. Kinds
+    /// with no unresolved edges are absent.
     pub unresolved_requirements: BTreeMap<RequirementKind, usize>,
+    /// Informational: see [`DependencyGraph::cycles`]. Only computed under
+    /// the same conditions as `duplicate_edges`; otherwise empty.
     pub cycles: Vec<Vec<PackageId>>,
+    /// Informational: non-root packages with no incoming edge.
     pub orphans: Vec<PackageId>,
 }
 
 impl IntegrityReport {
     /// True when no integrity failure was found. Informational findings
     /// (cycles, orphans, unresolved requirements) do not affect this.
+    ///
+    /// The CLI's `check` command exits with code 3 when this is false.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use robigus::IntegrityReport;
+    ///
+    /// // `Default` has `foreign_keys_ok: false`, so it is not ok.
+    /// let mut report = IntegrityReport::default();
+    /// assert!(!report.is_ok());
+    ///
+    /// report.foreign_keys_ok = true;
+    /// assert!(report.is_ok());
+    ///
+    /// // Informational findings do not make the report fail...
+    /// report.cycles.push(Vec::new());
+    /// assert!(report.is_ok());
+    ///
+    /// // ...but integrity failures do.
+    /// report.invalid_json_columns = 1;
+    /// assert!(!report.is_ok());
+    /// ```
     pub fn is_ok(&self) -> bool {
         self.foreign_keys_ok
             && self.duplicate_identities == 0
@@ -432,6 +520,26 @@ impl Store {
     /// migrations, and applies the §11.1 pragmas. Opening a database with a
     /// newer schema version fails with [`StoreError::SchemaTooNew`] (CLI
     /// exit code 3).
+    ///
+    /// Missing parent directories are created. A file that is not a SQLite
+    /// database fails with [`StoreError::Sqlite`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use robigus::Store;
+    ///
+    /// let dir = tempfile::tempdir()?;
+    /// let store = Store::open(&dir.path().join("analyses/project.db")).await?;
+    ///
+    /// // A new database has no metadata yet and passes the integrity check.
+    /// assert!(store.metadata().await?.is_none());
+    /// assert!(store.check().await?.is_ok());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
         ensure_parent_dir(path)?;
         let path = path.to_path_buf();
@@ -460,7 +568,25 @@ impl Store {
         })
     }
 
-    /// Reads the analysis metadata row, if one has been written.
+    /// Reads the analysis metadata row, if one has been written. A stored
+    /// row whose JSON columns do not parse is [`StoreError::Corrupt`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let store = robigus::Store::open(std::path::Path::new("analysis.db")).await?;
+    /// match store.metadata().await? {
+    ///     Some(metadata) => println!(
+    ///         "{} {} from {}",
+    ///         metadata.project_name, metadata.project_version, metadata.source_uri
+    ///     ),
+    ///     None => println!("no analysis recorded yet"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn metadata(&self) -> Result<Option<AnalysisMetadata>, StoreError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -1132,7 +1258,44 @@ impl Store {
 
     /// Rebuilds the full [`Analysis`] (metadata + graph). Every JSON column
     /// is validated; parse failures and persisted graph records that would be
-    /// deduplicated during reconstruction are [`StoreError::Corrupt`].
+    /// deduplicated during reconstruction are [`StoreError::Corrupt`], as is
+    /// a database whose metadata row has not been written.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use robigus::{AnalysisMetadata, Configuration, Store};
+    /// use std::collections::BTreeMap;
+    ///
+    /// let dir = tempfile::tempdir()?;
+    /// let store = Store::open(&dir.path().join("analysis.db")).await?;
+    /// store
+    ///     .write_metadata(&AnalysisMetadata {
+    ///         robigus_version: "0.1.0".into(),
+    ///         project_name: "demo".into(),
+    ///         project_version: "1.0.0".into(),
+    ///         source_kind: "path".into(),
+    ///         source_uri: "/src/demo".into(),
+    ///         source_digest: String::new(),
+    ///         configuration: Configuration::default(),
+    ///         toolchain: BTreeMap::from([("cargo".into(), "1.93.1".into())]),
+    ///         network_mode: "offline".into(),
+    ///         sandbox_mode: "bwrap".into(),
+    ///         options: serde_json::json!({}),
+    ///         created_at: "2026-01-01T00:00:00Z".into(),
+    ///         updated_at: String::new(),
+    ///     })
+    ///     .await?;
+    ///
+    /// let analysis = store.load().await?;
+    /// assert_eq!(analysis.metadata.project_name, "demo");
+    /// assert!(!analysis.metadata.updated_at.is_empty()); // stamped by the store
+    /// assert_eq!(analysis.graph.node_count(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn load(&self) -> Result<Analysis, StoreError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -1202,6 +1365,27 @@ impl Store {
     /// Validates schema and graph well-formedness (spec §11.3). Informational
     /// findings (unresolved requirements, cycles, orphans) do not affect
     /// [`IntegrityReport::is_ok`].
+    ///
+    /// Findings are returned in the report, not as errors; `Err` means the
+    /// checks themselves could not run.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let store = robigus::Store::open(std::path::Path::new("analysis.db")).await?;
+    /// let report = store.check().await?;
+    /// if !report.is_ok() {
+    ///     eprintln!("integrity failures: {report:?}");
+    ///     std::process::exit(3);
+    /// }
+    /// for (kind, count) in &report.unresolved_requirements {
+    ///     println!("{count} unresolved {kind:?} requirement(s)");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn check(&self) -> Result<IntegrityReport, StoreError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {

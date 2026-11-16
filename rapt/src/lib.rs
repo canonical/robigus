@@ -1,5 +1,7 @@
 //! The `rapt` library: pure async Rust client and wrappers for querying the Ubuntu archive.
 
+#![warn(missing_docs)]
+
 pub mod archive;
 pub mod cache;
 pub mod cli;

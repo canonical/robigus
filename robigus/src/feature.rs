@@ -10,7 +10,9 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid feature expression '{input}': {reason}")]
 pub struct FeatureExprError {
+    /// The rejected input.
     pub input: String,
+    /// Why the input was rejected.
     pub reason: String,
 }
 
@@ -29,14 +31,50 @@ pub enum FeatureExpr {
     /// `feature` on the dependency `dep`, weakly only when `dep` is itself
     /// enabled.
     DepFeature {
+        /// The dependency whose feature is enabled.
         dep: String,
+        /// The feature enabled on `dep`.
         feature: String,
+        /// `true` for the weak `dep?/feature` form.
         weak: bool,
     },
 }
 
 impl FeatureExpr {
-    /// Parses a Cargo feature expression.
+    /// Parses a Cargo feature expression. [`Display`](fmt::Display) is its
+    /// inverse: a parsed expression displays as its input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FeatureExprError`] for empty input, empty names around
+    /// `dep:`, `/`, or `?`, and misplaced `?` or `/` characters (for example
+    /// `fo?o`, `foo//bar`, or `dep:foo/bar`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use robigus::FeatureExpr;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dep = FeatureExpr::parse("dep:foo")?;
+    /// assert_eq!(dep, FeatureExpr::Dep("foo".into()));
+    /// assert_eq!(dep.to_string(), "dep:foo");
+    ///
+    /// let weak = FeatureExpr::parse("foo?/bar")?;
+    /// assert_eq!(
+    ///     weak,
+    ///     FeatureExpr::DepFeature {
+    ///         dep: "foo".into(),
+    ///         feature: "bar".into(),
+    ///         weak: true,
+    ///     },
+    /// );
+    /// assert_eq!(weak.to_string(), "foo?/bar");
+    ///
+    /// assert!(FeatureExpr::parse("dep:foo/bar").is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn parse(input: &str) -> Result<Self, FeatureExprError> {
         let err = |reason: &str| FeatureExprError {
             input: input.to_string(),

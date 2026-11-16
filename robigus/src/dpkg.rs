@@ -16,14 +16,70 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
+/// A Debian package version, `[epoch:]upstream_version[-debian_revision]`.
+///
+/// Ordering, equality, and hashing follow dpkg semantics (Debian Policy
+/// §5.6.12), so structurally different versions such as `1.02` and `1.2`
+/// are equal. [`Display`](fmt::Display) reproduces the parsed components
+/// verbatim (an epoch of `0` is omitted); see [`DpkgVersion::canonical_form`]
+/// for the normalized spelling.
+///
+/// # Examples
+///
+/// ```
+/// use robigus::dpkg::DpkgVersion;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// // Epochs dominate.
+/// assert!(DpkgVersion::parse("1:1.0")? > DpkgVersion::parse("2.0")?);
+/// // `~` sorts before the end of the string: pre-releases come first.
+/// assert!(DpkgVersion::parse("1.0~rc1")? < DpkgVersion::parse("1.0")?);
+/// // Digit chunks compare numerically.
+/// let padded = DpkgVersion::parse("1.02")?;
+/// assert_eq!(padded, DpkgVersion::parse("1.2")?);
+/// assert_eq!(padded.to_string(), "1.02");
+/// assert_eq!(padded.canonical_form(), "1.2");
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DpkgVersion {
+    /// The epoch; `0` when omitted.
     pub epoch: u32,
+    /// The upstream version: everything between the epoch and the last `-`.
     pub upstream_version: String,
+    /// The Debian revision after the last `-`; empty when absent.
     pub debian_revision: String,
 }
 
 impl DpkgVersion {
+    /// Parses `[epoch:]upstream_version[-debian_revision]`, ignoring
+    /// surrounding whitespace. The epoch is the text before the first `:`
+    /// and the revision is the text after the last `-`.
+    ///
+    /// Fails with a [`DpkgError`] for an empty input, a non-numeric epoch, an
+    /// empty upstream version, or an empty revision after a trailing `-`.
+    /// Characters are not otherwise validated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use robigus::dpkg::DpkgVersion;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let version = DpkgVersion::parse("2:1.18.0-1ubuntu1")?;
+    /// assert_eq!(version.epoch, 2);
+    /// assert_eq!(version.upstream_version, "1.18.0");
+    /// assert_eq!(version.debian_revision, "1ubuntu1");
+    ///
+    /// // The revision splits at the last hyphen.
+    /// assert_eq!(DpkgVersion::parse("1.0-rc-2")?.upstream_version, "1.0-rc");
+    ///
+    /// assert!(DpkgVersion::parse("x:1.0").is_err());
+    /// assert!(DpkgVersion::parse("1.0-").is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn parse(s: &str) -> Result<Self, DpkgError> {
         let s = s.trim();
         if s.is_empty() {

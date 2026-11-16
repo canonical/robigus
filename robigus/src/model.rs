@@ -27,17 +27,38 @@ use walkdir::WalkDir;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SourceKind {
     /// crates.io or alternative Cargo sparse/git registries
-    CargoRegistry { index_url: Url },
+    CargoRegistry {
+        /// Registry index URL, e.g. `https://index.crates.io/`.
+        index_url: Url,
+    },
     /// Direct Git checkout with precise tree reference
-    Git { url: Url, reference: GitReference },
+    Git {
+        /// Repository URL; part of the source identity.
+        url: Url,
+        /// The branch, tag, or revision that was requested. Recorded but not
+        /// part of the identity; the resolved commit is [`SourceId::precise`].
+        reference: GitReference,
+    },
     /// Local filesystem path
-    Path { path: PathBuf },
+    Path {
+        /// Directory containing the source tree. Reproducibility comes from
+        /// the tree digest in [`SourceId::precise`] (see [`path_tree_digest`]).
+        path: PathBuf,
+    },
     /// Direct download of a source tarball. `digest` is the trusted checksum
     /// when one was supplied; otherwise the computed digest is recorded with
     /// `unverified` provenance (spec §7.2).
-    Tarball { url: Url, digest: Option<String> },
+    Tarball {
+        /// Download URL of the archive.
+        url: Url,
+        /// Trusted SHA-256 checksum, if one was supplied. Used as the
+        /// identity digest when [`SourceId::precise`] is unset.
+        digest: Option<String>,
+    },
     /// Ubuntu APT repository archive
     Apt {
+        /// Base URL of the archive mirror, e.g.
+        /// `http://archive.ubuntu.com/ubuntu`.
         mirror_url: Url,
         /// Series and pocket, e.g. `noble` or `noble-updates`.
         suite: Suite,
@@ -75,11 +96,19 @@ impl SourceKind {
     }
 }
 
+/// The git ref a [`SourceKind::Git`] source was requested by.
+///
+/// This is provenance only: it is stored in `package.source_reference` but is
+/// not part of the [`SourceId`] identity, which uses the resolved commit.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum GitReference {
+    /// A named branch.
     Branch(String),
+    /// A named tag.
     Tag(String),
+    /// An explicit revision (commit hash or other rev-spec).
     Rev(String),
+    /// The remote's default branch (`HEAD`).
     DefaultBranch,
 }
 
@@ -97,6 +126,7 @@ pub enum GitReference {
 /// - every other source compares structurally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceId {
+    /// Where the source comes from and how it is fetched.
     pub kind: SourceKind,
     /// Exact hash, commit ID, or cryptographic digest locking this source instance
     pub precise: Option<String>,
@@ -205,9 +235,14 @@ impl GitReference {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Ecosystem {
+    /// Cargo crates; versions are SemVer.
     Rust,
+    /// Ubuntu/Debian binary or source packages; versions are dpkg versions.
     Ubuntu,
+    /// Native C/C++ system libraries outside a package archive; versions
+    /// are opaque.
     SystemC,
+    /// Any other ecosystem; versions are opaque.
     Generic,
 }
 
@@ -254,8 +289,12 @@ impl fmt::Display for Ecosystem {
 /// `dpkg` and `solver`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum PackageVersion {
+    /// A SemVer version, used by [`Ecosystem::Rust`].
     SemVer(Version),
+    /// A Debian `[epoch:]upstream[-revision]` version, used by
+    /// [`Ecosystem::Ubuntu`].
     Debian(DpkgVersion),
+    /// Uninterpreted version text, compared only for identity.
     Opaque(String),
 }
 
@@ -291,11 +330,44 @@ impl fmt::Display for PackageVersion {
 
 /// PackageId: A globally unique, immutable identifier for a concrete package instance (Name + Version + SourceId).
 /// Gives the concrete, resolved identity of a single package.
+///
+/// All four fields participate in identity; source identity follows
+/// [`SourceId`]'s rules. `Display` renders `name version (ecosystem/kind)`.
+///
+/// # Examples
+///
+/// ```
+/// use robigus::model::{Ecosystem, PackageVersion};
+/// use robigus::{PackageId, SourceId, SourceKind};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let id = PackageId {
+///     name: "serde".into(),
+///     version: PackageVersion::from_stored_text(Ecosystem::Rust, "1.0.219"),
+///     source_id: SourceId {
+///         kind: SourceKind::CargoRegistry {
+///             index_url: "https://index.crates.io/".parse()?,
+///         },
+///         precise: None,
+///     },
+///     ecosystem: Ecosystem::Rust,
+/// };
+/// assert_eq!(id.to_string(), "serde 1.0.219 (rust/cargo-registry)");
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PackageId {
+    /// Package name as known in its ecosystem (crate name, Debian package
+    /// name, library name, ...).
     pub name: String,
+    /// The concrete version; its variant should match what `ecosystem`
+    /// parses back to (see [`PackageVersion::from_stored_text`]), or the
+    /// store rejects the id.
     pub version: PackageVersion,
+    /// Where this instance comes from.
     pub source_id: SourceId,
+    /// The ecosystem governing version parsing and linking semantics.
     pub ecosystem: Ecosystem,
 }
 
@@ -339,6 +411,24 @@ impl MachineArch {
 
     /// `All` expands to every supported architecture; other variants yield
     /// themselves unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use robigus::MachineArch;
+    /// use ubuntu_info_rust::Architecture;
+    ///
+    /// assert_eq!(MachineArch::All.expand().len(), Architecture::ALL.len());
+    ///
+    /// let arm64 = MachineArch::Ubuntu(Architecture::Arm64);
+    /// assert_eq!(arm64.expand(), vec![arm64.clone()]);
+    ///
+    /// // Unsupported architectures are kept as stubs, never expanded.
+    /// let mips = MachineArch::Unsupported("mips".into());
+    /// assert_eq!(mips.expand(), vec![mips.clone()]);
+    /// assert!(!mips.is_supported());
+    /// assert_eq!(mips.to_string(), "mips_unsupported");
+    /// ```
     pub fn expand(&self) -> Vec<Self> {
         match self {
             Self::All => Architecture::ALL
@@ -371,24 +461,33 @@ impl fmt::Display for MachineArch {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TargetKind {
     /// Rust rlib/proc-macro/dylib
-    RustLib { proc_macro: bool },
+    RustLib {
+        /// True for a `proc-macro` crate, which runs on the build host.
+        proc_macro: bool,
+    },
     /// Executable binary
     Binary,
     /// System shared library (.so, .dylib, .dll) with SONAME
-    SharedLibrary { soname: Option<String> },
+    SharedLibrary {
+        /// The library's SONAME (e.g. `libz.so.1`), when known.
+        soname: Option<String>,
+    },
     /// Static library archive (.a)
     StaticLibrary,
     /// C/C++ Header include directory
     Headers,
-    /// Pkg-config `.pc` integration
+    /// Pkg-config `.pc` integration; carries the module name.
     PkgConfig(String),
 }
 
 /// Target: What artifacts the package produces or provides (libraries, binaries, C/C++ headers, dynamic shared objects, system tools).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
+    /// Target name (crate target, binary, library, or module name).
     pub name: String,
+    /// What kind of artifact this is.
     pub kind: TargetKind,
+    /// Workspace-relative path of the target's source or artifact, if known.
     pub path: Option<PathBuf>,
 }
 
@@ -396,12 +495,16 @@ pub struct Target {
 /// General version constraint solver compatibility layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VersionConstraint {
+    /// A Cargo/SemVer requirement such as `^1.2` or `>=0.4, <0.6`.
     SemVer(VersionReq),
     /// Debian comparison: e.g. ">= 2:1.18.0-1"
     Debian {
+        /// The relational operator.
         op: DebianOperator,
+        /// The dpkg version text compared against, e.g. `2:1.18.0-1`.
         target_version: String,
     },
+    /// No version constraint; any version satisfies it.
     Any,
 }
 
@@ -449,12 +552,18 @@ impl VersionConstraint {
     }
 }
 
+/// A Debian version relation operator (Debian Policy §7.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DebianOperator {
+    /// `=`: exactly equal.
     Eq,
+    /// `<<`: strictly earlier.
     Lt,
+    /// `<=`: earlier or equal.
     Le,
+    /// `>>`: strictly later.
     Gt,
+    /// `>=`: later or equal.
     Ge,
 }
 
@@ -471,6 +580,8 @@ impl DebianOperator {
     }
 }
 
+/// The category a dependency serves (spec §3). Edges and declarations carry
+/// a *set* of these, since one dependency may serve several categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyKind {
@@ -489,29 +600,63 @@ pub enum DependencyKind {
 /// Expresses a dependency relationship in a manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dependency {
+    /// Name of the depended-on package as written in the manifest.
     pub name: String,
+    /// Ecosystem the dependency is resolved in.
     pub ecosystem: Ecosystem,
+    /// Acceptable versions; [`VersionConstraint::Any`] when unconstrained.
     pub version_req: VersionConstraint,
+    /// An explicit source (git, path, alternative registry), or `None` for
+    /// the ecosystem's default source.
     pub source_id: Option<SourceId>,
     /// The categories this dependency serves; a dependency may appear in
     /// several (spec §3).
     pub kinds: BTreeSet<DependencyKind>,
+    /// True when the dependency is only pulled in by enabling a feature
+    /// (Cargo `optional = true`).
     pub optional: bool,
     /// Activation condition (spec §4); `Predicate::TRUE` is always active.
     pub predicate: Predicate,
     /// Cargo feature expressions (`foo`, `foo?`, `dep:foo`, `foo?/bar`).
     pub features: BTreeSet<FeatureExpr>,
+    /// Whether the dependency's `default` feature is enabled (Cargo
+    /// `default-features`).
     pub default_features: bool,
 }
 
 // 6. Analysis Lifecycle
 /// Per-node state of the dependency analysis (spec §5.1, §7.7).
+///
+/// Serialized (and stored) exactly as `Not_Started`, `Started`, `Complete`,
+/// and `Error`; `Display` uses the same spelling.
+///
+/// # Examples
+///
+/// ```
+/// use robigus::AnalysisStatus;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// assert_eq!(serde_json::to_string(&AnalysisStatus::NotStarted)?, "\"Not_Started\"");
+/// assert_eq!(AnalysisStatus::NotStarted.to_string(), "Not_Started");
+///
+/// let status: AnalysisStatus = serde_json::from_str("\"Complete\"")?;
+/// assert_eq!(status, AnalysisStatus::Complete);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AnalysisStatus {
+    /// Initial state: no analysis has been performed for this node.
     #[serde(rename = "Not_Started")]
     NotStarted,
+    /// Analysis has begun but is not complete. Persisted before work starts
+    /// so an interrupted run can resume.
     Started,
+    /// Analysis is done, and every resolved dependency edge leads to a node
+    /// that is also `Complete` (unresolved requirements are exempt).
     Complete,
+    /// An error must be resolved before analysis can complete; the cause is
+    /// recorded in the node's plan rows ([`PlanRow::error`]).
     Error,
 }
 
@@ -569,10 +714,15 @@ macro_rules! stored_names {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalyzerId {
+    /// Rust/Cargo projects, including `build.rs` native-code discovery.
     Cargo,
+    /// C/C++ projects built with CMake, Meson, Autotools, or Make.
     Cpp,
+    /// Python projects (detected only in v1).
     Python,
+    /// Go modules (detected only in v1).
     Go,
+    /// Node.js packages (detected only in v1).
     Node,
 }
 
@@ -622,10 +772,15 @@ stored_names!(AnalysisStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildSystem {
+    /// A Cargo `build.rs` script compiling or linking native code.
     BuildScript,
+    /// CMake (`CMakeLists.txt`).
     Cmake,
+    /// Meson (`meson.build`).
     Meson,
+    /// GNU Autotools (`configure.ac` or a generated `configure`).
     Autotools,
+    /// Plain Make (`GNUmakefile`, `makefile`, or `Makefile`).
     Make,
 }
 
@@ -641,10 +796,16 @@ stored_names!(BuildSystem {
 /// [`AnalysisStatus`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum PlanStatus {
+    /// Planned but not yet attempted.
     Pending,
+    /// Currently being executed.
     Running,
+    /// Finished successfully.
     Complete,
+    /// Attempted and failed; see [`PlanRow::error`].
     Failed,
+    /// Deliberately not run, e.g. for an analyzer that is detected but not
+    /// shipped (see [`AnalyzerId::is_shipped`]).
     Skipped,
 }
 
@@ -666,6 +827,7 @@ stored_names!(PlanStatus {
 pub enum PlanSubject {
     /// Workspace-relative root directory; empty for the top level.
     Root(PathBuf),
+    /// A package node in the dependency graph.
     Package(PackageId),
 }
 
@@ -673,14 +835,22 @@ pub enum PlanSubject {
 /// by `(subject, analyzer, strategy, build_system)`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PlanRow {
+    /// The root directory or package this row analyzes (part of the key).
     pub subject: PlanSubject,
+    /// The analyzer that executes the row (part of the key).
     pub analyzer: AnalyzerId,
+    /// How the analyzer examines the subject (part of the key).
     pub strategy: AnalysisStrategy,
+    /// The build system targeted, or `None` for the analyzer's own manifest
+    /// (part of the key; stored as `''` when `None`).
     pub build_system: Option<BuildSystem>,
+    /// Where the row is in its lifecycle.
     pub status: PlanStatus,
+    /// How many times execution has been attempted.
     pub attempts: u32,
     /// The recorded cause of a failure; required for a node marked `Error`.
     pub error: Option<String>,
+    /// Free-form supplementary information, such as a pointer to a log.
     pub detail: Option<String>,
 }
 
@@ -756,24 +926,37 @@ impl RequirementKind {
 /// The declared dependency need, independent of any resolved node (spec §5.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Requirement {
+    /// What sort of thing is required; determines how `name` is read.
     pub kind: RequirementKind,
     /// Crate name, pkg-config module, header path, soname, or tool name.
     pub name: String,
+    /// Acceptable versions, or `None` when the declaration states none.
     pub version_req: Option<VersionConstraint>,
 }
 
 // 8. Evidence and Confidence
+/// How a piece of [`Evidence`] was obtained (spec §5.3). Each method has a
+/// confidence cap, see [`EvidenceMethod::max_confidence`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceMethod {
+    /// Declared in a package manifest (e.g. `Cargo.toml`).
     Manifest,
+    /// Pinned in a lockfile (e.g. `Cargo.lock`).
     Lockfile,
+    /// Found in a build script such as `build.rs`.
     BuildScript,
+    /// Reported by ecosystem tooling run in the sandbox.
     ToolOutput,
+    /// Found by scanning source files (e.g. `#include` lines).
     SourceScan,
+    /// Taken from README or build instructions.
     Documentation,
+    /// Observed while executing a build or configure step.
     BuildObservation,
+    /// Produced by an LLM sub-agent; capped at tier L3.
     LlmSubAgent,
+    /// Supplied or corrected manually by a person.
     HumanOverride,
 }
 
@@ -864,19 +1047,29 @@ impl fmt::Display for Confidence {
 pub struct SourceLocation {
     /// Workspace-relative file path.
     pub path: PathBuf,
+    /// First line of the anchored span, if known.
     pub start_line: Option<u64>,
+    /// Last line of the anchored span, if known.
     pub end_line: Option<u64>,
 }
 
+/// One record supporting a claim such as an edge (spec §5.3). Evidence is
+/// retained and merged, never discarded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
+    /// How the evidence was obtained.
     pub method: EvidenceMethod,
+    /// Confidence in this record; should not exceed the method's cap (see
+    /// [`Evidence::violates_cap`]).
     pub confidence: Confidence,
+    /// Where in the source tree the claim is anchored, if anywhere.
     pub location: Option<SourceLocation>,
+    /// Free-form explanation of what was observed.
     pub detail: Option<String>,
 }
 
 impl Evidence {
+    /// The qualitative tier of [`Evidence::confidence`].
     pub fn tier(&self) -> ConfidenceTier {
         self.confidence.tier()
     }
@@ -891,14 +1084,21 @@ impl Evidence {
 /// L0 0–19, L1 20–39, L2 40–59, L3 60–79, L4 80–100.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConfidenceTier {
+    /// 0–19: unsupported guess; must not be persisted as sole evidence.
     L0,
+    /// 20–39: documentation or naming heuristic only.
     L1,
+    /// 40–59: source scan with unverified anchors.
     L2,
+    /// 60–79: verified anchor or sandboxed tool output, not independently
+    /// cross-checked.
     L3,
+    /// 80–100: cross-validated; two independent methods agree.
     L4,
 }
 
 impl ConfidenceTier {
+    /// The tier for a raw score; values above 100 map to [`ConfidenceTier::L4`].
     pub fn from_confidence(confidence: u8) -> Self {
         match confidence {
             0..=19 => Self::L0,
@@ -914,29 +1114,38 @@ impl ConfidenceTier {
 /// A virtual package provided by a node (spec §5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provide {
+    /// Name of the virtual package.
     pub name: String,
+    /// Version provided, or `None` for an unversioned provide.
     pub version: Option<PackageVersion>,
 }
 
 /// A conflict declared by a node (spec §5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conflict {
+    /// Name of the conflicting package.
     pub name: String,
+    /// Versions that conflict, or `None` for every version.
     pub version_req: Option<VersionConstraint>,
 }
 
 /// A concrete package instance in the graph (spec §5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
+    /// The node's identity; the graph holds at most one node per id.
     pub id: PackageId,
     /// Workspace-relative source directory, if the node exists in the
     /// analysis tree.
     pub path: Option<PathBuf>,
+    /// Analysis progress for this node.
     pub status: AnalysisStatus,
     /// Features unified across the graph (Cargo resolver v2 semantics).
     pub active_features: BTreeSet<String>,
+    /// Artifacts the package produces or provides.
     pub targets: Vec<Target>,
+    /// Virtual packages this node provides.
     pub provides: Vec<Provide>,
+    /// Packages this node declares a conflict with.
     pub conflicts: Vec<Conflict>,
 }
 
@@ -958,16 +1167,20 @@ impl Node {
 /// A dependency relationship between nodes (spec §5.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edge {
+    /// The dependent package.
     pub from: PackageId,
     /// `None` = unresolved requirement preserved for Phase 2.
     pub to: Option<PackageId>,
+    /// The declared need this edge satisfies; part of the edge identity.
     pub requirement: Requirement,
     /// The categories this dependency serves; a dependency may appear in
     /// several (spec §3).
     pub kinds: BTreeSet<DependencyKind>,
     /// Activation condition; `Predicate::TRUE` is always active.
     pub predicate: Predicate,
+    /// Confidence in the edge: the maximum over its evidence.
     pub confidence: Confidence,
+    /// Every record supporting the edge, merged without duplicates.
     pub evidence: Vec<Evidence>,
 }
 
@@ -975,6 +1188,81 @@ pub struct Edge {
 /// resolved edges plus a side list for unresolved requirements, which have no
 /// target node to attach to. Unresolved requirements map to
 /// `dependency_edge` rows with a NULL `to_package_id` in the store (§11.2).
+///
+/// Nodes are keyed by [`PackageId`]; edges are deduplicated by identity and
+/// merged (see [`DependencyGraph::add_edge`]).
+///
+/// # Examples
+///
+/// ```
+/// use robigus::model::{Confidence, Ecosystem, PackageVersion};
+/// use robigus::{
+///     AnalysisStatus, DependencyGraph, DependencyKind, Edge, Node, PackageId, Predicate,
+///     Requirement, RequirementKind, SourceId, SourceKind,
+/// };
+/// use std::collections::BTreeSet;
+///
+/// fn crate_id(name: &str) -> PackageId {
+///     PackageId {
+///         name: name.into(),
+///         version: PackageVersion::from_stored_text(Ecosystem::Rust, "1.0.0"),
+///         source_id: SourceId {
+///             kind: SourceKind::Path { path: format!("/src/{name}").into() },
+///             precise: None,
+///         },
+///         ecosystem: Ecosystem::Rust,
+///     }
+/// }
+///
+/// let app = crate_id("app");
+/// let log = crate_id("log");
+/// let mut graph = DependencyGraph::new();
+/// graph.add_root(app.clone());
+/// graph.add_node(Node::new(app.clone()));
+///
+/// let edge = |kind, confidence| Edge {
+///     from: app.clone(),
+///     to: Some(log.clone()),
+///     requirement: Requirement {
+///         kind: RequirementKind::Crate,
+///         name: "log".into(),
+///         version_req: None,
+///     },
+///     kinds: BTreeSet::from([kind]),
+///     predicate: Predicate::TRUE,
+///     confidence: Confidence::new(confidence),
+///     evidence: Vec::new(),
+/// };
+/// graph.add_edge(edge(DependencyKind::Normal, 60));
+/// // Same `from`, `to`, requirement, and predicate: merged, not duplicated.
+/// graph.add_edge(edge(DependencyKind::Build, 90));
+///
+/// // A requirement with no target node is kept on the side for Phase 2.
+/// graph.add_edge(Edge {
+///     to: None,
+///     requirement: Requirement {
+///         kind: RequirementKind::PkgConfig,
+///         name: "zlib".into(),
+///         version_req: None,
+///     },
+///     ..edge(DependencyKind::Normal, 40)
+/// });
+///
+/// // `log` was inserted as a placeholder node.
+/// assert_eq!(graph.node_count(), 2);
+/// assert_eq!(graph.node(&log).map(|n| n.status), Some(AnalysisStatus::NotStarted));
+///
+/// assert_eq!(graph.edge_count(), 2);
+/// assert_eq!(graph.unresolved().len(), 1);
+/// let resolved = graph.edges_to(&log);
+/// assert_eq!(resolved.len(), 1);
+/// assert_eq!(
+///     resolved[0].kinds,
+///     BTreeSet::from([DependencyKind::Normal, DependencyKind::Build])
+/// );
+/// assert_eq!(resolved[0].confidence.value(), 90);
+/// assert!(graph.cycles().is_empty());
+/// ```
 #[derive(Debug, Default, Clone)]
 pub struct DependencyGraph {
     graph: StableDiGraph<Node, Edge>,
@@ -984,6 +1272,7 @@ pub struct DependencyGraph {
 }
 
 impl DependencyGraph {
+    /// An empty graph with no nodes, edges, or roots.
     pub fn new() -> Self {
         Self::default()
     }
@@ -993,6 +1282,8 @@ impl DependencyGraph {
         self.roots.insert(id);
     }
 
+    /// The ids marked with [`DependencyGraph::add_root`]. A root need not
+    /// have a node in the graph.
     pub fn roots(&self) -> &BTreeSet<PackageId> {
         &self.roots
     }
@@ -1003,6 +1294,40 @@ impl DependencyGraph {
     /// [`DependencyGraph::node_mut`] (in memory) or `Store::update_status`
     /// (persisted), mirroring the store (spec §22.19). Re-discovering a
     /// `Complete` dependency therefore never resets it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use robigus::{AnalysisStatus, DependencyGraph, Node};
+    /// # use robigus::model::{Ecosystem, PackageVersion};
+    /// # use robigus::{PackageId, SourceId, SourceKind};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let id = PackageId {
+    /// #     name: "zlib".into(),
+    /// #     version: PackageVersion::Opaque("1.3".into()),
+    /// #     source_id: SourceId {
+    /// #         kind: SourceKind::Path { path: "/src/zlib".into() },
+    /// #         precise: None,
+    /// #     },
+    /// #     ecosystem: Ecosystem::SystemC,
+    /// # };
+    /// let mut graph = DependencyGraph::new();
+    /// graph.add_node(Node::new(id.clone()));
+    /// graph.node_mut(&id).ok_or("missing node")?.status = AnalysisStatus::Complete;
+    ///
+    /// // Re-discovering the package replaces its payload but keeps its status.
+    /// let mut rediscovered = Node::new(id.clone());
+    /// rediscovered.path = Some("third_party/zlib".into());
+    /// graph.add_node(rediscovered);
+    ///
+    /// let node = graph.node(&id).ok_or("missing node")?;
+    /// assert_eq!(graph.node_count(), 1);
+    /// assert_eq!(node.status, AnalysisStatus::Complete);
+    /// assert_eq!(node.path.as_deref(), Some(std::path::Path::new("third_party/zlib")));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn add_node(&mut self, mut node: Node) -> NodeIndex {
         if let Some(&ix) = self.index.get(&node.id) {
             node.status = self.graph[ix].status;
@@ -1023,10 +1348,14 @@ impl DependencyGraph {
         self.add_node(Node::new(id.clone()))
     }
 
+    /// The node for `id`, if present.
     pub fn node(&self, id: &PackageId) -> Option<&Node> {
         self.index.get(id).map(|&ix| &self.graph[ix])
     }
 
+    /// Mutable access to the node for `id`, if present; the only in-memory
+    /// way to change a node's `status`. Do not change the node's `id`: the
+    /// graph's index is keyed by it and would no longer match.
     pub fn node_mut(&mut self, id: &PackageId) -> Option<&mut Node> {
         self.index
             .get(id)
@@ -1034,6 +1363,8 @@ impl DependencyGraph {
             .map(move |ix| &mut self.graph[ix])
     }
 
+    /// Number of nodes, including placeholder nodes created by
+    /// [`DependencyGraph::add_edge`].
     pub fn node_count(&self) -> usize {
         self.graph.node_count()
     }
@@ -1169,10 +1500,14 @@ fn merge_edge_weights(existing: &mut Edge, incoming: &Edge) {
 
 // 10. Packages and Workspaces
 
+/// The parsed, ecosystem-neutral content of a package manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
+    /// Identity of the package the manifest describes.
     pub package_id: PackageId,
+    /// Declared dependencies, before resolution to graph nodes.
     pub dependencies: Vec<Dependency>,
+    /// Artifacts the package declares.
     pub targets: Vec<Target>,
     /// Feature declarations (`[features]`): feature name → the feature
     /// expressions it enables.
@@ -1181,9 +1516,12 @@ pub struct Manifest {
     pub system_metadata: BTreeMap<String, String>,
 }
 
+/// A package's manifest together with the directory it was read from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
+    /// The package's parsed manifest.
     pub manifest: Manifest,
+    /// Directory containing the manifest and package sources.
     pub root_dir: PathBuf,
 }
 
@@ -1193,7 +1531,34 @@ pub struct Package {
 /// to make local-path analyses reproducible.
 ///
 /// Regular files and symlinks participate; other entry types and empty
-/// directories do not. Non-UTF-8 file names are hashed lossily.
+/// directories do not. Non-UTF-8 file names are hashed lossily. Symlinks are
+/// not followed: their target path is hashed instead of the target content.
+///
+/// Returns the digest as 64 lowercase hex characters.
+///
+/// # Errors
+///
+/// Fails with a fetch error if `root` cannot be canonicalized, the tree
+/// cannot be walked, or an entry cannot be read.
+///
+/// # Examples
+///
+/// ```
+/// use robigus::path_tree_digest;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let dir = tempfile::tempdir()?;
+/// std::fs::write(dir.path().join("a.txt"), b"hello")?;
+///
+/// let digest = path_tree_digest(dir.path())?;
+/// assert_eq!(digest.len(), 64);
+/// assert_eq!(path_tree_digest(dir.path())?, digest);
+///
+/// std::fs::write(dir.path().join("a.txt"), b"changed")?;
+/// assert_ne!(path_tree_digest(dir.path())?, digest);
+/// # Ok(())
+/// # }
+/// ```
 pub fn path_tree_digest(root: &Path) -> Result<String, RobigusError> {
     let root = root.canonicalize().map_err(FetchError::from)?;
     let mut entries: Vec<(String, PathBuf, bool)> = Vec::new();

@@ -16,7 +16,29 @@ use crate::model::{
 
 // 1. Version Ordering and Constraint Evaluation
 /// Abstract matching engine for version requirements.
+///
+/// # Examples
+///
+/// ```
+/// use robigus::VersionConstraint;
+/// use robigus::model::{DebianOperator, PackageVersion};
+/// use robigus::solver::ConstraintChecker;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let at_least_1_0 = VersionConstraint::Debian {
+///     op: DebianOperator::Ge,
+///     target_version: "1.0".into(),
+/// };
+/// assert!(at_least_1_0.matches(&PackageVersion::Debian("1.0-1".parse()?)));
+/// assert!(!at_least_1_0.matches(&PackageVersion::Debian("1.0~rc1".parse()?)));
+/// // Cross-ecosystem comparisons never match.
+/// assert!(!at_least_1_0.matches(&PackageVersion::SemVer("1.0.0".parse()?)));
+/// # Ok(())
+/// # }
+/// ```
 pub trait ConstraintChecker: Send + Sync {
+    /// Whether `version` satisfies this requirement. Versions from a
+    /// different ecosystem than the requirement never match.
     fn matches(&self, version: &PackageVersion) -> bool;
 }
 
@@ -72,12 +94,35 @@ pub enum ConflictDomain {
 /// major.minor.patch — matching Cargo's semver-compatibility rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SemverCompatKey {
+    /// The major version (`0` for pre-1.0 versions).
     pub major: u64,
+    /// The minor version, set only when `major` is `0`.
     pub minor: Option<u64>,
+    /// The patch version, set only when `major` and `minor` are both `0`.
     pub patch: Option<u64>,
 }
 
 impl SemverCompatKey {
+    /// The compatibility bucket of `version`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use robigus::solver::SemverCompatKey;
+    /// use semver::Version;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let key = |v: &str| -> Result<SemverCompatKey, semver::Error> {
+    ///     Ok(SemverCompatKey::of(&Version::parse(v)?))
+    /// };
+    /// assert_eq!(key("1.2.3")?, key("1.9.0")?);
+    /// // Pre-1.0 versions key by major.minor: Cargo treats 0.1 and 0.2 as incompatible.
+    /// assert_ne!(key("0.1.0")?, key("0.2.0")?);
+    /// assert_eq!(key("0.1.0")?, key("0.1.9")?);
+    /// assert_ne!(key("0.0.1")?, key("0.0.2")?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn of(version: &Version) -> Self {
         if version.major > 0 {
             Self {
@@ -101,12 +146,17 @@ impl SemverCompatKey {
     }
 }
 
+/// Phase 2 seam: decides which packages may coexist in one solution (spec
+/// §9). Unused by the Phase 1 graph expander.
 pub trait ConflictPolicy: Send + Sync {
     /// Maps a package to its isolation domain. Packages in the same domain
     /// with conflicting versions trigger backtracking or a solver error.
     fn domain_for(&self, pkg: &PackageId) -> ConflictDomain;
 }
 
+/// The built-in [`ConflictPolicy`]: Rust crates with SemVer versions coexist
+/// side by side per [`SemverCompatKey`]; every other package (including Rust
+/// crates without a SemVer version) is a [`ConflictDomain::Singleton`].
 pub struct DefaultConflictPolicy;
 
 impl ConflictPolicy for DefaultConflictPolicy {
@@ -127,18 +177,25 @@ impl ConflictPolicy for DefaultConflictPolicy {
 /// A candidate package that satisfies an edge search.
 #[derive(Debug, Clone)]
 pub struct CandidateSummary {
+    /// The candidate package's identity.
     pub package_id: PackageId,
+    /// The candidate's direct dependencies.
     pub dependencies: Vec<Dependency>,
     /// Flags whether this package is already pulled/cached or available locally
     pub is_available_locally: bool,
 }
 
+/// A failure reported by a [`DependencyProvider`].
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
+    /// The provider could not be queried; carries a human-readable cause.
     #[error("failed to query source provider: {0}")]
     ProviderError(String),
 }
 
+/// Phase 2 seam: the package-metadata source a CDCL solver (`pubgrub` or
+/// `resolvo`) queries for candidates and their dependencies (spec §9, §15).
+/// Phase 1 does not use it; Cargo nodes are resolved by `cargo metadata`.
 #[async_trait]
 pub trait DependencyProvider: Send + Sync {
     /// Yields all versions available for a given package query, sorted newest-to-oldest.

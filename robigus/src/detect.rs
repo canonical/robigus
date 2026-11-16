@@ -24,8 +24,12 @@ use crate::model::{AnalysisStrategy, AnalyzerId, BuildSystem, PlanRow, PlanStatu
 pub struct DetectionSignal {
     /// Workspace-relative marker path.
     pub marker: PathBuf,
+    /// The analyzer the marker signals.
     pub analyzer: AnalyzerId,
+    /// The build system the marker signals, if any (`None` for an
+    /// ecosystem's own manifest, such as `Cargo.toml`).
     pub build_system: Option<BuildSystem>,
+    /// How strongly the marker indicates the analyzer (0–100).
     pub confidence: Confidence,
 }
 
@@ -42,7 +46,9 @@ pub struct ProjectRoot {
 /// determinism.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectionReport {
+    /// One signal per marker file found.
     pub signals: Vec<DetectionSignal>,
+    /// The analysis entry points.
     pub roots: Vec<ProjectRoot>,
     /// Cargo packages inside a root that are neither workspace members nor
     /// separate roots (test fixtures, examples, …). Recorded so the report
@@ -91,6 +97,7 @@ impl Default for DetectionLimits {
 pub struct DetectionDiagnostic {
     /// Workspace-relative path the problem concerns (empty = whole tree).
     pub path: PathBuf,
+    /// Human-readable description of the problem.
     pub message: String,
 }
 
@@ -98,13 +105,19 @@ pub struct DetectionDiagnostic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Language {
+    /// Assembly: `.s`, `.S`, `.asm`.
     Assembly,
+    /// C: `.c`, `.h`.
     C,
+    /// C++: `.cc`, `.cpp`, `.cxx`, `.c++`, `.hh`, `.hpp`, `.hxx`.
     Cpp,
+    /// Go: `.go`.
     Go,
     /// JavaScript and TypeScript.
     JavaScript,
+    /// Python: `.py`.
     Python,
+    /// Rust: `.rs`.
     Rust,
 }
 
@@ -150,12 +163,14 @@ pub struct ProjectCharacteristics {
     /// From that manifest's `package.version`, or the workspace's
     /// `workspace.package.version` when inherited or virtual.
     pub version: Option<String>,
+    /// Languages seen, by file extension.
     pub languages: BTreeSet<Language>,
     /// The ecosystems present; an ecosystem's own build tool (for example
     /// Cargo) is implied by its analyzer.
     pub analyzers: BTreeSet<AnalyzerId>,
     /// The C/C++ build systems and `build.rs` scripts present.
     pub build_systems: BTreeSet<BuildSystem>,
+    /// Testing systems inferred from markers and build descriptions.
     pub test_systems: BTreeSet<TestSystem>,
 }
 
@@ -247,6 +262,42 @@ impl ProjectTree {
     /// The walk is blocking I/O and runs in `spawn_blocking` (spec §6.2).
     /// Problems that do not prevent detection are recorded as
     /// [`DetectionDiagnostic`]s rather than failing it.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`DetectError::Walk`] if `root` is not a directory, and
+    /// with [`DetectError::LimitExceeded`] if the walk exceeds
+    /// [`DetectionLimits::max_entries`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use robigus::{DetectionLimits, ProjectTree, detect};
+    /// use robigus::model::AnalyzerId;
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let project = tempfile::tempdir()?;
+    /// std::fs::write(
+    ///     project.path().join("Cargo.toml"),
+    ///     "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    /// )?;
+    ///
+    /// let tree = ProjectTree::discover(project.path(), &DetectionLimits::default()).await?;
+    /// assert!(tree.has_marker(Path::new("Cargo.toml")));
+    ///
+    /// let report = detect(&tree);
+    /// assert_eq!(report.roots.len(), 1);
+    /// assert_eq!(report.roots[0].path, Path::new("")); // the top level
+    /// assert!(report.roots[0].analyzers.contains(&AnalyzerId::Cargo));
+    /// assert_eq!(report.characteristics.name.as_deref(), Some("demo"));
+    /// assert_eq!(report.characteristics.version.as_deref(), Some("0.1.0"));
+    /// assert!(report.diagnostics.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn discover(
         root: impl Into<PathBuf>,
         limits: &DetectionLimits,
@@ -659,6 +710,8 @@ fn nearest_root(root_map: &RootMap, dir: &Path) -> Option<PathBuf> {
 /// directory's markers are always considered before those of its
 /// subdirectories. `vendor/` is skipped entirely, so vendored crates are
 /// never roots.
+///
+/// See [`ProjectTree::discover`] for an example.
 pub fn detect(tree: &ProjectTree) -> DetectionReport {
     let mut signals: Vec<DetectionSignal> = tree
         .markers
@@ -789,7 +842,11 @@ fn project_characteristics(
 /// pure marker inspection over an in-memory [`ProjectTree`] with no I/O. The
 /// `analyze` method is added when the analyzers land (WP-2.2/WP-3.1).
 pub trait ProjectAnalyzer: Send + Sync {
+    /// The analyzer's identifier, as used in signals and plan rows.
     fn id(&self) -> AnalyzerId;
+    /// How strongly `tree` calls for this analyzer. The shipped analyzers
+    /// report the highest confidence among their markers, or
+    /// [`Confidence::ZERO`] when none is present.
     fn detect(&self, tree: &ProjectTree) -> Confidence;
 }
 
@@ -822,6 +879,28 @@ impl ProjectAnalyzer for CppAnalyzer {
 }
 
 /// The v1 analyzer registry (spec §7.3).
+///
+/// # Examples
+///
+/// ```
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use robigus::model::AnalyzerId;
+/// use robigus::{Confidence, DetectionLimits, ProjectTree, analyzers};
+///
+/// let project = tempfile::tempdir()?;
+/// std::fs::write(project.path().join("CMakeLists.txt"), "project(demo C)\n")?;
+/// let tree = ProjectTree::discover(project.path(), &DetectionLimits::default()).await?;
+///
+/// let applicable: Vec<AnalyzerId> = analyzers()
+///     .iter()
+///     .filter(|analyzer| analyzer.detect(&tree) > Confidence::ZERO)
+///     .map(|analyzer| analyzer.id())
+///     .collect();
+/// assert_eq!(applicable, [AnalyzerId::Cpp]);
+/// # Ok(())
+/// # }
+/// ```
 pub fn analyzers() -> Vec<Box<dyn ProjectAnalyzer>> {
     vec![Box::new(CargoAnalyzer), Box::new(CppAnalyzer)]
 }

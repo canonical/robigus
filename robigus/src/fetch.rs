@@ -24,11 +24,53 @@ use url::Url;
 
 // 1. Inputs and outcomes
 /// A target software project as supplied by the caller (spec §7.1).
+///
+/// # Examples
+///
+/// ```
+/// use robigus::SourceInput;
+/// use robigus::model::GitReference;
+/// use url::Url;
+///
+/// # fn main() -> Result<(), url::ParseError> {
+/// let git = SourceInput::Git {
+///     url: Url::parse("https://github.com/example/project.git")?,
+///     reference: GitReference::Tag("v1.0.0".into()),
+/// };
+/// let tarball = SourceInput::Tarball {
+///     url: Url::parse("https://example.org/project-1.0.0.tar.gz")?,
+///     digest: None, // recorded as `Provenance::Unverified`
+/// };
+/// let local = SourceInput::Path { path: "./project".into() };
+/// # let _ = (git, tarball, local);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub enum SourceInput {
-    Git { url: Url, reference: GitReference },
-    Tarball { url: Url, digest: Option<String> },
-    Path { path: PathBuf },
+    /// A git repository, cloned and checked out at `reference`.
+    Git {
+        /// Repository URL.
+        url: Url,
+        /// Branch, tag, revision, or default branch to check out. Only a full
+        /// commit hash ([`GitReference::Rev`]) can be served from the cache
+        /// without network access.
+        reference: GitReference,
+    },
+    /// A (possibly compressed) tar archive downloaded over HTTP.
+    Tarball {
+        /// Archive URL.
+        url: Url,
+        /// Expected SHA-256 of the archive as 64 hex characters (trimmed,
+        /// case-insensitive). A mismatch is an error; `None` records the
+        /// computed digest as [`Provenance::Unverified`].
+        digest: Option<String>,
+    },
+    /// A local directory, analyzed in place without copying.
+    Path {
+        /// Directory containing the source tree.
+        path: PathBuf,
+    },
 }
 
 /// How strongly the recorded digest is vouched for (spec §7.2).
@@ -50,7 +92,9 @@ pub struct FetchedSource {
     /// SHA-256 of the content (tree digest for paths, archive digest for
     /// tarballs, resolved commit for git).
     pub digest: String,
+    /// Whether [`digest`](Self::digest) is vouched for.
     pub provenance: Provenance,
+    /// Where the source came from, as recorded in the [`SourceId`].
     pub kind: SourceKind,
 }
 
@@ -74,17 +118,32 @@ impl FetchedSource {
 /// installed, but a later hit is returned without re-hashing its contents.
 /// Do not share a cache root with less-trusted users, since anyone who can
 /// write it can alter analysis inputs.
+///
+/// # Examples
+///
+/// ```
+/// use robigus::Cache;
+///
+/// let cache = Cache::new("/var/tmp/robigus-cache");
+/// let entry = cache.path_for("tarball", "0123abcd").unwrap();
+/// assert!(entry.ends_with("tarball/0123abcd"));
+/// // Keys may come from untrusted input and must be one safe component.
+/// assert!(cache.path_for("git", "../../etc").is_err());
+/// ```
 #[derive(Debug, Clone)]
 pub struct Cache {
     root: PathBuf,
 }
 
 impl Cache {
+    /// A cache rooted at `root`. Nothing is created until an entry is
+    /// installed.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
 
-    /// `XDG_CACHE_HOME/robigus`, falling back to `~/.cache/robigus`.
+    /// `XDG_CACHE_HOME/robigus`, falling back to `~/.cache/robigus`, or to
+    /// `robigus-cache` in the system temporary directory when `HOME` is unset.
     pub fn default_dir() -> PathBuf {
         if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
             return PathBuf::from(xdg).join("robigus");
@@ -95,6 +154,7 @@ impl Cache {
         std::env::temp_dir().join("robigus-cache")
     }
 
+    /// The cache root directory.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -103,6 +163,10 @@ impl Cache {
     /// safe path component: keys can originate from untrusted input (for
     /// example a revision in a TSP's `Cargo.lock`), and a key such as
     /// `../../x` would otherwise address a directory outside the cache.
+    ///
+    /// A safe component is non-empty, does not start with `.`, and contains
+    /// only ASCII letters, digits, `.`, `_` and `-`; anything else fails with
+    /// [`FetchError::InvalidCacheKey`]. The path is not checked for existence.
     pub fn path_for(&self, kind: &str, key: &str) -> Result<PathBuf, FetchError> {
         validate_cache_component(kind)?;
         validate_cache_component(key)?;
@@ -159,7 +223,10 @@ fn full_commit_hash(rev: &str) -> Option<String> {
 /// Decompression-bomb and resource-exhaustion guards (spec §7.2).
 #[derive(Debug, Clone, Copy)]
 pub struct ExtractionLimits {
+    /// Maximum number of archive or checkout entries (default 100,000).
     pub max_entries: u64,
+    /// Maximum total size of regular files, in uncompressed bytes (default
+    /// 1 GiB).
     pub max_total_size: u64,
 }
 
@@ -177,9 +244,12 @@ impl Default for ExtractionLimits {
 /// `max_bytes`, so an oversized or endless response cannot exhaust memory.
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadLimits {
+    /// Maximum response body size, in bytes (default 512 MiB).
     pub max_bytes: u64,
+    /// Limit for establishing a connection (default 30 seconds).
     pub connect_timeout: Duration,
-    /// Wall-clock limit for one request, including reading the body.
+    /// Wall-clock limit for one request, including reading the body (default
+    /// 600 seconds).
     pub timeout: Duration,
 }
 
@@ -196,12 +266,13 @@ impl Default for DownloadLimits {
 /// Git acquisition policy.
 #[derive(Debug, Clone)]
 pub struct GitOptions {
-    /// Wall-clock limit for the whole clone, checkout, and submodule fetch.
+    /// Wall-clock limit for the whole clone, checkout, and submodule fetch
+    /// (default 600 seconds).
     pub timeout: Duration,
     /// Maximum submodule nesting depth (a superproject's own submodules are
-    /// depth 1).
+    /// depth 1; default 4).
     pub max_submodule_depth: usize,
-    /// Maximum number of submodules fetched in total.
+    /// Maximum number of submodules fetched in total (default 64).
     pub max_submodules: usize,
     /// URL schemes a submodule may be fetched from. `.gitmodules` is
     /// untrusted project content: the default allows only `https`, so a
@@ -224,10 +295,12 @@ impl Default for GitOptions {
 /// Resource limits and policy for [`fetch`].
 #[derive(Debug, Clone, Default)]
 pub struct FetchOptions {
+    /// Bounds on tarball downloads.
     pub download: DownloadLimits,
     /// Applied to extracted tarballs and to git checkouts (whose size can
     /// only be checked after checkout).
     pub extraction: ExtractionLimits,
+    /// Git clone and submodule policy.
     pub git: GitOptions,
 }
 
@@ -250,6 +323,37 @@ pub async fn fetch(
 /// Resolves a source without any network access. Remote sources must have a
 /// full commit or SHA-256 pin and an existing content-addressed cache entry.
 /// This does not fall back to a fetch if a cache entry disappears.
+///
+/// A [`SourceInput::Path`] is handled like [`fetch_path`]. A git source needs
+/// [`GitReference::Rev`] with a full commit hash; a tarball needs its
+/// `digest`. Without a pin or a cache entry this fails with
+/// [`FetchError::OfflineCacheMiss`]. Cache hits are returned as
+/// [`Provenance::Verified`] without re-hashing (see [`Cache`]).
+///
+/// # Examples
+///
+/// A local path needs no cache entry:
+///
+/// ```
+/// use robigus::{Cache, Provenance, SourceInput, fetch_offline};
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let project = tempfile::tempdir()?;
+/// std::fs::write(
+///     project.path().join("Cargo.toml"),
+///     "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+/// )?;
+/// let cache = Cache::new(Cache::default_dir());
+///
+/// let input = SourceInput::Path { path: project.path().into() };
+/// let fetched = fetch_offline(input, &cache).await?;
+/// assert_eq!(fetched.tree, project.path().canonicalize()?);
+/// assert_eq!(fetched.provenance, Provenance::Verified);
+/// assert_eq!(fetched.digest.len(), 64); // hex SHA-256 tree digest
+/// # Ok(())
+/// # }
+/// ```
 pub async fn fetch_offline(
     input: SourceInput,
     cache: &Cache,
@@ -1347,9 +1451,15 @@ pub struct RegistryClient {
 /// One record of a sparse-index entry.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct IndexRecord {
+    /// Crate name.
     pub name: String,
+    /// Crate version.
     pub vers: String,
+    /// SHA-256 of the `.crate` file as hex, checked by
+    /// [`RegistryClient::download_crate`].
     pub cksum: String,
+    /// Whether the version is yanked (`false` when absent); yanked versions
+    /// are refused for download.
     #[serde(default)]
     pub yanked: bool,
     /// Per-record download override, if the registry defines one.

@@ -9,6 +9,9 @@
 // `#[allow(unsafe_code)]` inside `sandbox.rs` for the native backend (M3),
 // at which point this becomes `deny`.
 #![forbid(unsafe_code)]
+// Spec §18: every public API is documented; CI denies warnings, so a new
+// undocumented public item fails the build.
+#![warn(missing_docs)]
 
 pub mod detect;
 pub mod dpkg;
