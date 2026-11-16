@@ -324,7 +324,7 @@ flowchart TD
 
 ### 7.2 Acquisition and extraction
 
-- Fetch into a content-addressed cache keyed by URL and digest (`--cache <PATH>`, default under the XDG cache directory).
+- Fetch into a content-addressed cache keyed by URL and digest (`--cache <PATH>`, default under the XDG cache directory). The cache is trusted local state owned by the invoking user: digests are verified when an entry is created, and a later hit is not re-verified. Anyone able to write the cache can alter analysis inputs, so it must not be shared with less-trusted users.
 - **Checksum provenance**: registry `.crate` artifacts MUST be verified against the checksum recorded in the registry index (mandatory, never optional). Git sources MUST record the exact resolved commit; when a lockfile pins it, that revision is used. A bare tarball URL has no trusted digest unless one is supplied via configuration or CLI; robigus records the computed SHA-256 and marks the provenance `unverified` in metadata.
 - Path inputs: a deterministic tree digest (hash over the canonical, sorted file list and contents) MUST be computed so local-path analyses are reproducible.
 - Extract with `tar` plus `flate2`/`xz2`/`zstd`.
@@ -637,6 +637,7 @@ Schema conventions:
   - status invariants: a `Complete` node's targeted dependencies are `Complete`; `Started`/`Error` nodes have at least one plan row and `Error` nodes have a recorded error;
   - informational findings: unresolved requirements grouped by `requirement_kind`, cycles (SCCs with more than one node, plus any node with an edge to itself), and orphan nodes (no incoming edges and not a root).
 - JSON export MUST be lossless with respect to the graph model (everything needed to reconstruct the `Analysis`); DOT export is a lossy visualization. A lossless `import` is future work.
+- Losslessness applies to the model values the schema can represent. The store rejects (`StoreError::Unrepresentable`) — rather than silently altering — non-UTF-8 or empty optional paths, empty provide versions, version constraints whose stored text would not parse back identically, and JSON values (metadata options, predicates) nested beyond the default `serde_json` decoder limit. `Some(VersionConstraint::Any)` is stored as the sentinel `@any`, distinct from `''` (absent). Everything the store accepts round-trips exactly through JSON export and `AnalysisSnapshot::to_analysis`.
 
 ## 12. Ubuntu Archive Mapping (Phase 2)
 
@@ -765,7 +766,7 @@ pub fn establish_sandbox(preference: SandboxPreference)
 - Do not log secrets; scrub environment variables from sandbox logs and `tool_invocation` records.
 - LLM sub-agents: run sandboxed; never include host secrets or credentials in prompt context; treat their output as untrusted and require anchor verification (§7.6) before it becomes evidence; record their interactions in `tool_invocation` for audit.
 - Record provenance for every discovered edge so results can be audited.
-- Provide a robigus-specific `SECURITY.md` with its own reporting path (the current workspace `SECURITY.md` points at the `rapt` repository).
+- Provide a robigus-specific `SECURITY.md` (`robigus/SECURITY.md`) with its own reporting path and sandbox scope; the workspace `SECURITY.md` covers the repository's other crates.
 - Report vulnerabilities per `SECURITY.md`.
 
 ## 18. Coding Standards

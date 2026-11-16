@@ -67,6 +67,10 @@ jobs:
       - name: Run test suite (cargo test)
         run: cargo test --locked --all-targets --all-features
 
+      # `--all-targets` excludes doctests; run them separately.
+      - name: Run doctests (cargo test --doc)
+        run: cargo test --locked --doc --all-features
+
       - name: Security audit dependencies (cargo audit)
         uses: rustsec/audit-check@v2.0.0
         with:
@@ -133,14 +137,19 @@ jobs:
           test -z "$capabilities" || { echo "::error::Unexpected bwrap file capabilities: $capabilities"; exit 1; }
           /usr/bin/bwrap --version
 
-          # Match the backend probe, including its mount, user, PID, network,
-          # IPC and UTS namespaces and runtime mounts. Do not relax seccomp.
+          # Match the backend's namespaces and read-only runtime overlay. The
+          # test suite itself exercises the full policy, including seccomp.
           probe_bwrap() {
+            empty=$(mktemp -d)
             timeout 15 /usr/bin/bwrap \
               --unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts \
-              --die-with-parent --new-session \
-              --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+              --die-with-parent --new-session --cap-drop ALL \
+              --overlay-src "$empty" --overlay-src /usr --ro-overlay /usr --remount-ro /usr \
+              --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
               --proc /proc --dev /dev --tmpfs /tmp --json-status-fd 1 -- /usr/bin/true
+            status=$?
+            rmdir "$empty"
+            return "$status"
           }
           if ! probe_bwrap; then
             # Ubuntu 24.04 may restrict unprivileged user namespaces via
@@ -173,17 +182,12 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      # ROB_REQUIRE_BWRAP turns every prerequisite skip into a failure, so a
+      # green job means the isolation assertions actually ran.
       - name: Run required sandbox integration tests
         env:
           ROB_REQUIRE_BWRAP: "1"
         run: cargo test --locked -p robigus --test sandbox
-
-      # Keep the known isolation regression mandatory until the ignored marker
-      # is removed with the fix. This intentionally fails while it is unfixed.
-      - name: Run required Unix-socket isolation regression
-        env:
-          ROB_REQUIRE_BWRAP: "1"
-        run: cargo test --locked -p robigus --test sandbox offline_cannot_connect_to_unix_socket_in_source -- --ignored --exact
 
   # Umbrella job for branch protection: point required status checks at this
   # single job instead of enumerating every job name.

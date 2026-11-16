@@ -19,6 +19,8 @@ pub mod fetch;
 pub mod model;
 pub mod predicate;
 pub mod sandbox;
+#[cfg(target_os = "linux")]
+mod sandbox_seccomp;
 pub mod solver;
 pub mod store;
 

@@ -307,6 +307,7 @@ async fn lossless_constraint_variants_round_trip() {
     let id = path_package("constraints");
     let mut constraints = vec![
         None,
+        Some(VersionConstraint::Any),
         Some(VersionConstraint::SemVer(VersionReq::STAR)),
         Some(VersionConstraint::SemVer(
             VersionReq::parse(">=1.2.3-alpha.1, <2.0").unwrap(),
@@ -355,6 +356,201 @@ async fn lossless_constraint_variants_round_trip() {
     let analysis = decoded.to_analysis().unwrap();
     assert_eq!(analysis.graph.node(&id), Some(&node));
     assert_eq!(analysis.graph.edge_count(), edges.len());
+    let loaded = store.load().await.unwrap();
+    assert_eq!(loaded.graph.node(&id), Some(&node));
+    assert_eq!(loaded.graph.edge_count(), edges.len());
+    assert!(store.check().await.unwrap().is_ok());
+}
+
+fn sorted_edges<'a>(edges: impl IntoIterator<Item = &'a Edge>) -> Vec<Edge> {
+    let mut edges: Vec<Edge> = edges.into_iter().cloned().collect();
+    edges.sort_by_key(|edge| serde_json::to_string(edge).unwrap());
+    edges
+}
+
+#[tokio::test]
+async fn some_any_constraint_round_trips_through_load_and_json_export() {
+    let (store, dir) = test_store().await;
+    store.write_metadata(&metadata()).await.unwrap();
+    let id = path_package("any");
+    let target = git_package("any-target");
+    let mut node = Node::new(id.clone());
+    node.conflicts.push(Conflict {
+        name: "conflict-any".into(),
+        version_req: Some(VersionConstraint::Any),
+    });
+    let unresolved = constraint_edge(&id, "unresolved-any", Some(VersionConstraint::Any));
+    let mut resolved = constraint_edge(&id, "resolved-any", Some(VersionConstraint::Any));
+    resolved.to = Some(target.clone());
+    store.upsert_node(&node).await.unwrap();
+    store
+        .upsert_edges(&id, &[resolved.clone(), unresolved.clone()])
+        .await
+        .unwrap();
+
+    // The sentinel is a storage detail: '' still means None.
+    let raw = rusqlite::Connection::open(dir.path().join("analysis.db")).unwrap();
+    let edge_texts: Vec<String> = raw
+        .prepare("SELECT version_req FROM dependency_edge ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(edge_texts, vec![ANY_VERSION_REQ, ANY_VERSION_REQ]);
+    let conflict_text: String = raw
+        .query_row("SELECT version_req FROM package_conflicts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(conflict_text, ANY_VERSION_REQ);
+
+    let loaded = store.load().await.unwrap();
+    assert_eq!(loaded.graph.node(&id), Some(&node));
+    assert_eq!(loaded.graph.edges_to(&target), vec![&resolved]);
+    assert_eq!(loaded.graph.unresolved(), std::slice::from_ref(&unresolved));
+
+    let snapshot = store.export_snapshot().await.unwrap();
+    let json = crate::export::json(&snapshot).unwrap();
+    assert!(!json.contains(ANY_VERSION_REQ), "sentinel leaked into JSON");
+    let decoded: AnalysisSnapshot = serde_json::from_str(&json).unwrap();
+    assert_snapshot_unchanged(&store, &decoded).await;
+    let analysis = decoded.to_analysis().unwrap();
+    assert_eq!(analysis.graph.node(&id), Some(&node));
+    assert_eq!(analysis.graph.edges_to(&target), vec![&resolved]);
+    assert_eq!(
+        analysis.graph.unresolved(),
+        std::slice::from_ref(&unresolved)
+    );
+    assert!(store.check().await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn none_any_and_semver_star_are_distinct_edges_and_conflicts() {
+    let (store, _dir) = test_store().await;
+    store.write_metadata(&metadata()).await.unwrap();
+    let id = path_package("distinct");
+    let target = git_package("distinct-target");
+    let constraints = [
+        None,
+        Some(VersionConstraint::Any),
+        Some(VersionConstraint::SemVer(VersionReq::STAR)),
+    ];
+    let mut node = Node::new(id.clone());
+    let mut expected = DependencyGraph::new();
+    let mut edges = Vec::new();
+    for constraint in &constraints {
+        node.conflicts.push(Conflict {
+            name: "same".into(),
+            version_req: constraint.clone(),
+        });
+        edges.push(constraint_edge(&id, "same", constraint.clone()));
+        let mut resolved = constraint_edge(&id, "same", constraint.clone());
+        resolved.to = Some(target.clone());
+        edges.push(resolved);
+    }
+    for edge in &edges {
+        expected.add_edge(edge.clone());
+    }
+    // DependencyGraph itself distinguishes all three constraints.
+    assert_eq!(expected.edge_count(), 6);
+
+    store.upsert_node(&node).await.unwrap();
+    store.upsert_edges(&id, &edges).await.unwrap();
+    // Re-upserting merges each edge with its own row only (the merge lookup
+    // keys on the stored version_req, so None never matches Some(Any)).
+    let mut stronger: Vec<Edge> = edges.clone();
+    for edge in &mut stronger {
+        edge.confidence = Confidence::new(60);
+        edge.kinds.insert(DependencyKind::Build);
+    }
+    store.upsert_edges(&id, &stronger).await.unwrap();
+
+    let snapshot = store.export_snapshot().await.unwrap();
+    assert_eq!(snapshot.edges.len(), 6);
+    assert_eq!(
+        sorted_edges(snapshot.edges.iter().map(|item| &item.edge)),
+        sorted_edges(&stronger)
+    );
+    assert_eq!(snapshot.nodes[0].node, node);
+
+    let loaded = store.load().await.unwrap();
+    assert_eq!(loaded.graph.edge_count(), 6);
+    assert_eq!(loaded.graph.node(&id), Some(&node));
+    assert_eq!(
+        sorted_edges(loaded.graph.edges_from(&id)),
+        sorted_edges(&stronger)
+    );
+
+    let decoded: AnalysisSnapshot =
+        serde_json::from_str(&crate::export::json(&snapshot).unwrap()).unwrap();
+    assert_eq!(decoded.to_analysis().unwrap().graph.edge_count(), 6);
+
+    let report = store.check().await.unwrap();
+    assert_eq!(report.duplicate_edges, 0);
+    assert_eq!(report.invalid_json_columns, 0);
+    assert!(report.is_ok(), "{report:?}");
+}
+
+#[tokio::test]
+async fn stored_version_req_sentinel_loads_as_any_and_other_garbage_is_corrupt() {
+    let (store, dir) = test_store().await;
+    store.write_metadata(&metadata()).await.unwrap();
+    let id = path_package("raw");
+    let mut node = Node::new(id.clone());
+    node.conflicts.push(Conflict {
+        name: "c".into(),
+        version_req: None,
+    });
+    store.upsert_node(&node).await.unwrap();
+    store
+        .upsert_edges(&id, &[constraint_edge(&id, "e", None)])
+        .await
+        .unwrap();
+    let raw = rusqlite::Connection::open(dir.path().join("analysis.db")).unwrap();
+    raw.execute(
+        "UPDATE dependency_edge SET version_req = ?1",
+        params![ANY_VERSION_REQ],
+    )
+    .unwrap();
+    raw.execute(
+        "UPDATE package_conflicts SET version_req = ?1",
+        params![ANY_VERSION_REQ],
+    )
+    .unwrap();
+    let loaded = store.load().await.unwrap();
+    assert_eq!(
+        loaded.graph.node(&id).unwrap().conflicts[0].version_req,
+        Some(VersionConstraint::Any)
+    );
+    assert_eq!(
+        loaded.graph.unresolved()[0].requirement.version_req,
+        Some(VersionConstraint::Any)
+    );
+
+    for (table, garbage) in [
+        ("dependency_edge", "@ANY"),
+        ("dependency_edge", "@any "),
+        ("package_conflicts", "@anything"),
+        ("package_conflicts", "not a requirement"),
+    ] {
+        raw.execute(
+            &format!("UPDATE {table} SET version_req = ?1"),
+            params![garbage],
+        )
+        .unwrap();
+        assert!(matches!(store.load().await, Err(StoreError::Corrupt(_))));
+        assert!(matches!(
+            store.export_snapshot().await,
+            Err(StoreError::Corrupt(_))
+        ));
+        raw.execute(
+            &format!("UPDATE {table} SET version_req = ?1"),
+            params![ANY_VERSION_REQ],
+        )
+        .unwrap();
+    }
+    assert!(store.load().await.is_ok());
 }
 
 #[tokio::test]
@@ -374,7 +570,6 @@ async fn lossy_constraints_reject_node_and_edge_writes_atomically() {
     let mut lossy_semver = VersionReq::parse("1.2.3").unwrap();
     lossy_semver.comparators[0].op = semver::Op::Wildcard;
     for constraint in [
-        VersionConstraint::Any,
         VersionConstraint::Debian {
             op: DebianOperator::Ge,
             target_version: String::new(),

@@ -46,13 +46,22 @@ pub enum NetworkAccess {
 /// creates a new directory inside `log_dir` for its stdout and stderr files.
 ///
 /// Only explicitly allowlisted `env` keys are accepted; inherited environment
-/// variables are never passed through. Callers must not put credentials or
+/// variables are never passed through. The canonical sandbox working directory
+/// must be UTF-8 so it can be recorded as `PWD`. Callers must not put credentials or
 /// other secrets in arguments, since arbitrary command arguments cannot be
 /// reliably identified as secrets and are recorded for reproducibility.
 ///
-/// Offline mode blocks IP networking, but live Unix-domain sockets reachable
-/// through the source or runtime mounts can still connect to host services.
-/// Do not rely on it for complete host-service isolation until this is fixed.
+/// Isolation boundary: user, mount, PID, network, IPC and UTS namespaces; all
+/// capabilities dropped and nested user namespaces disabled. The source and system runtime are private read-only
+/// overlays (`nodev`, `nosuid`), so host sockets, FIFOs and devices under them
+/// cannot be reached. A seccomp filter limits socket creation to IP families
+/// (with no route off the host) and fixed-peer Unix stream/seqpacket pairs,
+/// and denies io_uring and the kernel keyring syscalls (the host session
+/// keyring is not namespaced); named Unix sockets are unavailable even inside
+/// the sandbox. Inherited descriptors other than stdio are closed before
+/// bubblewrap starts. Not covered here: resource limits (WP-3.5) and
+/// allowlisted networking, which needs an explicit proxy transport (WP-2.1).
+///
 /// Bubblewrap uses a fixed shell wrapper to restore stdin; failure to execute
 /// the requested program is reported as the shell's exit status (126 or 127).
 #[derive(Debug, Clone)]
@@ -164,30 +173,37 @@ async fn probe_bwrap() -> Result<PathBuf, String> {
         if !executable.is_file() {
             return Err(format!("{} was not found", executable.display()));
         }
-        let mut cmd = Command::new(&executable);
-        cmd.env_clear().kill_on_drop(true).stdin(Stdio::null());
-        cmd.args([
-            "--unshare-user",
-            "--unshare-pid",
-            "--unshare-net",
-            "--unshare-ipc",
-            "--unshare-uts",
-            "--die-with-parent",
-            "--new-session",
-        ]);
-        bind_runtime(&mut cmd);
-        cmd.args([
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-            "--json-status-fd",
-            "1",
-            "--",
-            "/usr/bin/true",
-        ]);
+        if !Path::new(SANITIZER).is_file() {
+            return Err(format!(
+                "{SANITIZER} is required to close inherited descriptors before bubblewrap"
+            ));
+        }
+        // Probe with the full isolation policy used for real runs: overlays,
+        // seccomp and descriptor sanitation. Availability means all of them work.
+        let scratch = tempfile::tempdir()
+            .map_err(|error| format!("cannot create sandbox probe directory: {error}"))?;
+        let empty = scratch.path().join("empty");
+        let source = scratch.path().join("source");
+        for dir in [&empty, &source] {
+            std::fs::create_dir(dir)
+                .map_err(|error| format!("cannot create sandbox probe directory: {error}"))?;
+        }
+        let status = tempfile::tempfile()
+            .map_err(|error| format!("cannot create sandbox probe status file: {error}"))?;
+        let mut status_reader = status
+            .try_clone()
+            .map_err(|error| format!("cannot reopen sandbox probe status file: {error}"))?;
+        let mut cmd = isolated_command(
+            &executable,
+            &empty,
+            &source,
+            Path::new("/source"),
+            &BTreeMap::new(),
+            status,
+            Stdio::null(),
+            Stdio::piped(),
+        )?;
+        cmd.args(["/usr/bin/true"]);
         let result = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await;
         match result {
             Err(_) => Err("namespace probe timed out after 10 seconds".into()),
@@ -196,7 +212,13 @@ async fn probe_bwrap() -> Result<PathBuf, String> {
                 executable.display()
             )),
             Ok(Ok(output)) if output.status.success() => {
-                check_bwrap_completion(&output.stdout, output.status)
+                use std::io::{Read, Seek};
+                let mut report = Vec::new();
+                status_reader
+                    .rewind()
+                    .and_then(|()| status_reader.read_to_end(&mut report))
+                    .map_err(|error| format!("cannot read namespace probe status: {error}"))?;
+                check_bwrap_completion(&report, output.status)
                     .map_err(|cause| format!("namespace probe status failed: {cause}"))?;
                 Ok(executable)
             }
@@ -250,12 +272,167 @@ async fn read_bounded(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Bind only the system runtime, not the host root or home directory.
-fn bind_runtime(cmd: &mut Command) {
-    for path in ["/usr", "/bin", "/lib", "/lib64"] {
-        if Path::new(path).exists() {
-            cmd.args(["--ro-bind", path, path]);
+/// Fixed, trusted host shell that closes every inherited descriptor except
+/// stdio and the seccomp filter before exec'ing bubblewrap.
+const SANITIZER: &str = "/usr/bin/bash";
+
+/// The sanitizer script. It receives no untrusted text: `$@` is bubblewrap and
+/// its arguments, passed as separate words and never evaluated. Descriptor
+/// numbers come from `/proc/self/fd` and are checked to be numeric before use.
+/// Closing happens in a single-threaded process, so no descriptor can be
+/// opened concurrently; the final check fails closed if any survives.
+const SANITIZE_FDS: &str = r#"keep=$1; shift
+for entry in /proc/self/fd/*; do
+  fd=${entry##*/}
+  case $fd in ''|*[!0-9]*) echo "robigus: unexpected descriptor entry" >&2; exit 125;; esac
+  if [ "$fd" -gt 2 ] && [ "$fd" -ne "$keep" ]; then exec {fd}>&-; fi
+done
+for entry in /proc/self/fd/*; do
+  fd=${entry##*/}
+  if [ "$fd" -gt 2 ] && [ "$fd" -ne "$keep" ] && [ -e "$entry" ]; then
+    target=$(readlink "$entry" 2>/dev/null)
+    case $target in /proc/*/fd) ;; *) echo "robigus: descriptor $fd survived sanitation" >&2; exit 125;; esac
+  fi
+done
+exec "$@""#;
+
+/// Host trees exposed to the sandbox. Directories are mounted as private
+/// read-only overlays; symlinks (for example a merged-`/usr` `/bin`) are
+/// recreated as symlinks rather than followed.
+const RUNTIME_TREES: [&str; 4] = ["/usr", "/bin", "/lib", "/lib64"];
+
+/// Mounts `host` read-only at `target` without exposing host special files.
+///
+/// A read-only OverlayFS creates its own inodes for sockets and FIFOs, so a
+/// host listener or FIFO reader under the tree cannot be reached through it;
+/// the final remount adds `nodev`/`nosuid`, which overlays do not inherit.
+/// The empty lower layer is required because bubblewrap needs two layers.
+/// Bubblewrap stacks `--overlay-src` layers with the last one on top, so the
+/// empty layer goes first: the host tree must be the top layer, or the empty
+/// directory's own metadata would replace the host root's permissions.
+fn overlay_tree(cmd: &mut Command, host: &Path, empty: &Path, target: &Path) {
+    cmd.arg("--overlay-src")
+        .arg(empty)
+        .arg("--overlay-src")
+        .arg(host)
+        .arg("--ro-overlay")
+        .arg(target)
+        .arg("--remount-ro")
+        .arg(target);
+}
+
+/// Exposes only the system runtime, never the host root or home directory.
+fn mount_runtime(cmd: &mut Command, empty: &Path) -> Result<(), String> {
+    for tree in RUNTIME_TREES {
+        let path = Path::new(tree);
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(path)
+                    .map_err(|error| format!("cannot read runtime symlink {tree}: {error}"))?;
+                cmd.arg("--symlink").arg(target).arg(path);
+            }
+            Ok(metadata) if metadata.is_dir() => overlay_tree(cmd, path, empty, path),
+            Ok(_) => {
+                return Err(format!(
+                    "runtime path {tree} is neither a directory nor a symlink"
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect runtime path {tree}: {error}")),
         }
+    }
+    Ok(())
+}
+
+/// Builds a sanitized bubblewrap command with the complete isolation policy,
+/// ending with `--` so the caller appends only the workload. `status` becomes
+/// bubblewrap's stdin and its `--json-status-fd`.
+#[allow(clippy::too_many_arguments)]
+fn isolated_command(
+    executable: &Path,
+    empty: &Path,
+    source: &Path,
+    workdir: &Path,
+    env: &BTreeMap<String, String>,
+    status: std::fs::File,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> Result<Command, String> {
+    #[cfg(target_os = "linux")]
+    let filter = crate::sandbox_seccomp::filter_file()?;
+    #[cfg(not(target_os = "linux"))]
+    return Err("bubblewrap sandboxing requires Linux".into());
+
+    #[cfg(target_os = "linux")]
+    {
+        use command_fds::{CommandFdExt, FdMapping};
+        let filter_fd = crate::sandbox_seccomp::FILTER_FD;
+        let mut cmd = Command::new(SANITIZER);
+        cmd.env_clear()
+            .kill_on_drop(true)
+            .stdin(Stdio::from(status))
+            .stdout(stdout)
+            .stderr(stderr);
+        // All descriptor mappings go through one call: command-fds cannot
+        // detect collisions between separate calls.
+        cmd.as_std_mut()
+            .fd_mappings(vec![FdMapping {
+                parent_fd: filter.into(),
+                child_fd: filter_fd,
+            }])
+            .map_err(|error| format!("cannot map sandbox seccomp descriptor: {error}"))?;
+        cmd.args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            SANITIZE_FDS,
+            "robigus-fd-sanitizer",
+        ])
+        .arg(filter_fd.to_string())
+        .arg(executable)
+        .args([
+            "--unshare-user",
+            // A nested user namespace would hand the workload a full
+            // capability set over new kernel attack surface; forbid it.
+            "--disable-userns",
+            "--assert-userns-disabled",
+            "--unshare-pid",
+            "--unshare-net",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--die-with-parent",
+            "--new-session",
+            "--cap-drop",
+            "ALL",
+            "--clearenv",
+            "--json-status-fd",
+            "0",
+            "--seccomp",
+        ])
+        .arg(filter_fd.to_string());
+        mount_runtime(&mut cmd, empty)?;
+        cmd.args([
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            "/output",
+            "--tmpfs",
+            "/cargo",
+            "--tmpfs",
+            "/home",
+            "--dir",
+            "/home/sandbox",
+        ]);
+        overlay_tree(&mut cmd, source, empty, Path::new("/source"));
+        for (key, value) in env {
+            cmd.arg("--setenv").arg(key).arg(value);
+        }
+        cmd.arg("--chdir").arg(workdir).arg("--");
+        Ok(cmd)
     }
 }
 
@@ -354,6 +531,9 @@ impl Sandbox for BwrapSandbox {
         } else {
             Path::new("/source").join(relative_workdir)
         };
+        let pwd = sandbox_workdir.to_str().ok_or_else(|| {
+            SandboxError::InvalidCommand("sandbox working directory must be UTF-8".into())
+        })?;
         let workspace = tokio::fs::canonicalize(&spec.workspace).await?;
         let mut log_base = workspace.clone();
         for part in spec.log_dir.components() {
@@ -418,65 +598,41 @@ impl Sandbox for BwrapSandbox {
             ("CARGO_HOME".into(), "/cargo".into()),
             ("CARGO_TARGET_DIR".into(), "/output/target".into()),
             ("TMPDIR".into(), "/tmp".into()),
+            ("PWD".into(), pwd.into()),
         ]);
         env.extend(spec.env.clone());
-        let mut cmd = Command::new(&self.executable);
-        cmd.env_clear()
-            .kill_on_drop(true)
-            // Only stdio descriptors can be passed to a child without unsafe
-            // pre-exec code. Bubblewrap closes the status fd before exec; the
-            // fixed shell wrapper restores the command's stdin to /dev/null.
-            .stdin(Stdio::from(status_file))
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr));
+        // The overlay's second lower layer must be an empty directory that does
+        // not overlap the source; keep it with this invocation's logs.
+        let empty_layer = log_dir.join("empty-layer");
+        tokio::fs::create_dir(&empty_layer).await?;
+        // Bubblewrap closes the status fd before exec; the fixed shell wrapper
+        // restores the command's stdin to /dev/null.
+        let launch = isolated_command(
+            &self.executable,
+            &empty_layer,
+            &source,
+            &sandbox_workdir,
+            &env,
+            status_file,
+            Stdio::from(stdout),
+            Stdio::from(stderr),
+        );
+        let mut cmd = match launch {
+            Ok(cmd) => cmd,
+            Err(cause) => {
+                return Err(SandboxError::BwrapSetup { cause, stderr_path });
+            }
+        };
         #[cfg(unix)]
         cmd.process_group(0);
         cmd.args([
-            "--unshare-user",
-            "--unshare-pid",
-            "--unshare-net",
-            "--unshare-ipc",
-            "--unshare-uts",
-            "--die-with-parent",
-            "--new-session",
-            "--clearenv",
-            "--json-status-fd",
-            "0",
-        ]);
-        bind_runtime(&mut cmd);
-        cmd.args([
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-            "--tmpfs",
-            "/output",
-            "--tmpfs",
-            "/cargo",
-            "--tmpfs",
-            "/home",
-            "--dir",
-            "/home/sandbox",
-            "--ro-bind",
+            "/bin/sh",
+            "-c",
+            "exec </dev/null; exec \"$@\"",
+            "robigus-sandbox",
         ])
-        .arg(&source)
-        .arg("/source");
-        for (key, value) in &env {
-            cmd.arg("--setenv").arg(key).arg(value);
-        }
-        cmd.arg("--chdir")
-            .arg(&sandbox_workdir)
-            .args([
-                "--",
-                "/bin/sh",
-                "-c",
-                "exec </dev/null; exec \"$@\"",
-                "robigus-sandbox",
-            ])
-            .arg(&spec.program)
-            .args(&spec.args);
+        .arg(&spec.program)
+        .args(&spec.args);
 
         let relative_log = log_dir
             .strip_prefix(&workspace)
@@ -682,12 +838,45 @@ mod tests {
             Err(SandboxError::InvalidCommand(_))
         ));
         spec.env.clear();
+        spec.env.insert("PWD".into(), "/host/path".into());
+        assert!(matches!(
+            sandbox.run(&spec).await,
+            Err(SandboxError::InvalidCommand(_))
+        ));
+        spec.env.clear();
         spec.log_dir = "../outside".into();
         assert!(matches!(
             sandbox.run(&spec).await,
             Err(SandboxError::InvalidCommand(_))
         ));
         assert!(!spec.workspace.join("logs").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_non_utf8_canonical_workdir_before_launch() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (dir, mut spec) = fixture().await;
+        let name = std::ffi::OsString::from_vec(b"invalid-\xff".to_vec());
+        std::fs::create_dir(spec.source.join(&name)).unwrap();
+        std::os::unix::fs::symlink(&name, spec.source.join("link")).unwrap();
+        let sandbox = BwrapSandbox {
+            executable: "/does/not/exist".into(),
+        };
+        for subdir in [PathBuf::from(name), PathBuf::from("link")] {
+            spec.source_subdir = subdir;
+            assert!(matches!(
+                sandbox.run(&spec).await,
+                Err(SandboxError::InvalidCommand(message)) if message.contains("UTF-8")
+            ));
+        }
+        assert!(!spec.workspace.join("logs").exists());
+        let db = rusqlite::Connection::open(dir.path().join("analysis.db")).unwrap();
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM tool_invocation", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[cfg(unix)]

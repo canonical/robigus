@@ -983,6 +983,33 @@ mod tests {
         assert!(report.non_member_crates.is_empty());
     }
 
+    /// Regression (WP-1.6): spec §7.3 scopes the own-`[workspace]` rule to
+    /// packages *not reached* by an ancestor's `members`. A matched member
+    /// that also carries its own `[workspace]` stays a member — it is not a
+    /// separate root — while the unreachable nested workspace still is.
+    #[test]
+    fn matched_member_with_own_workspace_is_not_a_separate_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        );
+        write(
+            tmp.path(),
+            "crates/a/Cargo.toml",
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[workspace]\n",
+        );
+        write(
+            tmp.path(),
+            "fuzz/Cargo.toml",
+            "[package]\nname = \"fuzz\"\nversion = \"0.0.0\"\n\n[workspace]\nmembers = [\".\"]\n",
+        );
+        let report = detect(&discover(tmp.path()));
+        assert_eq!(root_paths(&report), vec![Path::new(""), Path::new("fuzz")]);
+        assert!(report.non_member_crates.is_empty());
+    }
+
     /// A plain package inside a root that is neither a member, a workspace,
     /// nor explicitly excluded (a test fixture or example) is recorded but is
     /// not a root.
