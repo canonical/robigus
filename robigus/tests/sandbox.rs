@@ -843,10 +843,19 @@ async fn cargo_toolchain_runs_inside_the_sandbox() {
     let Some(sandbox) = bwrap(test).await else {
         return;
     };
-    if !Path::new("/usr/bin/cargo").exists() {
+    // Only the system runtime is visible in the sandbox, so a rustup toolchain
+    // under the host home directory cannot be used here.
+    if let Some(missing) = ["/usr/bin/cargo", "/usr/bin/rustc"]
+        .into_iter()
+        .find(|tool| !Path::new(tool).exists())
+    {
         skip(
             test,
-            "/usr/bin/cargo is required for the toolchain smoke test",
+            &format!(
+                "{missing} is required for the toolchain smoke test; install the \
+                 distribution `cargo` and `rustc` packages (rustup toolchains under \
+                 the home directory are not visible inside the sandbox)"
+            ),
         );
         return;
     }
@@ -862,7 +871,9 @@ async fn cargo_toolchain_runs_inside_the_sandbox() {
         &fixture.spec.log_dir,
     );
     assert!(
-        matches!(output.status, ProcessStatus::Exited(0)) && stdout.contains("cargo "),
+        matches!(output.status, ProcessStatus::Exited(0))
+            && stdout.contains("cargo ")
+            && stdout.contains("rustc "),
         "cargo failed: {:?}\nstdout: {stdout}\nstderr: {}",
         output.status,
         std::fs::read_to_string(&output.stderr_path).unwrap_or_default()

@@ -122,10 +122,16 @@ jobs:
     steps:
       # Ubuntu's bubblewrap package may enable kernel.unprivileged_userns_clone
       # system-wide in its post-install step; this job assumes a disposable VM.
-      - name: Install bubblewrap and AppArmor tools
+      # The sandbox exposes only the system runtime (/usr), never $HOME, so the
+      # rustup toolchain installed below for building is invisible inside it.
+      # The Cargo smoke test needs the distribution toolchain in /usr/bin.
+      - name: Install bubblewrap, AppArmor tools and the system Rust toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bubblewrap apparmor libcap2-bin python3
+          sudo apt-get install -y --no-install-recommends \
+            bubblewrap apparmor libcap2-bin python3 cargo rustc
+          /usr/bin/cargo --version
+          /usr/bin/rustc --version
 
       - name: Check unprivileged bubblewrap namespaces
         run: |
