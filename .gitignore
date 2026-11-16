@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# cargo-fuzz working state (crash artifacts and generated corpora)
+/fuzz/artifacts/
+/fuzz/corpus/

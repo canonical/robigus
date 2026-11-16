@@ -36,6 +36,20 @@ jobs:
       - name: Run fuzz targets
         run: |
           cargo fuzz build
-          for target in $(cargo fuzz list); do
+          targets=$(cargo fuzz list)
+          # Fail rather than pass vacuously if the targets disappear.
+          test -n "$targets" || { echo '::error::No fuzz targets found'; exit 1; }
+          for target in $targets; do
+            echo "::group::Fuzzing $target"
             cargo fuzz run "$target" -- -max_total_time=60
+            echo '::endgroup::'
           done
+
+      # Crash inputs reproduce with `cargo fuzz run <target> <artifact>`.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

@@ -224,4 +224,5 @@ pub struct PkgNamesArgs {
     pub prefix: Option<String>,
 }
 
+/// Alternative spelling of [`PkgNamesArgs`], kept for compatibility.
 pub type PkgnamesArgs = PkgNamesArgs;

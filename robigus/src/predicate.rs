@@ -21,11 +21,46 @@ use ubuntu_info_rust::Architecture;
 /// The in-memory representation is this typed AST, never a string. Operands
 /// of `And`/`Or` keep their discovery order; use [`Predicate::canonicalized`]
 /// for the canonical (sorted, folded) form.
+///
+/// # Examples
+///
+/// Parse a §4.5 example, canonicalize it, and evaluate it on two
+/// architectures:
+///
+/// ```
+/// use robigus::{Configuration, Evaluator, MachineArch, Predicate};
+/// use ubuntu_info_rust::Architecture;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let gas = Predicate::parse(r#"feature("asm") && arch("arm64") && !env("CC" = "clang")"#)?;
+/// assert_eq!(
+///     gas.canonical_text(),
+///     r#"!env("CC" = "clang") && arch("arm64") && feature("asm")"#,
+/// );
+///
+/// let mut arm64 = Configuration::for_arch(MachineArch::Ubuntu(Architecture::Arm64));
+/// arm64.features.insert("rav1e".into(), ["asm".to_string()].into());
+/// // Unqualified `feature` atoms resolve against the current package.
+/// assert!(Evaluator::new(arm64.clone()).evaluate(&gas, Some("rav1e")));
+/// assert!(!Evaluator::new(arm64.clone()).evaluate(&gas, None));
+///
+/// arm64.env.insert("CC".into(), "clang".into());
+/// assert!(!Evaluator::new(arm64).evaluate(&gas, Some("rav1e")));
+///
+/// let amd64 = Configuration::for_arch(MachineArch::Ubuntu(Architecture::Amd64));
+/// assert!(!Evaluator::new(amd64).evaluate(&gas, Some("rav1e")));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Predicate {
+    /// Conjunction (`&&`); an empty conjunction is `true`.
     And(Vec<Predicate>),
+    /// Disjunction (`||`); an empty disjunction is `false`.
     Or(Vec<Predicate>),
+    /// Negation (`!`).
     Not(Box<Predicate>),
+    /// A single [`Atom`].
     Atom(Atom),
 }
 
@@ -35,12 +70,16 @@ pub enum Atom {
     /// `feature("name")` (`package = None`) or `feature("pkg/name")`
     /// (`package = Some`).
     Feature {
+        /// The qualifying package, or `None` for the current package.
         package: Option<String>,
+        /// The feature name.
         name: String,
     },
     /// `cfg("key" = "value")` — a Cargo `cfg` key/value pair, stored verbatim.
     Cfg {
+        /// The `cfg` key, e.g. `target_os`.
         key: String,
+        /// The `cfg` value, e.g. `linux`.
         value: String,
     },
     /// `arch("amd64")` — `MachineArch` covers `all` and unsupported stubs.
@@ -51,12 +90,16 @@ pub enum Atom {
     BuildProfile(String),
     /// `env("CC" = "clang")`.
     Env {
+        /// The environment variable name.
         name: String,
+        /// The value the variable must equal.
         value: String,
     },
     /// `series("noble")`.
     Series(String),
+    /// The constant `true`.
     True,
+    /// The constant `false`.
     False,
 }
 
@@ -66,10 +109,12 @@ impl Predicate {
     /// The never-active predicate.
     pub const FALSE: Self = Self::Atom(Atom::False);
 
+    /// A conjunction of `operands`, in the given order (not canonicalized).
     pub fn and(operands: Vec<Self>) -> Self {
         Self::And(operands)
     }
 
+    /// A disjunction of `operands`, in the given order (not canonicalized).
     pub fn or(operands: Vec<Self>) -> Self {
         Self::Or(operands)
     }
@@ -90,6 +135,7 @@ impl Predicate {
         })
     }
 
+    /// `cfg("key" = "value")`.
     pub fn cfg(key: impl Into<String>, value: impl Into<String>) -> Self {
         Self::Atom(Atom::Cfg {
             key: key.into(),
@@ -97,18 +143,22 @@ impl Predicate {
         })
     }
 
+    /// `arch("name")` for `arch`.
     pub fn arch(arch: MachineArch) -> Self {
         Self::Atom(Atom::Arch(arch))
     }
 
+    /// `platform("name")`.
     pub fn platform(name: impl Into<String>) -> Self {
         Self::Atom(Atom::Platform(name.into()))
     }
 
+    /// `build-profile("name")`.
     pub fn build_profile(name: impl Into<String>) -> Self {
         Self::Atom(Atom::BuildProfile(name.into()))
     }
 
+    /// `env("NAME" = "value")`.
     pub fn env(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self::Atom(Atom::Env {
             name: name.into(),
@@ -116,6 +166,7 @@ impl Predicate {
         })
     }
 
+    /// `series("name")`.
     pub fn series(name: impl Into<String>) -> Self {
         Self::Atom(Atom::Series(name.into()))
     }
@@ -274,6 +325,31 @@ fn write_joined(
 impl Predicate {
     /// Parses a predicate from its textual form (spec §4.2). An empty or
     /// whitespace-only input is equivalent to `true`.
+    ///
+    /// The result preserves the input's structure and operand order; see
+    /// [`Predicate::canonicalized`] for the canonical form.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use robigus::{MachineArch, Predicate};
+    /// use ubuntu_info_rust::Architecture;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Debian `foo [amd64 !arm64]` (spec §4.5).
+    /// let parsed = Predicate::parse(r#"arch("amd64") && !arch("arm64")"#)?;
+    /// assert_eq!(
+    ///     parsed,
+    ///     Predicate::and(vec![
+    ///         Predicate::arch(MachineArch::Ubuntu(Architecture::Amd64)),
+    ///         !Predicate::arch(MachineArch::Ubuntu(Architecture::Arm64)),
+    ///     ]),
+    /// );
+    /// assert_eq!(Predicate::parse("  ")?, Predicate::TRUE);
+    /// assert!(Predicate::parse(r#"feature("a") &&"#).is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn parse(input: &str) -> Result<Self, PredicateError> {
         let tokens = lex(input)?;
         let mut parser = Parser {
@@ -792,6 +868,26 @@ impl Predicate {
 
     /// The canonical serialization (spec §4.3): the `Display` of the
     /// canonical form. Used for storage and equality.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use robigus::Predicate;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let a = Predicate::parse(r#"cfg("target_os" = "linux") || cfg("target_family" = "unix")"#)?;
+    /// let b = Predicate::parse(
+    ///     r#"(cfg("target_family" = "unix") || true && cfg("target_os" = "linux"))"#,
+    /// )?;
+    /// assert_ne!(a, b);
+    /// assert_eq!(a.canonical_text(), b.canonical_text());
+    /// assert_eq!(
+    ///     a.canonical_text(),
+    ///     r#"cfg("target_family" = "unix") || cfg("target_os" = "linux")"#,
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn canonical_text(&self) -> String {
         self.canonicalized().to_string()
     }
@@ -959,6 +1055,8 @@ pub struct Evaluator {
 }
 
 impl Evaluator {
+    /// An evaluator for `configuration`, with `All` architectures expanded
+    /// and unsupported stubs dropped up front.
     pub fn new(configuration: Configuration) -> Self {
         let expanded_arches = configuration
             .arches
@@ -973,6 +1071,7 @@ impl Evaluator {
         }
     }
 
+    /// The configuration this evaluator was built for.
     pub fn configuration(&self) -> &Configuration {
         &self.configuration
     }
@@ -1042,6 +1141,7 @@ pub const DEFAULT_DNF_TERM_CAP: usize = 10_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("DNF conversion exceeds the term cap of {cap}")]
 pub struct DnfError {
+    /// The term cap that was exceeded.
     pub cap: usize,
 }
 

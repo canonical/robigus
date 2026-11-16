@@ -2,6 +2,49 @@
 //!
 //! Renderers inspect only the supplied snapshot; they perform no filesystem,
 //! environment, network, or tool queries.
+//!
+//! # Examples
+//!
+//! Snapshots normally come from [`Store::export_snapshot`](crate::Store::export_snapshot);
+//! this one is built by hand and has no nodes.
+//!
+//! ```
+//! use robigus::{AnalysisMetadata, AnalysisSnapshot, Configuration, export};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let snapshot = AnalysisSnapshot {
+//!     metadata: AnalysisMetadata {
+//!         robigus_version: "0.1.0".into(),
+//!         project_name: "demo".into(),
+//!         project_version: "1.0.0".into(),
+//!         source_kind: "path".into(),
+//!         source_uri: "/src/demo".into(),
+//!         source_digest: "sha256:0".into(),
+//!         configuration: Configuration::default(),
+//!         toolchain: Default::default(),
+//!         network_mode: "offline".into(),
+//!         sandbox_mode: "bwrap".into(),
+//!         options: serde_json::Value::Null,
+//!         created_at: "2026-01-01T00:00:00Z".into(),
+//!         updated_at: "2026-01-01T00:00:00Z".into(),
+//!     },
+//!     nodes: vec![],
+//!     edges: vec![],
+//!     roots: vec![],
+//!     plans: vec![],
+//!     invocations: vec![],
+//! };
+//!
+//! // JSON is lossless: it deserializes back into the same snapshot.
+//! let json = export::json(&snapshot)?;
+//! assert!(json.ends_with('\n'));
+//! assert_eq!(serde_json::from_str::<AnalysisSnapshot>(&json)?, snapshot);
+//!
+//! // DOT is a lossy visualization; an empty graph is still a valid document.
+//! assert_eq!(export::dot(&snapshot)?, "digraph {\n}\n");
+//! # Ok(())
+//! # }
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;

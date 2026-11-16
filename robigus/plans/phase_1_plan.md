@@ -1,12 +1,12 @@
 # robigus — Phase 1 Implementation Plan
 
-Status: in progress — M1 work packages are implemented and pass locally, including the strict unprivileged sandbox suite. M1 acceptance still requires a green run of the required CI jobs (including the hosted-runner sandbox job and scheduled fuzzing), which has not yet been observed. `analyze`, the proxy, expansion, and M2/M3 analysis remain unimplemented.
+Status: in progress — M1 work packages are implemented, and the required CI gate (build/lint/test, MSRV, deny, and the strict unprivileged sandbox job on `ubuntu-26.04`) has passed remotely on the `phase-1-testing` PR. The public API is fully documented, and a workspace `README.md` covers both crates. The one remaining M1 acceptance item is observing a successful run of the nightly fuzz workflow, which is triggered only from `main` (see §7). `analyze`, the proxy, expansion, and M2/M3 analysis remain unimplemented.
 Scope: v1 = Milestones M1–M3 (dependency graph analysis only)
 Normative reference: [`../AGENTS.md`](../AGENTS.md) — if this plan and the spec disagree, the spec wins.
 
 All paths are relative to the workspace root (the directory containing `Cargo.toml`, `rapt/`, and `robigus/`). The robigus crate lives in `robigus/`.
 
-Review baseline: local workspace tests, formatting, clippy, documentation, doctests, fuzz-target clippy, `cargo audit`, and `cargo deny check` passed on Rust 1.93.1. The strict sandbox suite (`ROB_REQUIRE_BWRAP=1`, run as an unprivileged user) passed 19 tests; its two ignored entries are subprocess helpers invoked by other tests. Remote CI and scheduled fuzz results were not verified.
+Review baseline: local workspace tests, formatting, clippy, documentation, doctests, fuzz-target clippy, `cargo audit`, and `cargo deny check` passed on Rust 1.93.1. The strict sandbox suite (`ROB_REQUIRE_BWRAP=1`, run as an unprivileged user) passed 19 tests; its two ignored entries are subprocess helpers invoked by other tests. Remote PR CI passed, including the sandbox job. Remote push-to-`main` CI and scheduled fuzz results have not yet been observed.
 
 ---
 
@@ -125,7 +125,7 @@ Tasks:
 - [x] CI: MSRV job pinned to 1.93.1, build/test triggers for pushes to `main` and PRs targeting `main`, a separate doctest step, a required unprivileged sandbox job, and a scheduled/manual nightly fuzz workflow (predicate and dpkg targets; the stale missing-target success fallback is removed).
 - [x] Baseline: `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo doc --locked --no-deps --all-features` clean.
 
-Acceptance: CI green on PR and push (not yet observed remotely); `cargo deny check` passes locally; manifest carries all §18 metadata.
+Acceptance: CI green on the PR (observed remotely); push-to-`main` CI follows the merge. `cargo deny check` passes; the manifest carries all §18 metadata. `tokio-rusqlite` has been removed from the workspace dependencies (the store uses `rusqlite` via `spawn_blocking`). Cargo's `unused_workspace_dependencies` warnings for `cargo_metadata` (WP-2.2) and `insta` (WP-2.4) are expected until those packages use them; they are warnings and do not fail CI.
 
 ### WP-1.2 — Core model extensions (M, ~4d)
 
@@ -273,7 +273,7 @@ Tasks:
 
 Tests: sandbox suite — loopback IP isolation; host stream/seqpacket sockets (top-level and nested) and datagram sockets; host FIFOs in both directions; inherited descriptors; fixed-peer socketpair IPC and `AF_UNIX` socket denial; host keyrings; nested user namespaces and capability/seccomp state; read-only source; hidden host home and environment; recorded `PWD`; setup-failure diagnostics; timeout and recording; a Cargo toolchain smoke test. Runner-gated with an explicit skip reason when the runner lacks namespace support; `ROB_REQUIRE_BWRAP=1` makes unavailable prerequisites fail the suite, and the required CI sandbox job sets it. BPF unit tests cover the filter's control flow, ABI guards and argument-width handling.
 
-Acceptance: fail-closed behavior and host-IPC isolation verified locally as an unprivileged user; the hosted-runner sandbox job still needs a green remote run. The first remote run failed on `ubuntu-24.04` (bubblewrap 0.9.0 lacks overlay options, diagnosed but not confirmed from the log); the job now runs on `ubuntu-26.04`, enforces bubblewrap ≥ 0.11, logs bwrap's stderr and the namespace sysctls, and on failure lifts the AppArmor user-namespace restriction on the disposable VM. The second remote run passed the probe and 18 of 19 sandbox tests; the Cargo smoke test failed because the runner's rustup toolchain lives under `$HOME`, which the sandbox never exposes. The job now also installs the distribution `cargo` and `rustc` into `/usr/bin`.
+Acceptance: met. Fail-closed behavior and host-IPC isolation are verified locally as an unprivileged user, and the required hosted-runner sandbox job has passed remotely with `ROB_REQUIRE_BWRAP=1` (all 19 tests). History: the first remote run failed on `ubuntu-24.04` (bubblewrap 0.9.0 lacks overlay options, diagnosed but not confirmed from the log); the job now runs on `ubuntu-26.04`, enforces bubblewrap ≥ 0.11, logs bwrap's stderr and the namespace sysctls, and on failure lifts the AppArmor user-namespace restriction on the disposable VM. The second remote run passed the probe and 18 of 19 sandbox tests; the Cargo smoke test failed because the runner's rustup toolchain lives under `$HOME`, which the sandbox never exposes. The job now also installs the distribution `cargo` and `rustc` into `/usr/bin`.
 
 ### WP-1.8 — CLI skeleton (M, ~3d)
 
@@ -514,12 +514,13 @@ Tests: fixture with a known divergence between methods.
 
 | Item | Where | Notes |
 |---|---|---|
-| MSRV CI job (1.93.1) | WP-1.1 | Configured; remote job results not verified in this review |
-| `cargo deny` (licenses + advisories) | WP-1.1 | Configured; local `cargo deny check` passed in this review |
-| Nightly fuzz CI job | WP-1.3 | Scheduled/manual workflow with predicate and dpkg targets; stale fallback removed. Actual runs not yet verified |
-| Sandbox-capable CI job | WP-1.7 | Required unprivileged `ROB_REQUIRE_BWRAP=1` job in the CI gate; the full suite passes locally as an unprivileged user. Runs on `ubuntu-26.04` (bubblewrap ≥ 0.11 required); first remote run on 24.04 failed, the 26.04 job is not yet verified remotely |
+| MSRV CI job (1.93.1) | WP-1.1 | Passed remotely on the PR |
+| `cargo deny` (licenses + advisories) | WP-1.1 | Passed remotely on the PR and locally |
+| Nightly fuzz CI job | WP-1.3 | Scheduled/manual workflow with predicate and dpkg targets. It now fails if no targets are found and uploads crash artifacts on failure. GitHub runs scheduled workflows only from the default branch, and `main` still carries the old workflow, so a run must be observed after merging (or started manually with `workflow_dispatch` against this branch). **Remaining M1 item** |
+| Sandbox-capable CI job | WP-1.7 | Required unprivileged `ROB_REQUIRE_BWRAP=1` job in the CI gate on `ubuntu-26.04` (bubblewrap ≥ 0.11, distribution `cargo`/`rustc`). Passed remotely |
 | Push-trigger CI | WP-1.1 | Build/test workflow triggers on pushes to `main` and PRs targeting `main` |
-| rustdoc with examples | each WP | Warning-strict doc build and a separate doctest step configured; public-API example coverage remains incomplete (DoD) |
+| rustdoc with examples | each WP | Every public item in `robigus` and `rapt` is documented, and both crates enable `#![warn(missing_docs)]` (CI's `-D warnings` makes a gap a failure). Key entry points have doctests (graph, predicates, dpkg, features, store, export, detection, fetch, sandbox); new APIs must keep this up |
+| Workspace README | DoD | `README.md` at the workspace root gives an overview of both crates, a `tsp-analyzer` quickstart, library examples, sandbox host requirements, and the development workflow. Update it when `analyze` lands (M2) |
 | Security policy | WP-1.1 | `robigus/SECURITY.md` with its own reporting path and sandbox scope; root `SECURITY.md` covers the workspace |
 | Tag `v0.1.0` | DoD | After Definition of Done below |
 
@@ -557,7 +558,7 @@ Proposed slicing only, not a record of actual PRs or merge state; each eventual 
 | 6 | WP-1.6 detection | fixture tests |
 | 7 | WP-1.7 sandbox foundation | sandbox suite |
 | 8 | WP-1.8 CLI skeleton | integration tests |
-| 9 | WP-1.9 export | round-trip test; **M1 done** once the CI gate, including the sandbox job, is green |
+| 9 | WP-1.9 export | round-trip test; CI gate including the sandbox job green (observed); **M1 done** once a nightly fuzz run passes |
 | 10 | WP-2.1 proxy | wiremock tests |
 | 11 | WP-2.2 cargo analyzer | snapshots |
 | 12 | WP-2.3 expansion + `analyze` + `print --why` | resume/limit tests |
@@ -584,7 +585,7 @@ Proposed slicing only, not a record of actual PRs or merge state; each eventual 
 | LLM anchor verification false positives/negatives | Bad or dropped evidence | Medium | Loose identifier matching + findings recorded; L3 cap bounds impact |
 | `gix` API churn | Build breakage | Low | Pin version; isolate behind `fetch.rs` |
 | cargo-fuzz nightly job maintenance | CI noise | Low | Scheduled job, separate from the PR gate |
-| CI runner lacks namespace support or a new enough bubblewrap | Sandbox job fails | Medium (observed on `ubuntu-24.04`) | The required job sets `ROB_REQUIRE_BWRAP=1`, so missing support fails rather than skips; pinned to `ubuntu-26.04` with a bubblewrap ≥ 0.11 check; AppArmor restriction lifted only on the disposable VM |
+| CI runner lacks namespace support or a new enough bubblewrap | Sandbox job fails | Low on `ubuntu-26.04` (observed on `ubuntu-24.04`; resolved) | The required job sets `ROB_REQUIRE_BWRAP=1`, so missing support fails rather than skips; pinned to `ubuntu-26.04` with a bubblewrap ≥ 0.11 check; AppArmor restriction lifted only on the disposable VM |
 | Host bubblewrap older than 0.11 (e.g. Ubuntu 24.04's 0.9.0) | Tool unusable on that host | Medium on LTS installs | Fail closed with an explicit version diagnostic; document the requirement; the native backend (WP-3.5) is the long-term fallback |
 | Regex-based `build.rs` analysis false positives | Wrong edges | Medium | L2 confidence cap; build observation (WP-3.4) cross-checks |
 
@@ -597,10 +598,10 @@ Proposed slicing only, not a record of actual PRs or merge state; each eventual 
 - [ ] Sandbox: fail-closed verified (exit 4 with diagnostics); bwrap and native backends pass the sandbox suite on a required capable runner; the allowlist proxy blocks non-allowlisted hosts. (Host-IPC isolation is fixed for bwrap and passes locally.)
 - [ ] Offline mode produces declared-but-unresolved graphs with `network_mode = "offline"`.
 - [ ] LLM sub-agents: opt-in only, anchor-verified, capped at L3, injection-resistant (tested).
-- [ ] CI green on PR and push: fmt, clippy `-D warnings`, doc, test, audit, deny, MSRV 1.93.1; nightly fuzz running.
+- [ ] CI green on PR and push: fmt, clippy `-D warnings`, doc, test, audit, deny, MSRV 1.93.1; nightly fuzz running. (PR CI is green; push-to-`main` and fuzz runs remain to be observed.)
 - [x] `robigus/Cargo.toml` carries full §18 metadata; `robigus/SECURITY.md` exists with its own reporting path (spec §17).
 - [ ] Differential and fuzz tests cover dpkg comparison; accepted-input and `Eq`/`Hash` fixes are implemented, but scheduled fuzz runs remain to be verified.
-- [ ] rustdoc complete for the public API; README quickstart.
+- [x] rustdoc complete for the current public API (enforced by `missing_docs`); README quickstart. Both must be extended as M2/M3 add APIs and `analyze`.
 - [ ] Tag `v0.1.0`.
 
 ## 12. Explicit non-goals during Phase 1
