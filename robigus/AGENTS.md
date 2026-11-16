@@ -460,7 +460,7 @@ Fetched sources are untrusted. All analysis that executes project code MUST run 
 ### 10.2 Requirements
 
 - Run as an unprivileged user in isolated namespaces (mount, PID, network, user).
-- Prefer `bubblewrap` (`bwrap`) when available; otherwise use Landlock plus seccomp and namespaces via the `landlock` and `nix` crates.
+- Prefer `bubblewrap` (`bwrap`) when available; otherwise use Landlock plus seccomp and namespaces via the `landlock` and `nix` crates. The bubblewrap backend requires bubblewrap ≥ 0.11 (read-only overlay support; Ubuntu 26.04+); an older `bwrap` counts as unavailable.
 - `--sandbox <mode>` accepts `auto` (default: `bwrap` if available, else native), `bwrap`, or `native`. There is **no** `none` mode.
 - **Fail closed**: if no sandbox can be established — for example unprivileged user namespaces blocked by AppArmor on stock Ubuntu, `bwrap` missing, or seccomp/namespace setup failure — the tool MUST exit with code 4, print `no sandbox available`, and include a detailed diagnostic listing every mechanism attempted and why each failed. (Operator guidance, not a tool mode: run robigus where namespaces are permitted, such as a configured CI runner.)
 - Mount the source tree read-only; provide writable tmpfs for build output and a writable `CARGO_HOME` inside the sandbox (required by `cargo metadata`).

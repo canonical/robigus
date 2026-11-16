@@ -178,6 +178,7 @@ async fn probe_bwrap() -> Result<PathBuf, String> {
                 "{SANITIZER} is required to close inherited descriptors before bubblewrap"
             ));
         }
+        check_bwrap_version(&executable).await?;
         // Probe with the full isolation policy used for real runs: overlays,
         // seccomp and descriptor sanitation. Availability means all of them work.
         let scratch = tempfile::tempdir()
@@ -232,6 +233,62 @@ async fn probe_bwrap() -> Result<PathBuf, String> {
             }
         }
     }
+}
+
+/// Oldest bubblewrap with `--overlay-src`/`--ro-overlay`, which the isolation
+/// policy requires (Ubuntu 26.04 ships 0.11.1; Ubuntu 24.04's 0.9.0 is too old).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const MIN_BWRAP_VERSION: (u64, u64) = (0, 11);
+
+/// Rejects a bubblewrap too old for the policy with an actionable cause,
+/// rather than letting the probe fail on an unknown option.
+#[cfg(target_os = "linux")]
+async fn check_bwrap_version(executable: &Path) -> Result<(), String> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new(executable)
+            .arg("--version")
+            .env_clear()
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("{} --version timed out", executable.display()))?
+    .map_err(|error| format!("failed to run {} --version: {error}", executable.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        return Err(format!(
+            "{} --version failed ({})",
+            executable.display(),
+            output.status
+        ));
+    }
+    require_bwrap_version(stdout.trim())
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn require_bwrap_version(reported: &str) -> Result<(), String> {
+    let (major, minor) = MIN_BWRAP_VERSION;
+    let version = parse_bwrap_version(reported)
+        .ok_or_else(|| format!("unrecognized bubblewrap version output {reported:?}"))?;
+    if version < MIN_BWRAP_VERSION {
+        return Err(format!(
+            "bubblewrap {}.{} is too old; {major}.{minor} or newer is required for \
+             read-only overlays (Ubuntu 26.04 or later)",
+            version.0, version.1
+        ));
+    }
+    Ok(())
+}
+
+/// Parses `bubblewrap X.Y[.Z...]` into `(X, Y)`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_bwrap_version(reported: &str) -> Option<(u64, u64)> {
+    let mut parts = reported.strip_prefix("bubblewrap ")?.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 /// Bubblewrap emits JSON objects for setup and, only after successful setup and
@@ -767,6 +824,24 @@ mod tests {
             tool_version: None,
         };
         (dir, spec)
+    }
+
+    #[test]
+    fn requires_bubblewrap_with_overlay_support() {
+        assert_eq!(parse_bwrap_version("bubblewrap 0.11.1"), Some((0, 11)));
+        assert_eq!(parse_bwrap_version("bubblewrap 1.0"), Some((1, 0)));
+        assert_eq!(parse_bwrap_version("bwrap 0.11.1"), None);
+        assert_eq!(parse_bwrap_version("bubblewrap 0"), None);
+        assert!(require_bwrap_version("bubblewrap 0.11.0").is_ok());
+        assert!(require_bwrap_version("bubblewrap 0.12.0").is_ok());
+        assert!(require_bwrap_version("bubblewrap 1.0.0").is_ok());
+        let old = require_bwrap_version("bubblewrap 0.9.0").unwrap_err();
+        assert!(
+            old.contains("0.9 is too old") && old.contains("0.11"),
+            "{old}"
+        );
+        let garbled = require_bwrap_version("garbage").unwrap_err();
+        assert!(garbled.contains("unrecognized"), "{garbled}");
     }
 
     #[cfg(unix)]

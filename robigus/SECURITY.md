@@ -34,5 +34,6 @@ Known limitations that are **not** yet in scope:
 - CPU, memory and process-count limits (planned for the native backend, WP-3.5).
 - Allowlisted network egress, which is unavailable until the proxy lands (WP-2.1).
 - The tool refuses to run as root; running it under other privileged configurations is unsupported.
+- bubblewrap 0.11 or newer (Ubuntu 26.04 or later) is required for the read-only overlays; older versions, such as Ubuntu 24.04's 0.9.0, are rejected and no sandbox is established.
 
 Exported JSON includes recorded tool arguments and environments. Treat exports as potentially sensitive.

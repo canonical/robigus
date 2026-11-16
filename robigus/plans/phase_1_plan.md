@@ -256,6 +256,8 @@ Isolation boundary (implemented and tested as an unprivileged user):
 - a fixed `/usr/bin/bash` sanitizer closes every inherited descriptor except stdio and the filter before exec'ing bubblewrap, and fails closed if any survives;
 - the availability probe uses the identical policy, so `SandboxUnavailable` means the full policy cannot be established.
 
+Host requirement: bubblewrap ≥ 0.11 (first release with `--overlay-src`/`--ro-overlay`), i.e. Ubuntu 26.04 or later. Ubuntu 24.04 ships 0.9.0 and is unsupported; the probe checks `bwrap --version` first and reports an actionable `SandboxUnavailable` cause instead of an unknown-option failure.
+
 Named Unix sockets are unavailable inside the sandbox. Cgroup/process resource limits remain WP-3.5; allowlisted networking needs an explicit proxy transport (WP-2.1). Informational: a workload can read bubblewrap's command line, which includes absolute host paths of the source and log directories (no file contents).
 
 `SandboxUnavailable` reports backend probing failures; after selection, `SandboxError::BwrapSetup` reports bubblewrap launch, setup, or supervision failures with the stderr log. A missing completion report does not prove the command never ran. Bubblewrap's completion protocol requires a shell wrapper to restore stdin: a missing requested executable is reported as exit 127, and command signals are encoded as 128 + signal. Command cancellation terminates the child and leaves its pre-launch invocation marked `running`, indicating an interrupted execution. The canonical sandbox working directory is now recorded as `PWD`; non-UTF-8 working directories are rejected before launch.
@@ -271,7 +273,7 @@ Tasks:
 
 Tests: sandbox suite — loopback IP isolation; host stream/seqpacket sockets (top-level and nested) and datagram sockets; host FIFOs in both directions; inherited descriptors; fixed-peer socketpair IPC and `AF_UNIX` socket denial; host keyrings; nested user namespaces and capability/seccomp state; read-only source; hidden host home and environment; recorded `PWD`; setup-failure diagnostics; timeout and recording; a Cargo toolchain smoke test. Runner-gated with an explicit skip reason when the runner lacks namespace support; `ROB_REQUIRE_BWRAP=1` makes unavailable prerequisites fail the suite, and the required CI sandbox job sets it. BPF unit tests cover the filter's control flow, ABI guards and argument-width handling.
 
-Acceptance: fail-closed behavior and host-IPC isolation verified locally as an unprivileged user; the hosted-runner sandbox job (including its Ubuntu 24.04 AppArmor setup) still needs a green remote run.
+Acceptance: fail-closed behavior and host-IPC isolation verified locally as an unprivileged user; the hosted-runner sandbox job still needs a green remote run. The first remote run failed on `ubuntu-24.04` (bubblewrap 0.9.0 lacks overlay options, diagnosed but not confirmed from the log); the job now runs on `ubuntu-26.04`, enforces bubblewrap ≥ 0.11, logs bwrap's stderr and the namespace sysctls, and on failure lifts the AppArmor user-namespace restriction on the disposable VM.
 
 ### WP-1.8 — CLI skeleton (M, ~3d)
 
@@ -515,7 +517,7 @@ Tests: fixture with a known divergence between methods.
 | MSRV CI job (1.93.1) | WP-1.1 | Configured; remote job results not verified in this review |
 | `cargo deny` (licenses + advisories) | WP-1.1 | Configured; local `cargo deny check` passed in this review |
 | Nightly fuzz CI job | WP-1.3 | Scheduled/manual workflow with predicate and dpkg targets; stale fallback removed. Actual runs not yet verified |
-| Sandbox-capable CI job | WP-1.7 | Required unprivileged `ROB_REQUIRE_BWRAP=1` job in the CI gate; the full suite passes locally as an unprivileged user. Hosted-runner AppArmor setup not yet verified remotely |
+| Sandbox-capable CI job | WP-1.7 | Required unprivileged `ROB_REQUIRE_BWRAP=1` job in the CI gate; the full suite passes locally as an unprivileged user. Runs on `ubuntu-26.04` (bubblewrap ≥ 0.11 required); first remote run on 24.04 failed, the 26.04 job is not yet verified remotely |
 | Push-trigger CI | WP-1.1 | Build/test workflow triggers on pushes to `main` and PRs targeting `main` |
 | rustdoc with examples | each WP | Warning-strict doc build and a separate doctest step configured; public-API example coverage remains incomplete (DoD) |
 | Security policy | WP-1.1 | `robigus/SECURITY.md` with its own reporting path and sandbox scope; root `SECURITY.md` covers the workspace |
@@ -570,7 +572,7 @@ Proposed slicing only, not a record of actual PRs or merge state; each eventual 
 
 | Risk | Impact | Likelihood | Mitigation |
 |---|---|---|---|
-| Unprivileged user namespaces blocked (stock Ubuntu 24.04 AppArmor) | Tool unusable on some hosts | High on default installs | Fail-closed diagnostics (WP-1.7); document operator guidance; test the exit-4 path |
+| Unprivileged user namespaces blocked (stock Ubuntu AppArmor) | Tool unusable on some hosts | High on default installs | Fail-closed diagnostics (WP-1.7); document operator guidance; test the exit-4 path |
 | Host IPC through sandbox mounts or inherited state | Offline sandbox could reach host services | Mitigated | Private `nodev` overlays, seccomp socket/keyring policy, descriptor sanitation; regressions for sockets, FIFOs, descriptors and keyrings run in the required sandbox job |
 | Dpkg comparison/hash regressions | Hashed identities could behave incorrectly | Mitigated | UTF-8, `Eq`/`Hash`, differential, property, and fuzz-target coverage added; verify scheduled fuzz runs |
 | Local cache contents tampered after publication | Cache hit returned as verified despite modified contents | Low (trusted-cache policy) | Spec §7.2: the cache is user-owned trusted state and must not be shared with less-trusted users |
@@ -582,7 +584,8 @@ Proposed slicing only, not a record of actual PRs or merge state; each eventual 
 | LLM anchor verification false positives/negatives | Bad or dropped evidence | Medium | Loose identifier matching + findings recorded; L3 cap bounds impact |
 | `gix` API churn | Build breakage | Low | Pin version; isolate behind `fetch.rs` |
 | cargo-fuzz nightly job maintenance | CI noise | Low | Scheduled job, separate from the PR gate |
-| CI runner lacks namespace support | Sandbox job fails | Medium | The required job sets `ROB_REQUIRE_BWRAP=1`, so missing support fails rather than skips; AppArmor setup in the job |
+| CI runner lacks namespace support or a new enough bubblewrap | Sandbox job fails | Medium (observed on `ubuntu-24.04`) | The required job sets `ROB_REQUIRE_BWRAP=1`, so missing support fails rather than skips; pinned to `ubuntu-26.04` with a bubblewrap ≥ 0.11 check; AppArmor restriction lifted only on the disposable VM |
+| Host bubblewrap older than 0.11 (e.g. Ubuntu 24.04's 0.9.0) | Tool unusable on that host | Medium on LTS installs | Fail closed with an explicit version diagnostic; document the requirement; the native backend (WP-3.5) is the long-term fallback |
 | Regex-based `build.rs` analysis false positives | Wrong edges | Medium | L2 confidence cap; build observation (WP-3.4) cross-checks |
 
 ## 11. Definition of Done (Phase 1)

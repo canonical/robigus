@@ -113,7 +113,10 @@ jobs:
     name: Unprivileged bubblewrap sandbox
     # An ephemeral GitHub-hosted VM provides sudo for package/policy setup;
     # the probe and tests themselves must run as the unprivileged runner user.
-    runs-on: ubuntu-24.04
+    # Ubuntu 26.04 is required: the sandbox uses read-only overlays
+    # (--overlay-src/--ro-overlay), added in bubblewrap 0.11. Ubuntu 24.04
+    # ships bubblewrap 0.9.0, which rejects those options.
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
 
     steps:
@@ -135,38 +138,56 @@ jobs:
           }
           capabilities=$(getcap /usr/bin/bwrap)
           test -z "$capabilities" || { echo "::error::Unexpected bwrap file capabilities: $capabilities"; exit 1; }
-          /usr/bin/bwrap --version
+          version=$(/usr/bin/bwrap --version)
+          echo "$version"
+          if ! [[ "$version" =~ ^bubblewrap\ ([0-9]+)\.([0-9]+) ]] ||
+             (( BASH_REMATCH[1] == 0 && BASH_REMATCH[2] < 11 )); then
+            echo "::error::bubblewrap >= 0.11 is required for read-only overlays; found: $version"
+            exit 1
+          fi
+          uname -r
+          for knob in kernel.unprivileged_userns_clone user.max_user_namespaces \
+                      kernel.apparmor_restrict_unprivileged_userns; do
+            sysctl "$knob" 2>/dev/null || true
+          done
 
           # Match the backend's namespaces and read-only runtime overlay. The
           # test suite itself exercises the full policy, including seccomp.
+          # bwrap's stderr is kept so a failure is diagnosable from the log.
           probe_bwrap() {
+            local empty status
             empty=$(mktemp -d)
             timeout 15 /usr/bin/bwrap \
-              --unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts \
-              --die-with-parent --new-session --cap-drop ALL \
+              --unshare-user --disable-userns --assert-userns-disabled \
+              --unshare-pid --unshare-net --unshare-ipc --unshare-uts \
+              --die-with-parent --new-session --cap-drop ALL --clearenv \
               --overlay-src "$empty" --overlay-src /usr --ro-overlay /usr --remount-ro /usr \
               --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
-              --proc /proc --dev /dev --tmpfs /tmp --json-status-fd 1 -- /usr/bin/true
+              --proc /proc --dev /dev --tmpfs /tmp --json-status-fd 1 -- /usr/bin/true \
+              2> "$RUNNER_TEMP/bwrap-probe.err"
             status=$?
             rmdir "$empty"
+            if (( status != 0 )); then
+              echo "bwrap probe exited with status $status:"
+              cat "$RUNNER_TEMP/bwrap-probe.err"
+            fi
             return "$status"
           }
           if ! probe_bwrap; then
-            # Ubuntu 24.04 may restrict unprivileged user namespaces via
-            # AppArmor. On this disposable VM, allow them only for /usr/bin/bwrap,
-            # rather than disabling the system-wide restriction. This profile is
-            # otherwise unconfined and exposes userns kernel interfaces to bwrap.
-            if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] &&
-               [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" == 1 ]]; then
-              cat > "$RUNNER_TEMP/robigus-ci-bwrap.apparmor" <<'EOF'
-          abi <abi/4.0>,
-          include <tunables/global>
-          profile robigus-ci-bwrap /usr/bin/bwrap flags=(unconfined) {
-            userns,
-          }
-          EOF
-              sudo apparmor_parser -r "$RUNNER_TEMP/robigus-ci-bwrap.apparmor"
-              probe_bwrap
+            # Ubuntu restricts unprivileged user namespaces through AppArmor
+            # (kernel.apparmor_restrict_unprivileged_userns=1), and its
+            # bwrap-userns-restrict profile confines bwrap further. Lifting the
+            # restriction system-wide is acceptable ONLY because this is a
+            # disposable GitHub-hosted VM; it mirrors upstream bubblewrap's CI.
+            # It must never be done on a shared or long-lived host.
+            knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+            if [[ -r "$knob" && "$(cat "$knob")" != 0 ]]; then
+              echo 'Disabling the AppArmor user-namespace restriction on this disposable VM'
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+              probe_bwrap || {
+                echo '::error::Unprivileged bubblewrap namespace probe failed after lifting the AppArmor restriction'
+                exit 1
+              }
             else
               echo '::error::Unprivileged bubblewrap namespace probe failed'
               exit 1
