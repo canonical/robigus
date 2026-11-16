@@ -30,6 +30,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "dpkg_comparator"
+path = "fuzz_targets/dpkg_comparator.rs"
+test = false
+doc = false
+bench = false
+
 # Prevent this crate from interfering with the parent workspace.
 [workspace]
 members = ["."]

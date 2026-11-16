@@ -631,7 +631,7 @@ impl Store {
             .map(|conflict| {
                 Ok((
                     conflict.name.clone(),
-                    checked_optional_constraint(conflict.version_req.as_ref(), "conflict")?,
+                    stored_version_req(conflict.version_req.as_ref(), "conflict")?,
                 ))
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
@@ -749,8 +749,9 @@ impl Store {
     /// merged evidence) rather than duplicated (spec §5.2, §11.2): on a
     /// partial-unique-index violation the existing row is selected, merged
     /// in Rust, and updated — `ON CONFLICT` is not used against partial
-    /// indexes. Optional version constraints that would not round-trip
-    /// unchanged (including `Some(VersionConstraint::Any)`) are rejected with
+    /// indexes. `Some(VersionConstraint::Any)` is stored as a sentinel distinct
+    /// from `None`, so the two remain separate edges. Other optional version
+    /// constraints that would not round-trip unchanged are rejected with
     /// [`StoreError::Unrepresentable`] before any edge or placeholder is written.
     /// Predicates must also decode within the exact [`AnalysisSnapshot`] JSON
     /// envelope. Placeholder identities follow the same version-spelling policy
@@ -763,7 +764,7 @@ impl Store {
                     edge.from
                 )));
             }
-            checked_optional_constraint(edge.requirement.version_req.as_ref(), "edge")?;
+            stored_version_req(edge.requirement.version_req.as_ref(), "edge")?;
             if predicate_exceeds_depth(&edge.predicate, JSON_NESTING_PRECHECK_LIMIT) {
                 return Err(StoreError::Unrepresentable(format!(
                     "edge predicate exceeds the safe JSON serialization nesting preflight limit of {JSON_NESTING_PRECHECK_LIMIT}"
@@ -1580,24 +1581,49 @@ fn checked_optional_path(path: Option<&Path>, context: &str) -> Result<String, S
         })
 }
 
-fn checked_optional_constraint(
+/// Storage-only `version_req` spelling of `Some(VersionConstraint::Any)`.
+///
+/// `''` keeps meaning `None` (spec §11.2), and [`VersionConstraint::Any`]'s
+/// own requirement text is also `''`, so `Any` needs a distinct spelling for
+/// `Some(Any)` to round-trip (spec §11.3). `@` cannot start a Cargo SemVer
+/// requirement (operator, digit, or wildcard) or the Debian `op version` form,
+/// so this never collides with [`VersionConstraint::requirement_text`] output.
+/// It participates in the edge and conflict unique indexes like any other
+/// text, keeping `None` and `Some(Any)` distinct as in [`DependencyGraph`].
+const ANY_VERSION_REQ: &str = "@any";
+
+/// Encodes an optional constraint for a `version_req` column. Constraints
+/// whose text would not load back unchanged are rejected.
+fn stored_version_req(
     constraint: Option<&VersionConstraint>,
     context: &str,
 ) -> Result<String, StoreError> {
-    let Some(constraint) = constraint else {
-        return Ok(String::new());
+    let constraint = match constraint {
+        None => return Ok(String::new()),
+        Some(VersionConstraint::Any) => return Ok(ANY_VERSION_REQ.to_string()),
+        Some(constraint) => constraint,
     };
     let text = constraint.requirement_text();
-    // Empty SQL text means None, not Some(Any). Other variants must also
-    // survive the text parser without changing their payload or variant.
+    // Other variants must survive the text parser without changing their
+    // payload or variant, and must not alias `None` or the `Any` sentinel.
     if text.is_empty()
-        || !matches!(VersionConstraint::from_requirement_text(&text), Ok(ref loaded) if loaded == constraint)
+        || text == ANY_VERSION_REQ
+        || !matches!(loaded_version_req(&text), Ok(Some(ref loaded)) if loaded == constraint)
     {
         return Err(StoreError::Unrepresentable(format!(
             "{context} constraint {constraint:?} does not round-trip through stored text"
         )));
     }
     Ok(text)
+}
+
+/// Decodes a `version_req` column written by [`stored_version_req`].
+fn loaded_version_req(text: &str) -> Result<Option<VersionConstraint>, StoreError> {
+    match text {
+        "" => Ok(None),
+        ANY_VERSION_REQ => Ok(Some(VersionConstraint::Any)),
+        text => VersionConstraint::from_requirement_text(text).map(Some),
+    }
 }
 
 fn checked_duration(duration_ms: u64) -> Result<i64, StoreError> {
@@ -1619,12 +1645,7 @@ fn upsert_edge(tx: &rusqlite::Transaction<'_>, edge: &Edge) -> Result<(), StoreE
     };
     let requirement = edge.requirement.name.clone();
     let requirement_kind = edge.requirement.kind.as_str().to_string();
-    let version_req = edge
-        .requirement
-        .version_req
-        .as_ref()
-        .map(|req| req.requirement_text())
-        .unwrap_or_default();
+    let version_req = stored_version_req(edge.requirement.version_req.as_ref(), "edge")?;
     let predicate = edge.predicate.canonical_text();
     let kinds = serde_json::to_string(&edge.kinds)?;
     let evidence = serde_json::to_string(&edge.evidence)?;
@@ -1931,9 +1952,7 @@ fn read_graph_snapshot(conn: &rusqlite::Connection) -> Result<GraphSnapshot, Sto
             let version_req_text: String = row.get("version_req")?;
             let conflict = Conflict {
                 name,
-                version_req: (!version_req_text.is_empty())
-                    .then(|| VersionConstraint::from_requirement_text(&version_req_text))
-                    .transpose()?,
+                version_req: loaded_version_req(&version_req_text)?,
             };
             let Some(node) = nodes.get_mut(&package_row) else {
                 return Err(StoreError::Corrupt(
@@ -1979,10 +1998,7 @@ fn read_graph_snapshot(conn: &rusqlite::Connection) -> Result<GraphSnapshot, Sto
                         "unknown requirement kind '{requirement_kind_text}'"
                     ))
                 })?,
-                version_req: match row.get::<_, String>("version_req")? {
-                    text if text.is_empty() => None,
-                    text => Some(VersionConstraint::from_requirement_text(&text)?),
-                },
+                version_req: loaded_version_req(&row.get::<_, String>("version_req")?)?,
             };
             let kinds: BTreeSet<DependencyKind> =
                 serde_json::from_str(&row.get::<_, String>("kinds")?)?;

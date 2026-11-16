@@ -1,10 +1,12 @@
 # robigus — Phase 1 Implementation Plan
 
-Status: in progress — WP-1.1 to WP-1.6 and WP-1.8 to WP-1.9 implemented; WP-1.7 foundation implemented with open socket isolation issue
+Status: in progress — M1 work packages are implemented and pass locally, including the strict unprivileged sandbox suite. M1 acceptance still requires a green run of the required CI jobs (including the hosted-runner sandbox job and scheduled fuzzing), which has not yet been observed. `analyze`, the proxy, expansion, and M2/M3 analysis remain unimplemented.
 Scope: v1 = Milestones M1–M3 (dependency graph analysis only)
 Normative reference: [`../AGENTS.md`](../AGENTS.md) — if this plan and the spec disagree, the spec wins.
 
 All paths are relative to the workspace root (the directory containing `Cargo.toml`, `rapt/`, and `robigus/`). The robigus crate lives in `robigus/`.
+
+Review baseline: local workspace tests, formatting, clippy, documentation, doctests, fuzz-target clippy, `cargo audit`, and `cargo deny check` passed on Rust 1.93.1. The strict sandbox suite (`ROB_REQUIRE_BWRAP=1`, run as an unprivileged user) passed 19 tests; its two ignored entries are subprocess helpers invoked by other tests. Remote CI and scheduled fuzz results were not verified.
 
 ---
 
@@ -24,7 +26,7 @@ Ubuntu archive mapping (M4) and packaging plans (M5) are explicitly out of scope
 ## 2. Ground rules
 
 - **Spec sections are binding.** Each work package below cites the `AGENTS.md` sections it implements.
-- **Edition 2024, MSRV 1.93.1 (the default Rust toolchain on Ubuntu 26.04 LTS), GPL-3.0-only.** `#![forbid(unsafe_code)]` at the crate root; the only scoped `#[allow(unsafe_code)]` lives in `sandbox.rs`.
+- **Edition 2024, MSRV 1.93.1 (the default Rust toolchain on Ubuntu 26.04 LTS), GPL-3.0-or-later.** The crate currently has `#![forbid(unsafe_code)]`; the planned native backend is the only permitted scoped exception, if needed.
 - **Errors, never panics.** All library errors are typed (`thiserror`); the CLI renders them with `miette`. No `unwrap`/`expect` outside tests.
 - **Determinism.** Analyzers MUST produce identical output for identical inputs: `BTreeMap`/`BTreeSet` ordering everywhere, sorted fixture output, redacted snapshots.
 - **Fail closed.** If the sandbox cannot be established, nothing runs (exit 4). There is no `none` mode.
@@ -68,7 +70,7 @@ flowchart TD
 
 ### 3.2 Indicative schedule
 
-Durations are indicative person-day estimates for a single implementer; parallel tracks assume a second reviewer, not a second implementer.
+Durations and dates below are original indicative estimates, not actual completion dates; parallel tracks assume a second reviewer, not a second implementer.
 
 ```mermaid
 gantt
@@ -119,11 +121,11 @@ Tasks:
 - [x] `robigus/Cargo.toml`: add `description`, `license = "GPL-3.0-only"`, `repository`, `keywords`, `categories`, `rust-version = "1.93.1"`.
 - [x] Workspace `Cargo.toml`: add shared deps — `petgraph`, `rusqlite` (bundled), `rusqlite_migration`, `tracing`, `tracing-subscriber`, `miette`, `sha2`, `tar`, `zstd`, `walkdir`, `ignore`, `toml`, `gix`, `cargo_metadata`, `toml_edit`; dev-deps `insta`, `proptest`, `wiremock`. (`reqwest`, `clap`, `flate2`, `xz2`, `chrono`, `regex`, `serde*`, `thiserror`, `tokio`, `ubuntu-info-rust` already exist.)
 - [x] Add `deny.toml` and a `cargo deny` CI job (licenses must accept GPL-3.0-only family; advisories on).
-- [x] Add a robigus `SECURITY.md` with its own reporting path (the workspace one points at `rapt`).
-- [x] CI: add an MSRV job pinned to 1.93.1; trigger workflows on pushes as well as PRs; reserve a nightly fuzz job (wired up once targets exist in WP-1.2/WP-1.3).
+- [x] Repository-level `SECURITY.md` covers the workspace; `robigus/SECURITY.md` gives robigus its own reporting path and sandbox scope (spec §17 updated accordingly).
+- [x] CI: MSRV job pinned to 1.93.1, build/test triggers for pushes to `main` and PRs targeting `main`, a separate doctest step, a required unprivileged sandbox job, and a scheduled/manual nightly fuzz workflow (predicate and dpkg targets; the stale missing-target success fallback is removed).
 - [x] Baseline: `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo doc --locked --no-deps --all-features` clean.
 
-Acceptance: CI green on PR and push; `cargo deny check` passes; manifest carries all §18 metadata.
+Acceptance: CI green on PR and push (not yet observed remotely); `cargo deny check` passes locally; manifest carries all §18 metadata.
 
 ### WP-1.2 — Core model extensions (M, ~4d)
 
@@ -134,7 +136,8 @@ Files: `robigus/src/error.rs` (new), `robigus/src/model.rs`, `robigus/src/dpkg.r
 Tasks:
 
 - [x] `error.rs`: `RobigusError` plus sub-errors (`StoreError`, `FetchError`, `PredicateError`, `DpkgError`, `SandboxUnavailable`) via `thiserror`; all implement `std::error::Error`.
-- [x] `dpkg.rs`: fix the `Eq`/`Ord` contract — `PartialEq` MUST agree with `Ord` (today `1.02 != 1.2` under `==` while `Ord` says `Equal`). Add a proptest asserting `a == b ⇔ a.cmp(b) == Equal`. Convert `parse` to a typed `DpkgError`.
+- [x] `dpkg.rs`: make `PartialEq` agree with `Ord` (including `1.02`/`1.2`); add the equivalence proptest and use typed `DpkgError`.
+- [x] Fix remaining dpkg contracts: comparison handles accepted UTF-8 without slicing panics, and equal versions including `1.0`/`1.0-0` hash equally. Deterministic, randomized, and differential `dpkg --compare-versions` tests cover the changes; a comparator fuzz target is configured.
 - [x] `model.rs`: unify `PackageVersion::Debian` with `DpkgVersion` (variant becomes `Debian(DpkgVersion)`; `Display` omits epoch `0` and empty revision). Keep identity ordering (`Ord` on `PackageId`) separate from semantic version ordering.
 - [x] `DependencyKind::Runtime`; correct the `Normal` doc comment; `Dependency.kind` becomes `BTreeSet<DependencyKind>`.
 - [x] `Dependency.platform: Option<String>` → `predicate: Predicate`; `Dependency.features` → `BTreeSet<FeatureExpr>`.
@@ -143,14 +146,14 @@ Tasks:
 - [x] `MachineArch { Ubuntu(Architecture), All, Unsupported(String) }` with expansion helpers; default analysis set = `ubuntu-info-rust` `Architecture::ALL` minus `I386` (i.e. `amd64`, `amd64v3`, `arm64`, `armhf`, `ppc64el`, `riscv64`, `s390x`).
 - [x] `SourceKind::Tarball { url, digest: Option<String> }`; deterministic tree-digest helper (SHA-256 over the canonical sorted file list + contents) for `SourceKind::Path`.
 - [x] `Requirement`/`RequirementKind { Crate, PkgConfig, Header, Soname, Tool, Generic }`; `Node` and `Edge` structs per §5.1–§5.2.
-- [x] `DependencyGraph`: `petgraph::stable_graph::StableDiGraph<Node, Edge>` + `BTreeMap<PackageId, NodeIndex>`; `add_node`, `add_edge` implementing the merge policy (union `kinds`, max confidence, merged evidence) over canonical-predicate edge identity (the predicate is canonicalized on insert, matching the store), `edges_from`/`edges_to`, `scc()` (Tarjan), roots as `BTreeSet<PackageId>`.
+- [x] `DependencyGraph`: `petgraph::stable_graph::StableDiGraph<Node, Edge>` + `BTreeMap<PackageId, NodeIndex>`; `add_node`, `add_edge` implementing the merge policy (union `kinds`, max confidence, merged evidence) over canonical-predicate edge identity (the predicate is canonicalized on insert, matching the store), `edges_from`/`edges_to`, `cycles()` (Tarjan SCCs and self-loops), roots as `BTreeSet<PackageId>`.
 - [x] `PackageId` `Display` includes ecosystem and source kind.
 - [x] `solver.rs`: delete `ModularSolver`, the always-`Equal` `debian_compare_versions` stub, and solver-only `ResolveError` paths; keep `DependencyProvider`/`ConflictPolicy`/`ConflictDomain` as the Phase 2 seam; fix `ConflictDomain::SideBySide` pre-1.0 keying (`major.minor` for `0.x`, `major.minor.patch` for `0.0.x`).
-- [x] `lib.rs`: public module tree and re-exports matching the §15 sketch.
+- [x] `lib.rs`: public module tree and re-exports for the implemented model and foundation APIs; the top-level analysis API remains M2 work.
 
 Tests: unit tests per type; serde round-trips; dpkg property test; merge-policy unit tests.
 
-Acceptance: `cargo test -p robigus` green; no solver stub remains; the public API compiles as sketched in §15.
+Acceptance: model and solver-seam tests green, dpkg comparison is panic-free on accepted input with consistent `Eq`/`Ord`/`Hash`, and differential/fuzz coverage is present. The full §15 `analyze`/`AnalysisOptions` API is deferred to M2; this work package supplies the foundation only.
 
 ### WP-1.3 — Predicate engine (L, ~5d)
 
@@ -168,16 +171,17 @@ Tasks:
 - [x] `cfg` atoms evaluate against `target_cfg`; `arch("all")` expands to the `ubuntu-info-rust` set; `Unsupported` arch atoms evaluate `false`; `arch("amd64")` ≡ `cfg("target_arch" = "x86_64")` at evaluation time, and the store never rewrites between the forms.
 - [x] DNF on demand with a node/term cap.
 - [x] proptest: canonicalization idempotence; De Morgan equivalence; `eval(canonical(p)) == eval(p)`; `parse(display(p)) == p`.
-- [x] cargo-fuzz target: `parse → canonicalize → display → parse` must succeed and be stable.
+- [x] cargo-fuzz targets: arbitrary UTF-8 `parse → display → parse`, and generated AST `canonicalize → display → parse` with canonicalization stability.
+- [x] Add the full `parse arbitrary text → canonicalize → display → parse` chain and a dpkg comparator fuzz target. Nightly fuzz execution remains to be verified in CI.
 - [x] Unit tests for every §4.5 example.
 
-Acceptance: fuzz + property tests wired into CI (nightly for fuzz); all §4.5 examples pass.
+Acceptance: property tests and §4.5 examples pass; predicate and dpkg fuzz targets are configured. A scheduled workflow definition alone does not verify remote fuzz runs.
 
 ### WP-1.4 — SQLite store (L, ~5d)
 
 **Spec refs:** §11 (all), §5.3, §15.
 
-Files: `robigus/src/store.rs` (+ `store/schema.rs`, `store/migrations.rs`).
+Files: `robigus/src/store.rs` (+ `store/schema.rs`, `store/migrations.rs`). The current lockfiles use bundled `rusqlite` 0.41.1, `rusqlite_migration` 2.7.0, and `libsqlite3-sys` 0.39.1 (patched SQLite), compatible with MSRV 1.93.1.
 
 Tasks:
 
@@ -191,11 +195,12 @@ Tasks:
 - [x] `update_status` enforces transitions: `Not_Started → Started → Complete | Error`; `Error → Started` (retry); `Complete` is terminal. It also enforces the plan invariants at write time: `Started` requires a plan row; `Error` requires a plan row with a recorded `error` (§22.19).
 - [x] `load()`: rebuild `DependencyGraph`; validate every JSON column (`configuration`, `toolchain`, `options`, `kinds`, `predicate`, `evidence`, `active_features`) — parse failures are integrity failures.
 - [x] `check()` → `IntegrityReport` per §11.3: schema version, `foreign_key_check`, duplicate identities, JSON validity, confidence bounds and tier caps (`LlmSubAgent` ≤ 79), status invariants (`Complete` ⇒ targeted deps `Complete`; `Started`/`Error` ⇒ plan rows exist; `Error` ⇒ recorded cause), unresolved-requirement counts by kind, SCC cycles, orphan nodes.
-- [x] `record_invocation` writes scrubbed argv/env and a workspace-relative `log_path`.
+- [x] `record_invocation` persists argv/env and `log_path`; the caller is responsible for scrubbing secrets and supplying a workspace-relative path. The sandbox records arguments verbatim and documents that they must not contain secrets.
+- [x] Export review hardening: reject unrepresentable paths, provide versions, durations, version constraints whose text does not round-trip, and overly deep JSON before writing; detect semantic duplicate package identities/edges and inconsistent target SONAMEs. `Some(VersionConstraint::Any)` is stored losslessly as the `@any` sentinel. Legacy data is not automatically repaired.
 
 Tests: migration from empty DB; `SchemaTooNew` rejection; save/load round-trip; idempotent double-save (row counts unchanged); status-transition violations detected; corrupted JSON detected; concurrent reader during writer (WAL).
 
-Acceptance: store tests green; schema matches §11.2 exactly; `Store` API matches §15.
+Acceptance: store migration, round-trip, idempotence, status-invariant, corruption, and concurrent-reader tests pass. The implemented API includes the store foundation; §15's top-level `analyze` and `AnalysisOptions` remain M2 work. The fail-closed representability and nesting restrictions are now part of spec §11.3: losslessness covers every value the store accepts.
 
 ### WP-1.5 — Fetch and safe extraction (M, ~3d)
 
@@ -215,6 +220,8 @@ Tasks:
 
 Tests: malicious-tarball fixtures (traversal, absolute path, escaping symlink, device node, setuid, gzip bomb, entry-count overflow); digest verify/mismatch; cache hit/miss; download size cap and timeout; local-repository git fixtures (default and non-default branch, pinned submodule, scheme restriction, `update = none`, checkout limits).
 
+Cache trust model (spec §7.2): the cache is trusted local state owned by the invoking user; digests are verified on install, and hits are not re-verified, so a cache must not be shared with less-trusted users. Deferred to WP-2.2: the registry helper rejects yanked releases, including potentially lockfile-pinned versions; decide and test the Cargo-compatible behavior there.
+
 Acceptance: every §7.2 hardening rule has a passing test.
 
 ### WP-1.6 — Detection (M, ~2d)
@@ -228,8 +235,8 @@ Tasks:
 - [x] `ProjectTree`: async `discover` (blocking walk in `spawn_blocking`) using the `ignore` crate with the skip list (`target/`, `vendor/`, `node_modules/`, `.git/`) and `DetectionLimits` (depth 64, 500,000 entries, 1 MiB build descriptions by default); problems are `DetectionDiagnostic`s, not silent (spec §7.3, §22.25).
 - [x] `ProjectCharacteristics` (spec §7.4): name/version, languages, analyzers, build systems, test systems; architectures and platforms come from analyzers.
 - [x] Marker table per §7.3 with per-signal confidence; `DetectionReport { signals }` sorted for determinism.
-- [x] Root rule (spec §7.3, §22.17): Cargo `members` globs (`*` does not cross `/`) and `exclude` path prefixes, both normalized; inside a Cargo root, only directories with their own `[workspace]` or crates listed explicitly in `exclude` become separate roots, and other non-member crates are recorded (`DetectionReport::non_member_crates`) but not rooted; markers attach to roots shallowest first so roots never depend on marker file names; vendored crates are never roots.
-- [x] Analyzer registry: `cargo`, `cpp`; detection emits root-keyed `manifest` plan rows with the build system in its own field (§22.20); future-ecosystem markers are recorded as `Skipped` plan rows.
+- [x] Root rule (spec §7.3, §22.17): membership and excludes are normalized; non-member crates and markers are recorded deterministically. The matched-member + nested `[workspace]` case is tested: the member stays in its ancestor root; the separate-root rule applies to non-members.
+- [x] Detector registry for `cargo` and `cpp`; detection emits root-keyed `manifest` plan rows with the build system in its own field (§22.20), and records future-ecosystem markers as `Skipped`. These are detection-only implementations, not dependency analyzers.
 
 Tests: fixtures for monorepo, vendored crate, nested workspace, non-member fixture crate, explicit `exclude`, member-glob and spelling normalization, marker-name independence, polyglot project, malformed/oversized/unreadable manifests, depth and entry limits, characteristics.
 
@@ -239,24 +246,34 @@ Acceptance: detection is deterministic and matches §7.3 semantics on fixtures.
 
 **Spec refs:** §10 (all), §6.2, §18 (unsafe policy).
 
-Files: `robigus/src/sandbox.rs`.
+Files: `robigus/src/sandbox.rs`, `robigus/src/sandbox_seccomp.rs`.
 
-Implementation in progress: the bubblewrap backend and fail-closed paths are implemented. On a namespace-capable host, the strict integration suite passed as an unprivileged user (`ROB_REQUIRE_BWRAP=1`); it covers loopback IP isolation, but not complete host-service isolation. **Open security issue:** a live Unix-domain socket under a read-only source bind remains connectable from the sandbox, allowing communication with that host service despite offline mode. Do not treat offline isolation as complete until this is addressed; a read-only bind and network namespace do not block pathname sockets. Cgroup/process resource limits remain WP-3.5.
+Isolation boundary (implemented and tested as an unprivileged user):
 
-`SandboxUnavailable` reports backend probing failures; after selection, `SandboxError::BwrapSetup` reports bubblewrap launch, setup, or supervision failures with the stderr log. A missing completion report does not prove the command never ran. Bubblewrap's completion protocol requires a shell wrapper to restore stdin: a missing requested executable is reported as exit 127, and command signals are encoded as 128 + signal. Command cancellation terminates the child and leaves its pre-launch invocation marked `running`, indicating an interrupted execution. The invocation's recorded environment omits `PWD`, which bubblewrap sets when changing directory; exact environment recording remains to be fixed.
+- user, mount, PID, network, IPC and UTS namespaces; all capabilities dropped; nested user namespaces disabled;
+- the source and system runtime are private read-only OverlayFS mounts remounted `nodev,nosuid`, so host sockets, FIFOs and devices under them are unreachable (previously reproduced through plain read-only binds);
+- a seccomp filter limits `socket()` to IP families, `socketpair()` to fixed-peer Unix stream/seqpacket pairs, and denies io_uring and the kernel keyring syscalls (the host session keyring is not namespaced; this was reproduced); foreign ABIs and x32 are killed;
+- a fixed `/usr/bin/bash` sanitizer closes every inherited descriptor except stdio and the filter before exec'ing bubblewrap, and fails closed if any survives;
+- the availability probe uses the identical policy, so `SandboxUnavailable` means the full policy cannot be established.
+
+Host requirement: bubblewrap ≥ 0.11 (first release with `--overlay-src`/`--ro-overlay`), i.e. Ubuntu 26.04 or later. Ubuntu 24.04 ships 0.9.0 and is unsupported; the probe checks `bwrap --version` first and reports an actionable `SandboxUnavailable` cause instead of an unknown-option failure.
+
+Named Unix sockets are unavailable inside the sandbox. Cgroup/process resource limits remain WP-3.5; allowlisted networking needs an explicit proxy transport (WP-2.1). Informational: a workload can read bubblewrap's command line, which includes absolute host paths of the source and log directories (no file contents).
+
+`SandboxUnavailable` reports backend probing failures; after selection, `SandboxError::BwrapSetup` reports bubblewrap launch, setup, or supervision failures with the stderr log. A missing completion report does not prove the command never ran. Bubblewrap's completion protocol requires a shell wrapper to restore stdin: a missing requested executable is reported as exit 127, and command signals are encoded as 128 + signal. Command cancellation terminates the child and leaves its pre-launch invocation marked `running`, indicating an interrupted execution. The canonical sandbox working directory is now recorded as `PWD`; non-UTF-8 working directories are rejected before launch.
 
 Tasks:
 
 - [x] `Sandbox` trait, `SandboxMode { Bwrap, Native }`, `SandboxPreference { Auto, Bwrap, Native }`, `CommandSpec`, `ProcessOutput`.
-- [ ] `establish_sandbox` fail-closed: probe `bwrap` and unprivileged-userns availability; collect `Attempted { mechanism, cause }` for every mechanism tried; `SandboxUnavailable` carries the full list (drives exit 4 and the `no sandbox available` diagnostic).
-- [ ] bwrap backend: read-only source bind, writable tmpfs for output **and** `CARGO_HOME`, `--unshare-net` by default, `--die-with-parent`, `--new-session`, minimal `/dev` and `/proc`.
-- [ ] Network: disabled in M1. Requesting network before the proxy exists (WP-2.1) MUST fail closed with an explicit error — never silently allow egress.
-- [ ] Wall-clock timeouts (tokio timer + kill); stdout/stderr captured to workspace logs; environment scrubbed; `tool_invocation` recorded for every execution.
+- [x] `establish_sandbox` fail-closed: probe `bwrap`, unprivileged user namespaces, and the full isolation policy; collect `Attempted { mechanism, cause }` for every mechanism tried; `SandboxUnavailable` carries the full list (drives exit 4 and the `no sandbox available` diagnostic).
+- [x] bwrap backend: read-only source overlay, writable tmpfs for output **and** `CARGO_HOME`, `--unshare-net` by default, `--die-with-parent`, `--new-session`, minimal `/dev` and `/proc`, plus the seccomp and descriptor controls above.
+- [x] Network-enabled sandbox requests fail explicitly until the proxy exists (WP-2.1); no unproxied IP egress fallback is provided.
+- [x] Wall-clock timeouts (tokio timer + kill); stdout/stderr captured to workspace logs; environment scrubbed; `tool_invocation` recorded for every execution.
 - [x] Crate-root `#![forbid(unsafe_code)]`; the native backend (M3) is the only scoped exception.
 
-Tests: sandbox suite (loopback IP isolation, read-only source, hidden host home and environment, failure diagnostics, timeout and recording). Runner-gated with an explicit skip reason when the runner lacks namespace support; set `ROB_REQUIRE_BWRAP=1` to make unavailable prerequisites fail the suite. The Unix-socket host-service exposure above remains an open issue; `offline_cannot_connect_to_unix_socket_in_source` is an ignored regression test that currently fails when run explicitly.
+Tests: sandbox suite — loopback IP isolation; host stream/seqpacket sockets (top-level and nested) and datagram sockets; host FIFOs in both directions; inherited descriptors; fixed-peer socketpair IPC and `AF_UNIX` socket denial; host keyrings; nested user namespaces and capability/seccomp state; read-only source; hidden host home and environment; recorded `PWD`; setup-failure diagnostics; timeout and recording; a Cargo toolchain smoke test. Runner-gated with an explicit skip reason when the runner lacks namespace support; `ROB_REQUIRE_BWRAP=1` makes unavailable prerequisites fail the suite, and the required CI sandbox job sets it. BPF unit tests cover the filter's control flow, ABI guards and argument-width handling.
 
-Acceptance: fail-closed behavior verified; a trivial command runs isolated under bwrap.
+Acceptance: fail-closed behavior and host-IPC isolation verified locally as an unprivileged user; the hosted-runner sandbox job still needs a green remote run. The first remote run failed on `ubuntu-24.04` (bubblewrap 0.9.0 lacks overlay options, diagnosed but not confirmed from the log); the job now runs on `ubuntu-26.04`, enforces bubblewrap ≥ 0.11, logs bwrap's stderr and the namespace sysctls, and on failure lifts the AppArmor user-namespace restriction on the disposable VM. The second remote run passed the probe and 18 of 19 sandbox tests; the Cargo smoke test failed because the runner's rustup toolchain lives under `$HOME`, which the sandbox never exposes. The job now also installs the distribution `cargo` and `rustc` into `/usr/bin`.
 
 ### WP-1.8 — CLI skeleton (M, ~3d)
 
@@ -267,14 +284,14 @@ Files: `robigus/src/main.rs`, `robigus/src/cli.rs`, `robigus/src/commands/{mod,f
 Tasks:
 
 - [x] clap derive: `fetch`, `analyze` (stub → WP-2.3), `check`, `print`, `export`, `version`; global `--db`, `--format`, `--offline`, `--sandbox <auto|bwrap|native>`, `--jobs`, `--verbose`, `--config`, `--cache`.
-- [x] `--config` TOML file: network allowlist overrides, limits, sub-agent opt-in placeholder.
+- [x] `--config` TOML parses acquisition limits and future network allowlist / sub-agent opt-in placeholders. Acquisition limits are applied; the allowlist is not enforced by `fetch`, and `[subagent]` does not enable an agent.
 - [x] Exit-code mapping 0–5 from error kinds; `miette` graphical diagnostics.
 - [x] `fetch` prints local path + digest; `check` runs the integrity report (exit 0/3); `print` loads the graph with `--kind`/`--depth`/`--status` filters (predicate filters and `--why` arrive in WP-2.3); `version`.
 - [x] `tracing-subscriber` init keyed off `--verbose`.
 
 Tests: `assert_cmd` integration tests per command, including the `--db`-required rule and exit codes 0/1/2/3 at process level; unit tests also verify exit codes 4 and 5 until `analyze` is implemented in WP-2.3.
 
-Acceptance: all M1 commands run against fixture databases; §14 exit codes verified.
+Acceptance for the skeleton: implemented reader/export commands run against fixture databases; `analyze` explicitly returns not-implemented. Exit codes 0–3 have process-level tests; 4 and 5 have mapping unit tests only and require process-level analysis tests in WP-2.3/WP-2.5.
 
 ### WP-1.9 — Export (S, ~1d)
 
@@ -287,9 +304,9 @@ Tasks:
 - [x] JSON export: one consistent database snapshot with metadata, full nodes, resolved and unresolved edges, roots, plans, and invocations; serde round-trip and `AnalysisSnapshot::to_analysis` reconstruction. Stored command arguments and environments are included without further redaction.
 - [x] DOT export via `petgraph` `Dot` with labeled nodes and edges, including synthetic nodes for unresolved requirements — documented as lossy. `export` requires `--format json` or `--format dot`.
 
-Tests: JSON snapshot round-trip and `Analysis` reconstruction; concurrent WAL snapshot; malformed records; DOT escaping, disconnected nodes, cycles and unresolved edges; CLI fixture databases and errors. Verification also covers lossy-value rejection before writes, semantic duplicate identities and edges, JSON nesting boundaries, and control-character predicates. Existing databases containing legacy lossy values or duplicate graph identities fail closed during export; no automatic migration or repair is performed. DOT escaping is tested at the document level; external Graphviz rendering is not part of the test suite.
+Tests: JSON snapshot round-trip and `Analysis` reconstruction; concurrent WAL snapshot; malformed records; DOT escaping, disconnected nodes, cycles and unresolved edges; CLI fixture databases and errors. Verification also covers lossy-value rejection before writes, semantic duplicate identities and edges, JSON nesting boundaries, and control-character predicates. Detectable legacy corruption fails closed; previously collapsed/lost distinctions cannot necessarily be recovered or detected, and there is no automatic repair. DOT escaping is tested at the document level; external Graphviz rendering is not part of the test suite.
 
-Acceptance: §11.3 losslessness holds for JSON.
+Acceptance: JSON round-trips every snapshot the store accepts (spec §11.3); DOT is lossy. The store rejects, rather than alters, the few model values it cannot represent (non-UTF-8 or empty optional paths, empty provide versions, non-round-tripping constraint text, JSON nested beyond the default decoder limit); `Some(VersionConstraint::Any)` round-trips. Protect exported JSON: recorded arguments and environment are included.
 
 ---
 
@@ -305,8 +322,8 @@ Files: `robigus/src/sandbox/proxy.rs`, `robigus/src/config.rs`.
 
 Tasks:
 
-- [ ] In-process tokio listener on the host side, exposed to the sandbox through proxy env vars (`HTTP_PROXY`/`HTTPS_PROXY`); direct egress blocked by the network namespace.
-- [ ] HTTPS: filter `CONNECT` by SNI/Host; HTTP: filter by `Host`. Allowed → blind TCP passthrough (no MITM; TLS stays end-to-end). Denied → close + log.
+- [ ] In-process tokio listener on the host side, exposed to the sandbox through proxy env vars (`HTTP_PROXY`/`HTTPS_PROXY`); direct egress blocked by the network namespace. Design and test an explicit sandbox-to-proxy transport: proxy variables alone do not make a host listener reachable from an isolated network namespace.
+- [ ] Define and enforce HTTP `Host`, HTTPS `CONNECT` authority, and TLS SNI validation separately, including malformed requests and mismatches. Allowed → blind TCP passthrough (no MITM; TLS stays end-to-end); denied → close + log. Account for cases where SNI is absent or unavailable.
 - [ ] Default allowlist: `crates.io`, `ubuntu.com`, `github.com`, `gitlab.com`, `codeberg.org` subdomains; `[network] allow/deny` config overrides; `--offline` disables egress entirely.
 - [ ] Request logging via `tracing` to a workspace log file.
 
@@ -320,11 +337,13 @@ Acceptance: §10.2 network rules enforced; cargo reaches crates.io through the p
 
 Files: `robigus/src/analyzers/cargo.rs`.
 
+Existing foundations: Cargo marker detection, `FeatureExpr` parsing, source/cache helpers, and graph types. There is no Cargo dependency analyzer or `ProjectAnalyzer::analyze` implementation yet.
+
 Tasks:
 
 - [ ] Run `cargo metadata --format-version 1` **unfiltered** inside the sandbox (writable `CARGO_HOME` tmpfs, proxy env); record `tool_invocation` (argv, scrubbed env, cargo/rustc versions).
 - [ ] Map `cargo_metadata::Metadata` → nodes (workspace members as roots) and edges (`dep_kinds` → `kinds` set; `[target.'cfg(...)']` → `cfg` atoms; `optional = true` → feature predicates).
-- [ ] `FeatureExpr` parsing for `dep:foo` / `foo?/bar`; per-node `active_features` from the resolve graph.
+- [ ] Use the existing `FeatureExpr` parser for `dep:foo` / `foo?/bar` in Cargo analysis; populate per-node `active_features` from the resolve graph.
 - [ ] `toml_edit` fallback for `--offline`: declared-but-unresolved edges (`to = None`), `Manifest` evidence, `network_mode = "offline"` in metadata, reduced confidence.
 - [ ] `build.rs` static scan (regex-based in M2; tree-sitter later): `cc`/`cxx`/`bindgen`/`pkg-config`/`cmake`/`meson` usage, `cargo:` directives, `links` key → `BuildScript`/`SourceScan` evidence at L2; discovered system requirements become unresolved edges.
 - [ ] Registry fetches via the WP-1.5 helper (checksum mandatory); git deps via `gix` at the locked rev; path deps with the containment rule — an escaping path dependency marks the node `Error`.
@@ -345,8 +364,8 @@ Tasks:
 
 - [ ] Work queue with `BTreeSet` ordering and a `--jobs` concurrency limit; analyzers `Send + Sync`.
 - [ ] Status lifecycle: persist `Started` **before** work; `Complete` only when every targeted dependency is `Complete`; `Error` records the cause in plan rows.
-- [ ] Edge merge on insert (union `kinds`, max confidence, merged evidence) — shared with `Store::upsert_edges`.
-- [ ] SCC cycle detection (Tarjan) recorded as findings, never errors.
+- [ ] Wire the already-implemented graph/store edge merging (union `kinds`, max confidence, merged evidence) into expansion.
+- [ ] Wire the existing Tarjan SCC detection into expansion findings. Define SCC-level completion semantics: requiring every dependency to be `Complete` first cannot independently complete a legal cycle.
 - [ ] Limits: depth (max distance from roots) and node count → stop, exit 5, non-`Complete` nodes remain queryable.
 - [ ] Resume: verify recorded source identity (URI + digest) and configuration against the request → exit 3 on mismatch; skip `Complete`, re-run `Started`, retry `Error`.
 - [ ] Wire the `analyze` command: fetch → detect → roots → expand → store.
@@ -361,6 +380,8 @@ Acceptance: §7.7 semantics verified end-to-end; `analyze` command complete.
 **Spec refs:** §16.
 
 Files: `robigus/tests/fixtures/**`, `robigus/tests/snapshots/**`, `robigus/tests/README.md`.
+
+Existing detection, store, CLI, and export tests use temporary/synthetic fixtures; the planned analyzer fixture tree, `insta` snapshots, and review checklist do not exist yet. `insta` is declared in the workspace but is not a `robigus` dev-dependency.
 
 Tasks:
 
@@ -465,9 +486,9 @@ Files: `robigus/src/analyzers/subagent.rs`, `robigus/src/config.rs`.
 
 Tasks:
 
-- [ ] Opt-in via config (`[subagents] enabled`, endpoint, model); the endpoint MUST be added to the network allowlist explicitly.
-- [ ] Orchestrator: build context from README/build docs + file inventory; call the API with `reqwest` through the proxy; parse a structured response (path, start_line, end_line, summary, identifiers).
-- [ ] **Anchor verification**: read the referenced files; verify the lines exist and the referenced identifiers appear; discard unverifiable claims and record the failure in `analysis_plan`.
+- [ ] Opt-in via config (endpoint and model); settle the final schema against the current `[subagent] enabled` placeholder. The endpoint MUST be added to the network allowlist explicitly.
+- [ ] Orchestrator: build context from README/build docs + file inventory; define the sandboxed execution and credential boundary required by spec §17, then call the API through the proxy and parse a structured response (path, start_line, end_line, summary, identifiers). A host-side `reqwest` call alone is not the required sandboxed sub-agent.
+- [ ] **Anchor verification**: define and enforce construct/AST-level verification as required by spec §7.6, not merely line/identifier presence; discard unverifiable claims and record the failure in `analysis_plan`.
 - [ ] **No-code-reproduction**: reject responses containing long verbatim quotes.
 - [ ] Evidence: `EvidenceMethod::LlmSubAgent`, confidence ≤ 79 (L3 cap); never sole evidence when a deterministic method exists — flag when it is.
 - [ ] Record `tool_invocation` with a scrubbed prompt digest; never place host secrets in prompt context.
@@ -493,13 +514,13 @@ Tests: fixture with a known divergence between methods.
 
 | Item | Where | Notes |
 |---|---|---|
-| MSRV CI job (1.93.1) | WP-1.1 | Fails fast on newer-only APIs |
-| `cargo deny` (licenses + advisories) | WP-1.1 | `deny.toml`; GPL-3.0-only family |
-| Nightly fuzz CI job | after WP-1.2/WP-1.3 | `cargo-fuzz` targets: predicate parser, dpkg comparator |
-| Sandbox-capable CI job | WP-1.7 | Runner must allow user namespaces; skip with explicit reason otherwise |
-| Push-trigger CI | WP-1.1 | Workflows currently run on PRs only |
-| rustdoc with examples | each WP | `cargo doc --locked --no-deps --all-features` with `-D warnings` |
-| `robigus/SECURITY.md` | WP-1.1 | Own reporting path |
+| MSRV CI job (1.93.1) | WP-1.1 | Configured; remote job results not verified in this review |
+| `cargo deny` (licenses + advisories) | WP-1.1 | Configured; local `cargo deny check` passed in this review |
+| Nightly fuzz CI job | WP-1.3 | Scheduled/manual workflow with predicate and dpkg targets; stale fallback removed. Actual runs not yet verified |
+| Sandbox-capable CI job | WP-1.7 | Required unprivileged `ROB_REQUIRE_BWRAP=1` job in the CI gate; the full suite passes locally as an unprivileged user. Runs on `ubuntu-26.04` (bubblewrap ≥ 0.11 required); first remote run on 24.04 failed, the 26.04 job is not yet verified remotely |
+| Push-trigger CI | WP-1.1 | Build/test workflow triggers on pushes to `main` and PRs targeting `main` |
+| rustdoc with examples | each WP | Warning-strict doc build and a separate doctest step configured; public-API example coverage remains incomplete (DoD) |
+| Security policy | WP-1.1 | `robigus/SECURITY.md` with its own reporting path and sandbox scope; root `SECURITY.md` covers the workspace |
 | Tag `v0.1.0` | DoD | After Definition of Done below |
 
 ## 8. Test matrix (spec §16 → work packages)
@@ -510,8 +531,8 @@ Tests: fixture with a known divergence between methods.
 | Fixtures | WP-1.6, WP-2.4, WP-3.1 |
 | Snapshot tests (insta, redacted) | WP-2.2, WP-2.4, WP-3.1 |
 | Property tests (proptest) | WP-1.2 (dpkg), WP-1.3 (predicates) |
-| Fuzzing (cargo-fuzz, nightly) | WP-1.2 (dpkg), WP-1.3 (parser) |
-| Differential dpkg vs `dpkg --compare-versions` | WP-1.2 |
+| Fuzzing (cargo-fuzz, nightly) | Predicate and dpkg comparator targets configured; remote runs unverified |
+| Differential dpkg vs `dpkg --compare-versions` | WP-1.2 — implemented; skips with reason if dpkg unavailable |
 | Store: migrations, round-trip, idempotent upsert | WP-1.4 |
 | Resume / status transitions | WP-2.3, WP-2.5 |
 | Limits → exit 5 | WP-2.3, WP-2.5 |
@@ -524,7 +545,7 @@ Tests: fixture with a known divergence between methods.
 
 ## 9. PR slicing
 
-Roughly one work package per PR; each PR must keep the full CI gate green.
+Proposed slicing only, not a record of actual PRs or merge state; each eventual PR must keep the full CI gate green.
 
 | PR | Contents | Gate |
 |---|---|---|
@@ -536,7 +557,7 @@ Roughly one work package per PR; each PR must keep the full CI gate green.
 | 6 | WP-1.6 detection | fixture tests |
 | 7 | WP-1.7 sandbox foundation | sandbox suite |
 | 8 | WP-1.8 CLI skeleton | integration tests |
-| 9 | WP-1.9 export | round-trip test — **M1 done** |
+| 9 | WP-1.9 export | round-trip test; **M1 done** once the CI gate, including the sandbox job, is green |
 | 10 | WP-2.1 proxy | wiremock tests |
 | 11 | WP-2.2 cargo analyzer | snapshots |
 | 12 | WP-2.3 expansion + `analyze` + `print --why` | resume/limit tests |
@@ -551,7 +572,10 @@ Roughly one work package per PR; each PR must keep the full CI gate green.
 
 | Risk | Impact | Likelihood | Mitigation |
 |---|---|---|---|
-| Unprivileged user namespaces blocked (stock Ubuntu 24.04 AppArmor) | Tool unusable on some hosts | High on default installs | Fail-closed diagnostics (WP-1.7); document operator guidance; test the exit-4 path |
+| Unprivileged user namespaces blocked (stock Ubuntu AppArmor) | Tool unusable on some hosts | High on default installs | Fail-closed diagnostics (WP-1.7); document operator guidance; test the exit-4 path |
+| Host IPC through sandbox mounts or inherited state | Offline sandbox could reach host services | Mitigated | Private `nodev` overlays, seccomp socket/keyring policy, descriptor sanitation; regressions for sockets, FIFOs, descriptors and keyrings run in the required sandbox job |
+| Dpkg comparison/hash regressions | Hashed identities could behave incorrectly | Mitigated | UTF-8, `Eq`/`Hash`, differential, property, and fuzz-target coverage added; verify scheduled fuzz runs |
+| Local cache contents tampered after publication | Cache hit returned as verified despite modified contents | Low (trusted-cache policy) | Spec §7.2: the cache is user-owned trusted state and must not be shared with less-trusted users |
 | `cargo metadata` needs network + writable `CARGO_HOME` inside sandbox | Primary analyzer fails | Medium | WP-2.1 proxy + tmpfs `CARGO_HOME`; smoke test through proxy |
 | Proxy breaks cargo TLS | Analysis fails | Low | CONNECT passthrough after host validation — no MITM |
 | `ON CONFLICT` vs partial unique indexes | Duplicate edges | Medium | Merge in Rust on constraint violation (WP-1.4) |
@@ -560,20 +584,22 @@ Roughly one work package per PR; each PR must keep the full CI gate green.
 | LLM anchor verification false positives/negatives | Bad or dropped evidence | Medium | Loose identifier matching + findings recorded; L3 cap bounds impact |
 | `gix` API churn | Build breakage | Low | Pin version; isolate behind `fetch.rs` |
 | cargo-fuzz nightly job maintenance | CI noise | Low | Scheduled job, separate from the PR gate |
-| CI runner lacks namespace support | Sandbox tests skip | Medium | Runner-gated tests with explicit skip reason; keep at least one sandbox-capable job |
+| CI runner lacks namespace support or a new enough bubblewrap | Sandbox job fails | Medium (observed on `ubuntu-24.04`) | The required job sets `ROB_REQUIRE_BWRAP=1`, so missing support fails rather than skips; pinned to `ubuntu-26.04` with a bubblewrap ≥ 0.11 check; AppArmor restriction lifted only on the disposable VM |
+| Host bubblewrap older than 0.11 (e.g. Ubuntu 24.04's 0.9.0) | Tool unusable on that host | Medium on LTS installs | Fail closed with an explicit version diagnostic; document the requirement; the native backend (WP-3.5) is the long-term fallback |
 | Regex-based `build.rs` analysis false positives | Wrong edges | Medium | L2 confidence cap; build observation (WP-3.4) cross-checks |
 
 ## 11. Definition of Done (Phase 1)
 
-- [ ] All M1–M3 work packages merged; PRs 1–18 closed.
-- [ ] `tsp-analyzer analyze` completes on every fixture; `check`, `print` (incl. `--why`), `export` work on the results.
+- [ ] All M1–M3 work packages meet their acceptance criteria and are merged; the PR slicing above is illustrative, not a list of required PR numbers.
+- [ ] `tsp-analyzer analyze` completes on positive fixtures; negative fixtures produce their expected rejection/status/exit code. `check`, `print` (incl. `--why`), and `export` work on the results.
 - [ ] Resume verified: interrupted run → re-run → all nodes `Complete`; identity mismatch → exit 3.
 - [ ] Limits verified: truncated graph → exit 5 with queryable non-`Complete` nodes.
-- [ ] Sandbox: fail-closed verified (exit 4 with diagnostics); bwrap and native backends pass the sandbox suite; allowlist proxy blocks non-allowlisted hosts.
+- [ ] Sandbox: fail-closed verified (exit 4 with diagnostics); bwrap and native backends pass the sandbox suite on a required capable runner; the allowlist proxy blocks non-allowlisted hosts. (Host-IPC isolation is fixed for bwrap and passes locally.)
 - [ ] Offline mode produces declared-but-unresolved graphs with `network_mode = "offline"`.
 - [ ] LLM sub-agents: opt-in only, anchor-verified, capped at L3, injection-resistant (tested).
 - [ ] CI green on PR and push: fmt, clippy `-D warnings`, doc, test, audit, deny, MSRV 1.93.1; nightly fuzz running.
-- [ ] `robigus/Cargo.toml` carries full §18 metadata; robigus `SECURITY.md` exists.
+- [x] `robigus/Cargo.toml` carries full §18 metadata; `robigus/SECURITY.md` exists with its own reporting path (spec §17).
+- [ ] Differential and fuzz tests cover dpkg comparison; accepted-input and `Eq`/`Hash` fixes are implemented, but scheduled fuzz runs remain to be verified.
 - [ ] rustdoc complete for the public API; README quickstart.
 - [ ] Tag `v0.1.0`.
 

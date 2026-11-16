@@ -49,10 +49,17 @@ impl DpkgVersion {
 
         // 2. Extract Upstream and Debian Revision (optional: after the last hyphen '-')
         let (upstream, debian_revision) = if let Some(hyphen_pos) = rest.rfind('-') {
-            (&rest[..hyphen_pos], &rest[hyphen_pos + 1..])
+            let revision = &rest[hyphen_pos + 1..];
+            if revision.is_empty() {
+                return Err(DpkgError::EmptyRevision);
+            }
+            (&rest[..hyphen_pos], revision)
         } else {
             (rest, "")
         };
+        if upstream.is_empty() {
+            return Err(DpkgError::EmptyUpstream);
+        }
 
         Ok(Self {
             epoch,
@@ -61,27 +68,32 @@ impl DpkgVersion {
         })
     }
 
-    /// Canonical form: numeric chunks are normalized (leading zeros stripped)
-    /// so that structurally different but semantically equal versions (`1.02`
-    /// and `1.2`) share one canonical string. Two versions have equal
-    /// canonical forms exactly when they compare `Equal`.
+    /// Canonical form: numeric chunks are normalized (leading zeros stripped,
+    /// trailing all-zero chunks omitted), and a zero revision is omitted.
+    /// Structurally different but semantically equal versions (`1.02` and
+    /// `1.2`, or `1.0` and `1.0-00`) share one canonical string.
     pub fn canonical_form(&self) -> String {
         let mut out = String::new();
         if self.epoch != 0 {
             out.push_str(&self.epoch.to_string());
             out.push(':');
         }
-        out.push_str(&normalize_part(&self.upstream_version));
-        if !self.debian_revision.is_empty() {
+        let upstream = normalize_part(&self.upstream_version);
+        // Keep an all-zero upstream printable rather than emitting an empty version.
+        out.push_str(if upstream.is_empty() { "0" } else { &upstream });
+        let revision = normalize_part(&self.debian_revision);
+        if !revision.is_empty() {
             out.push('-');
-            out.push_str(&normalize_part(&self.debian_revision));
+            out.push_str(&revision);
         }
         out
     }
 }
 
-/// Normalizes one version part: digit chunks lose their leading zeros (an
-/// all-zero chunk becomes "0"), non-digit chunks are preserved verbatim.
+/// Normalizes one version part: digit chunks lose their leading zeros and
+/// non-digit chunks are preserved verbatim. An all-zero chunk becomes "0"
+/// internally, but is omitted at the end: dpkg compares a trailing zero chunk
+/// equal to an absent chunk, while an internal zero still sorts before letters.
 fn normalize_part(part: &str) -> String {
     let mut out = String::with_capacity(part.len());
     let mut chars = part.chars().peekable();
@@ -98,7 +110,11 @@ fn normalize_part(part: &str) -> String {
                 }
             }
             let trimmed = digits.trim_start_matches('0');
-            out.push_str(if trimmed.is_empty() { "0" } else { trimmed });
+            if !trimmed.is_empty() {
+                out.push_str(trimmed);
+            } else if chars.peek().is_some() {
+                out.push('0');
+            }
         } else {
             out.push(c);
         }
@@ -134,6 +150,9 @@ impl fmt::Display for DpkgVersion {
 /// - Empty/End-of-string sorts directly above '~'
 /// - Letters 'A'-'Z' and 'a'-'z' sort next
 /// - Other punctuation/characters sort after letters
+///
+/// Non-ASCII input accepted by the parser follows Unicode scalar order after
+/// ASCII characters, preserving dpkg's ordering on Debian's ASCII alphabet.
 fn char_order(c: Option<char>) -> i32 {
     match c {
         Some('~') => -1,
@@ -172,11 +191,11 @@ fn compare_parts(mut a: &str, mut b: &str) -> Ordering {
                 }
             }
 
-            if !a_is_digit && ac.is_some() {
-                a = &a[1..];
+            if let Some(c) = ac.filter(|c| !c.is_ascii_digit()) {
+                a = &a[c.len_utf8()..];
             }
-            if !b_is_digit && bc.is_some() {
-                b = &b[1..];
+            if let Some(c) = bc.filter(|c| !c.is_ascii_digit()) {
+                b = &b[c.len_utf8()..];
             }
         }
 
@@ -252,7 +271,7 @@ impl PartialEq for DpkgVersion {
 impl Eq for DpkgVersion {}
 
 /// `Hash` agrees with the semantic `Eq`: the canonical form is hashed, so
-/// `1.02` and `1.2` hash identically.
+/// `1.02` and `1.2`, as well as `1.0` and `1.0-00`, hash identically.
 impl Hash for DpkgVersion {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.canonical_form().hash(state);
@@ -266,6 +285,14 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use proptest::string::string_regex;
+    use std::collections::hash_map::DefaultHasher;
+    use std::collections::{BTreeSet, HashSet};
+
+    fn version_hash(version: &DpkgVersion) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        version.hash(&mut hasher);
+        hasher.finish()
+    }
 
     fn assert_version_order(less: &str, greater: &str) {
         let v1: DpkgVersion = less.parse().unwrap();
@@ -285,6 +312,9 @@ mod tests {
         let v1: DpkgVersion = a.parse().unwrap();
         let v2: DpkgVersion = b.parse().unwrap();
         assert_eq!(v1.cmp(&v2), Ordering::Equal, "Expected '{}' == '{}'", a, b);
+        assert_eq!(v1, v2);
+        assert_eq!(v1.canonical_form(), v2.canonical_form());
+        assert_eq!(version_hash(&v1), version_hash(&v2));
     }
 
     #[test]
@@ -345,16 +375,54 @@ mod tests {
 
     #[test]
     fn hash_agrees_with_eq() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::Hasher;
+        assert_version_eq("1.02", "1.2");
+    }
 
-        let a: DpkgVersion = "1.02".parse().unwrap();
-        let b: DpkgVersion = "1.2".parse().unwrap();
-        let mut hasher_a = DefaultHasher::new();
-        let mut hasher_b = DefaultHasher::new();
-        a.hash(&mut hasher_a);
-        b.hash(&mut hasher_b);
-        assert_eq!(hasher_a.finish(), hasher_b.finish());
+    #[test]
+    fn zero_revisions_share_equality_hash_and_canonical_form() {
+        let versions: Vec<DpkgVersion> = ["1.0", "1.0-0", "1.0-00", "0:01.00-000"]
+            .into_iter()
+            .map(|text| text.parse().unwrap())
+            .collect();
+        for a in &versions {
+            for b in &versions {
+                assert_eq!(a.cmp(b), Ordering::Equal);
+                assert_eq!(a, b);
+                assert_eq!(a.canonical_form(), b.canonical_form());
+                assert_eq!(version_hash(a), version_hash(b));
+            }
+        }
+        assert_eq!(versions.iter().collect::<HashSet<_>>().len(), 1);
+        assert_eq!(versions.iter().collect::<BTreeSet<_>>().len(), 1);
+        assert_eq!(versions[0].canonical_form(), "1.");
+        assert_version_order("1.0-~", "1.0-0");
+        assert_version_order("1.0", "1.0-1");
+    }
+
+    #[test]
+    fn trailing_zero_chunks_are_equivalent_but_internal_zeros_are_not() {
+        assert_version_eq("1.0-a", "1.0-a000");
+        assert_version_eq("1.0-0a", "1.0-000a000");
+        assert_version_eq("1.", "1.000");
+        assert_version_eq("0", "000");
+        assert_eq!(DpkgVersion::parse("000").unwrap().canonical_form(), "0");
+        assert_version_order("1.0-a0b", "1.0-ab");
+    }
+
+    #[test]
+    fn non_ascii_comparison_is_safe_in_both_version_parts() {
+        assert_version_eq("1.é02", "1.é2");
+        assert_version_eq("1.0-🦀000", "1.0-🦀");
+        assert_version_eq("1.٢", "1.٢0"); // Only ASCII digits form numeric chunks.
+        assert_version_order("1.é1", "1.é2");
+        assert_version_order("1.é", "1.ê");
+        assert_version_order("1.z", "1.é");
+        assert_version_order("1.2", "1.é");
+        assert_version_order("1.aé", "1.bé");
+        assert_version_order("1.é~", "1.é");
+        assert_version_order("1.é", "1.éa");
+        assert_version_order("1.0-🦀1", "1.0-🦀2");
+        assert_version_order("1.0-é", "1.0-🦀");
     }
 
     #[test]
@@ -368,6 +436,220 @@ mod tests {
             DpkgVersion::parse("1:"),
             Err(DpkgError::EmptyUpstream)
         ));
+        assert!(matches!(
+            DpkgVersion::parse("1.0-"),
+            Err(DpkgError::EmptyRevision)
+        ));
+        assert!(matches!(
+            DpkgVersion::parse("-1"),
+            Err(DpkgError::EmptyUpstream)
+        ));
+    }
+
+    fn dpkg_available(test_name: &str) -> bool {
+        match std::process::Command::new("/usr/bin/dpkg")
+            .arg("--version")
+            .output()
+        {
+            Ok(output) => {
+                assert!(
+                    output.status.success(),
+                    "dpkg availability probe failed: {:?}; stderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                true
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                // Write directly so the skip reason is visible even with test capture enabled.
+                use std::io::Write;
+                writeln!(
+                    std::io::stderr(),
+                    "SKIP {test_name}: /usr/bin/dpkg unavailable: {error}"
+                )
+                .expect("write dpkg test skip reason");
+                false
+            }
+            Err(error) => panic!("cannot probe /usr/bin/dpkg: {error}"),
+        }
+    }
+
+    fn dpkg_compare(a: &str, b: &str) -> Ordering {
+        let relation = |operator: &str| {
+            let output = std::process::Command::new("/usr/bin/dpkg")
+                .args(["--compare-versions", a, operator, b])
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap_or_else(|error| panic!("dpkg {a:?} {operator} {b:?}: {error}"));
+            assert!(
+                output.stderr.is_empty(),
+                "dpkg rejected or warned about {a:?} {operator} {b:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            match output.status.code() {
+                Some(0) => true,
+                Some(1) => false,
+                _ => panic!(
+                    "dpkg {a:?} {operator} {b:?} returned unexpected status {:?}",
+                    output.status
+                ),
+            }
+        };
+        match (relation("lt"), relation("eq"), relation("gt")) {
+            (true, false, false) => Ordering::Less,
+            (false, true, false) => Ordering::Equal,
+            (false, false, true) => Ordering::Greater,
+            results => panic!("inconsistent dpkg relations for {a:?} vs {b:?}: {results:?}"),
+        }
+    }
+
+    #[test]
+    fn differential_dpkg_examples() {
+        if !dpkg_available("differential_dpkg_examples") {
+            return;
+        }
+        let examples = [
+            ("1.0", "1.0"),
+            ("1.0", "1.0-0"),
+            ("1.0", "1.0-000"),
+            ("0:01.00-00", "1.0"),
+            ("1.0-a", "1.0-a000"),
+            ("1.0-0a", "1.0-000a000"),
+            ("1.0-a0b", "1.0-ab"),
+            ("1.", "1.000"),
+            ("0", "000"),
+            ("1.02", "1.2"),
+            ("1.9", "1.10"),
+            ("1.000000000000000000001", "1.999999999999999999999"),
+            ("1.0~rc1", "1.0"),
+            ("1.0~~", "1.0~"),
+            ("1.~", "1.0"),
+            ("1.0", "1.a"),
+            ("1.0", "1.+"),
+            ("1.A", "1.a"),
+            ("1.z", "1.+"),
+            ("1.+", "1.."),
+            ("1.0-~", "1.0-0"),
+            ("1.0-1ubuntu1", "1.0-1ubuntu2"),
+            ("1.0-1", "1.0-1build1"),
+            ("1.0-0ubuntu1~22.04.1", "1.0-0ubuntu1"),
+            ("1.0-1", "1.0+git1-1"),
+            ("1.0-beta-1", "1.0-beta-2"),
+            ("1:1.0:git-1", "1:1.0:git-2"),
+            ("1:1.0", "2:0.1"),
+            ("1.999", "1:0"),
+        ];
+        for (a, b) in examples {
+            for (a, b) in [(a, b), (b, a)] {
+                let actual = DpkgVersion::parse(a)
+                    .unwrap()
+                    .cmp(&DpkgVersion::parse(b).unwrap());
+                assert_eq!(
+                    actual,
+                    dpkg_compare(a, b),
+                    "dpkg discrepancy: {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Debian ASCII grammar: digit-led upstream, nonempty optional revision,
+    /// upstream ':' only with an epoch, and upstream '-' only with a revision.
+    fn valid_debian_version_strategy() -> impl Strategy<Value = String> {
+        (
+            proptest::option::of(1u32..=4),
+            string_regex("[0-9][0-9A-Za-z.+~:-]{0,23}").unwrap(),
+            proptest::option::of(string_regex("[0-9A-Za-z.+~]{1,12}").unwrap()),
+        )
+            .prop_map(|(epoch, mut upstream, revision)| {
+                if epoch.is_none() {
+                    upstream = upstream.replace(':', "");
+                }
+                if revision.is_none() {
+                    upstream = upstream.replace('-', "");
+                }
+                // dpkg rejects an upstream ending in '-' when no revision
+                // follows it, and an empty revision after the final '-'.
+                if upstream.ends_with('-') && revision.is_none() {
+                    upstream.pop();
+                }
+                let mut text = match epoch {
+                    Some(epoch) => format!("{epoch}:{upstream}"),
+                    None => upstream,
+                };
+                if let Some(revision) = revision {
+                    text.push('-');
+                    text.push_str(&revision);
+                }
+                text
+            })
+    }
+
+    #[test]
+    fn differential_dpkg_randomized() {
+        if !dpkg_available("differential_dpkg_randomized") {
+            return;
+        }
+        use proptest::test_runner::{Config, TestRunner};
+
+        let pairs = (
+            valid_debian_version_strategy(),
+            valid_debian_version_strategy(),
+            0u8..4,
+        )
+            .prop_map(|(a, b, mode)| {
+                let mut a = DpkgVersion::parse(&a).unwrap();
+                let mut b = DpkgVersion::parse(&b).unwrap();
+                // Correlated pairs exercise parts that unrelated epochs/upstreams would mask.
+                match mode {
+                    1 => {
+                        a.epoch = 1;
+                        b.epoch = 1;
+                    }
+                    2 => {
+                        b.epoch = a.epoch;
+                        b.upstream_version = a.upstream_version.clone();
+                        // An upstream hyphen is only valid when a revision follows.
+                        if b.upstream_version.contains('-') && b.debian_revision.is_empty() {
+                            b.debian_revision = "0".into();
+                        }
+                    }
+                    3 => {
+                        b.epoch = a.epoch;
+                        b.upstream_version = equivalent_part(&a.upstream_version, 3);
+                        // A missing revision must stay missing: appending zeros
+                        // to an empty revision would spell an explicit `-000`.
+                        b.debian_revision = if a.debian_revision.is_empty() {
+                            String::new()
+                        } else {
+                            equivalent_part(&a.debian_revision, 3)
+                        };
+                    }
+                    _ => {}
+                }
+                (a.to_string(), b.to_string())
+            });
+        let mut runner = TestRunner::new(Config {
+            cases: 128,
+            max_shrink_iters: 128,
+            // Keep discrepancies in the failure message without creating regression files.
+            failure_persistence: None,
+            ..Config::default()
+        });
+        runner
+            .run(&pairs, |(a, b)| {
+                let actual = DpkgVersion::parse(&a)
+                    .unwrap()
+                    .cmp(&DpkgVersion::parse(&b).unwrap());
+                prop_assert_eq!(actual, dpkg_compare(&a, &b), "versions {:?} vs {:?}", a, b);
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("dpkg differential property failed: {error}"));
     }
 
     /// Generates versions whose `Display` output parses back unambiguously:
@@ -376,8 +658,8 @@ mod tests {
     fn version_strategy() -> impl Strategy<Value = DpkgVersion> {
         (
             0u32..=4,
-            string_regex("[0-9a-zA-Z.~+][0-9a-zA-Z.~+]{0,15}").unwrap(),
-            proptest::option::of(string_regex("[0-9a-zA-Z.~+]{1,10}").unwrap()),
+            string_regex("[0-9a-zA-Z.~+é中🦀٢][0-9a-zA-Z.~+é中🦀٢]{0,15}").unwrap(),
+            proptest::option::of(string_regex("[0-9a-zA-Z.~+é中🦀٢]{1,10}").unwrap()),
         )
             .prop_map(|(epoch, upstream, revision)| DpkgVersion {
                 epoch,
@@ -386,10 +668,63 @@ mod tests {
             })
     }
 
+    fn arbitrary_version_strategy() -> impl Strategy<Value = DpkgVersion> {
+        (any::<u32>(), any::<String>(), any::<String>()).prop_map(
+            |(epoch, upstream_version, debian_revision)| DpkgVersion {
+                epoch,
+                upstream_version,
+                debian_revision,
+            },
+        )
+    }
+
+    /// Preserve each non-digit chunk while adding leading zeros to numeric
+    /// chunks and, after a non-digit, appending a zero chunk (equal to end-of-string).
+    fn equivalent_part(part: &str, zeros: usize) -> String {
+        let mut out = String::new();
+        let mut was_digit = false;
+        for c in part.chars() {
+            if c.is_ascii_digit() && !was_digit {
+                out.extend(std::iter::repeat_n('0', zeros));
+            }
+            out.push(c);
+            was_digit = c.is_ascii_digit();
+        }
+        if !was_digit {
+            out.extend(std::iter::repeat_n('0', zeros));
+        }
+        out
+    }
+
     proptest! {
         #[test]
-        fn eq_agrees_with_ord(a in version_strategy(), b in version_strategy()) {
-            assert_eq!(a == b, a.cmp(&b) == Ordering::Equal);
+        fn eq_agrees_with_ord(a in arbitrary_version_strategy(), b in arbitrary_version_strategy()) {
+            prop_assert_eq!(a == b, a.cmp(&b) == Ordering::Equal);
+            prop_assert_eq!(a.cmp(&b), b.cmp(&a).reverse());
+            if a == b {
+                prop_assert_eq!(version_hash(&a), version_hash(&b));
+            }
+        }
+
+        #[test]
+        fn equivalent_numeric_spellings_share_hash(a in arbitrary_version_strategy(), zeros in 1usize..8) {
+            let b = DpkgVersion {
+                epoch: a.epoch,
+                upstream_version: equivalent_part(&a.upstream_version, zeros),
+                debian_revision: equivalent_part(&a.debian_revision, zeros),
+            };
+            prop_assert_eq!(a.cmp(&b), Ordering::Equal);
+            prop_assert_eq!(a.canonical_form(), b.canonical_form());
+            prop_assert_eq!(version_hash(&a), version_hash(&b));
+            prop_assert_eq!(a, b);
+        }
+
+        #[test]
+        fn comparison_is_transitive(a in arbitrary_version_strategy(), b in arbitrary_version_strategy(), c in arbitrary_version_strategy()) {
+            prop_assert_eq!(a.cmp(&a), Ordering::Equal);
+            if a <= b && b <= c {
+                prop_assert!(a <= c);
+            }
         }
 
         #[test]

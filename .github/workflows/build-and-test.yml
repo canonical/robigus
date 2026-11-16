@@ -67,6 +67,10 @@ jobs:
       - name: Run test suite (cargo test)
         run: cargo test --locked --all-targets --all-features
 
+      # `--all-targets` excludes doctests; run them separately.
+      - name: Run doctests (cargo test --doc)
+        run: cargo test --locked --doc --all-features
+
       - name: Security audit dependencies (cargo audit)
         uses: rustsec/audit-check@v2.0.0
         with:
@@ -105,18 +109,126 @@ jobs:
         with:
           command: check
 
+  sandbox:
+    name: Unprivileged bubblewrap sandbox
+    # An ephemeral GitHub-hosted VM provides sudo for package/policy setup;
+    # the probe and tests themselves must run as the unprivileged runner user.
+    # Ubuntu 26.04 is required: the sandbox uses read-only overlays
+    # (--overlay-src/--ro-overlay), added in bubblewrap 0.11. Ubuntu 24.04
+    # ships bubblewrap 0.9.0, which rejects those options.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      # Ubuntu's bubblewrap package may enable kernel.unprivileged_userns_clone
+      # system-wide in its post-install step; this job assumes a disposable VM.
+      # The sandbox exposes only the system runtime (/usr), never $HOME, so the
+      # rustup toolchain installed below for building is invisible inside it.
+      # The Cargo smoke test needs the distribution toolchain in /usr/bin.
+      - name: Install bubblewrap, AppArmor tools and the system Rust toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bubblewrap apparmor libcap2-bin python3 cargo rustc
+          /usr/bin/cargo --version
+          /usr/bin/rustc --version
+
+      - name: Check unprivileged bubblewrap namespaces
+        run: |
+          test "$(id -u)" -ne 0 || { echo '::error::Sandbox job must not run as root'; exit 1; }
+          test "$(awk '/^CapEff:/ {print $2}' /proc/self/status)" = 0000000000000000 || {
+            echo '::error::Sandbox job must not have effective capabilities'; exit 1;
+          }
+          test -x /usr/bin/bwrap && test ! -u /usr/bin/bwrap && test ! -g /usr/bin/bwrap || {
+            echo '::error::Expected an executable, non-setuid/non-setgid /usr/bin/bwrap'; exit 1;
+          }
+          capabilities=$(getcap /usr/bin/bwrap)
+          test -z "$capabilities" || { echo "::error::Unexpected bwrap file capabilities: $capabilities"; exit 1; }
+          version=$(/usr/bin/bwrap --version)
+          echo "$version"
+          if ! [[ "$version" =~ ^bubblewrap\ ([0-9]+)\.([0-9]+) ]] ||
+             (( BASH_REMATCH[1] == 0 && BASH_REMATCH[2] < 11 )); then
+            echo "::error::bubblewrap >= 0.11 is required for read-only overlays; found: $version"
+            exit 1
+          fi
+          uname -r
+          for knob in kernel.unprivileged_userns_clone user.max_user_namespaces \
+                      kernel.apparmor_restrict_unprivileged_userns; do
+            sysctl "$knob" 2>/dev/null || true
+          done
+
+          # Match the backend's namespaces and read-only runtime overlay. The
+          # test suite itself exercises the full policy, including seccomp.
+          # bwrap's stderr is kept so a failure is diagnosable from the log.
+          probe_bwrap() {
+            local empty status
+            empty=$(mktemp -d)
+            timeout 15 /usr/bin/bwrap \
+              --unshare-user --disable-userns --assert-userns-disabled \
+              --unshare-pid --unshare-net --unshare-ipc --unshare-uts \
+              --die-with-parent --new-session --cap-drop ALL --clearenv \
+              --overlay-src "$empty" --overlay-src /usr --ro-overlay /usr --remount-ro /usr \
+              --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+              --proc /proc --dev /dev --tmpfs /tmp --json-status-fd 1 -- /usr/bin/true \
+              2> "$RUNNER_TEMP/bwrap-probe.err"
+            status=$?
+            rmdir "$empty"
+            if (( status != 0 )); then
+              echo "bwrap probe exited with status $status:"
+              cat "$RUNNER_TEMP/bwrap-probe.err"
+            fi
+            return "$status"
+          }
+          if ! probe_bwrap; then
+            # Ubuntu restricts unprivileged user namespaces through AppArmor
+            # (kernel.apparmor_restrict_unprivileged_userns=1), and its
+            # bwrap-userns-restrict profile confines bwrap further. Lifting the
+            # restriction system-wide is acceptable ONLY because this is a
+            # disposable GitHub-hosted VM; it mirrors upstream bubblewrap's CI.
+            # It must never be done on a shared or long-lived host.
+            knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+            if [[ -r "$knob" && "$(cat "$knob")" != 0 ]]; then
+              echo 'Disabling the AppArmor user-namespace restriction on this disposable VM'
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+              probe_bwrap || {
+                echo '::error::Unprivileged bubblewrap namespace probe failed after lifting the AppArmor restriction'
+                exit 1
+              }
+            else
+              echo '::error::Unprivileged bubblewrap namespace probe failed'
+              exit 1
+            fi
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # ROB_REQUIRE_BWRAP turns every prerequisite skip into a failure, so a
+      # green job means the isolation assertions actually ran.
+      - name: Run required sandbox integration tests
+        env:
+          ROB_REQUIRE_BWRAP: "1"
+        run: cargo test --locked -p robigus --test sandbox
+
   # Umbrella job for branch protection: point required status checks at this
   # single job instead of enumerating every job name.
   ci-pass:
     name: CI gate
     if: always()
-    needs: [build-and-test, msrv, deny]
+    needs: [build-and-test, msrv, deny, sandbox]
     runs-on: ubuntu-latest
     steps:
       - name: Require all jobs to succeed
         run: |
           if [[ "${{ needs.build-and-test.result }}" != "success" ||
                 "${{ needs.msrv.result }}" != "success" ||
-                "${{ needs.deny.result }}" != "success" ]]; then
+                "${{ needs.deny.result }}" != "success" ||
+                "${{ needs.sandbox.result }}" != "success" ]]; then
             exit 1
           fi

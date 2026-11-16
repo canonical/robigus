@@ -26,13 +26,14 @@ petgraph = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rusqlite = { workspace = true }
 rusqlite_migration = { workspace = true }
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["fs", "process"] }
 semver = { version = "1", features = ["serde"] }
 serde.workspace = true
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror.workspace = true
 tar = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
@@ -51,3 +52,8 @@ proptest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 wiremock = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+command-fds = "0.3"
+libc = "0.2"
+seccompiler = "0.5"

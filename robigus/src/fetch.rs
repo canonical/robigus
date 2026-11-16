@@ -69,6 +69,11 @@ impl FetchedSource {
 
 // 2. Content-addressed cache
 /// The content-addressed source cache: `<root>/<kind>/<digest>` (spec §7.2).
+///
+/// The cache is trusted local state: digests are verified when an entry is
+/// installed, but a later hit is returned without re-hashing its contents.
+/// Do not share a cache root with less-trusted users, since anyone who can
+/// write it can alter analysis inputs.
 #[derive(Debug, Clone)]
 pub struct Cache {
     root: PathBuf,

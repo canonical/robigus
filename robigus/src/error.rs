@@ -126,6 +126,8 @@ pub enum DpkgError {
     InvalidEpoch { epoch: String },
     #[error("upstream version component cannot be empty")]
     EmptyUpstream,
+    #[error("debian revision cannot be empty after '-'")]
+    EmptyRevision,
 }
 
 /// One failed sandbox-establishment attempt.
