@@ -41,3 +41,13 @@ Known limitations that are **not** yet in scope:
 - bubblewrap 0.11 or newer (Ubuntu 26.04 or later) is required for the read-only overlays; older versions, such as Ubuntu 24.04's 0.9.0, are rejected and no sandbox is established.
 
 Exported JSON includes recorded tool arguments and environments. Treat exports as potentially sensitive.
+
+## Registry Credentials (planned, WP-2.6)
+
+Fetching crates from authenticated private registries is specified (spec §7.2.2) but **not implemented yet**. Once it is, any of the following is a security vulnerability:
+
+- a registry token sent to a host other than its registry's index or download host, sent over `http`, or forwarded on a cross-host redirect;
+- a token appearing in the database, exports, `tool_invocation` records, proxy logs, `tracing` output, error messages, the process list, a core dump, or the sandbox;
+- robigus writing a token to disk, or reading tokens from Cargo's credentials file, Cargo configuration, or `CARGO_REGISTRIES_*` variables.
+
+robigus will not store tokens. Each registry's token comes from one source configured in robigus's own configuration: an environment variable (for CI secret stores), a credential process using Cargo's credential provider protocol, or a token file that must be owned by you and have mode `0600`. Prefer a credential process or a CI secret store over a token file, use read-only tokens with the least privilege your registry offers, and rotate or revoke them at the registry; robigus has no `login` or `logout` commands. Public registries, including crates.io, never receive a token.
