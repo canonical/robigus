@@ -33,7 +33,7 @@ pub use detect::{
     TestSystem, analyzers, detect,
 };
 pub use error::{
-    DetectError, DpkgError, FetchError, PredicateError, RobigusError, SandboxAttempt,
+    DetectError, DpkgError, FetchError, InvalidHost, PredicateError, RobigusError, SandboxAttempt,
     SandboxUnavailable, StoreError,
 };
 pub use feature::{FeatureExpr, FeatureExprError};
@@ -48,6 +48,7 @@ pub use model::{
     SourceKind, Target, TargetKind, VersionConstraint, path_tree_digest,
 };
 pub use predicate::{Atom, Configuration, DEFAULT_DNF_TERM_CAP, DnfError, Evaluator, Predicate};
+pub use sandbox::proxy::{Allowlist, DEFAULT_ALLOWLIST, HostName, ProxyPolicy};
 pub use sandbox::{
     CommandSpec, NetworkAccess, ProcessOutput, ProcessStatus, Sandbox, SandboxError, SandboxMode,
     SandboxPreference, establish_sandbox,

@@ -20,13 +20,15 @@ chrono = { workspace = true }
 flate2 = { workspace = true }
 gix = { workspace = true, features = ["blocking-http-transport-reqwest"] }
 glob = { workspace = true }
+# HTTP/1.x request-head parsing for the sandbox proxy (already locked via hyper).
+httparse = "1.10"
 ignore = { workspace = true }
 miette = { workspace = true }
 petgraph = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rusqlite = { workspace = true }
 rusqlite_migration = { workspace = true }
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs", "net", "process", "stdio"] }
 semver = { version = "1", features = ["serde"] }
 serde.workspace = true
 serde_json = { workspace = true }

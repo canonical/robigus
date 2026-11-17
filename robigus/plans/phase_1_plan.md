@@ -1,12 +1,12 @@
 # robigus — Phase 1 Implementation Plan
 
-Status: in progress — M1 work packages are implemented, and the required CI gate (build/lint/test, MSRV, deny, and the strict unprivileged sandbox job on `ubuntu-26.04`) has passed remotely on the `phase-1-testing` PR. The public API is fully documented, and a workspace `README.md` covers both crates. The one remaining M1 acceptance item is observing a successful run of the nightly fuzz workflow, which is triggered only from `main` (see §7). `analyze`, the proxy, expansion, and M2/M3 analysis remain unimplemented.
+Status: in progress — **M1 is complete**: every M1 work package meets its acceptance criteria, and the merge to `main`, push CI, and the nightly fuzz run have all passed. M2 has started: WP-2.1 (allowlist proxy) is implemented and verified locally. `analyze`, the Cargo analyzer, expansion, and M3 remain unimplemented.
 Scope: v1 = Milestones M1–M3 (dependency graph analysis only)
 Normative reference: [`../AGENTS.md`](../AGENTS.md) — if this plan and the spec disagree, the spec wins.
 
 All paths are relative to the workspace root (the directory containing `Cargo.toml`, `rapt/`, and `robigus/`). The robigus crate lives in `robigus/`.
 
-Review baseline: local workspace tests, formatting, clippy, documentation, doctests, fuzz-target clippy, `cargo audit`, and `cargo deny check` passed on Rust 1.93.1. The strict sandbox suite (`ROB_REQUIRE_BWRAP=1`, run as an unprivileged user) passed 19 tests; its two ignored entries are subprocess helpers invoked by other tests. Remote PR CI passed, including the sandbox job. Remote push-to-`main` CI and scheduled fuzz results have not yet been observed.
+Review baseline: local workspace tests, formatting, clippy, documentation, doctests, fuzz-target clippy, `cargo audit`, and `cargo deny check` passed on Rust 1.93.1. The strict sandbox suite (`ROB_REQUIRE_BWRAP=1`, run as an unprivileged user) passed 22 tests; its two ignored entries are subprocess helpers invoked by other tests. With `ROB_NETWORK_TESTS=1` the live proxy smoke test also passed. Remote PR CI, push-to-`main` CI, and the nightly fuzz run passed for M1; WP-2.1 has not yet run in CI.
 
 ---
 
@@ -258,7 +258,7 @@ Isolation boundary (implemented and tested as an unprivileged user):
 
 Host requirement: bubblewrap ≥ 0.11 (first release with `--overlay-src`/`--ro-overlay`), i.e. Ubuntu 26.04 or later. Ubuntu 24.04 ships 0.9.0 and is unsupported; the probe checks `bwrap --version` first and reports an actionable `SandboxUnavailable` cause instead of an unknown-option failure.
 
-Named Unix sockets are unavailable inside the sandbox. Cgroup/process resource limits remain WP-3.5; allowlisted networking needs an explicit proxy transport (WP-2.1). Informational: a workload can read bubblewrap's command line, which includes absolute host paths of the source and log directories (no file contents).
+Named Unix sockets are unavailable inside the sandbox. Cgroup/process resource limits remain WP-3.5; allowlisted networking is provided by WP-2.1. Informational: a workload can read bubblewrap's command line, which includes absolute host paths of the source and log directories (no file contents).
 
 `SandboxUnavailable` reports backend probing failures; after selection, `SandboxError::BwrapSetup` reports bubblewrap launch, setup, or supervision failures with the stderr log. A missing completion report does not prove the command never ran. Bubblewrap's completion protocol requires a shell wrapper to restore stdin: a missing requested executable is reported as exit 127, and command signals are encoded as 128 + signal. Command cancellation terminates the child and leaves its pre-launch invocation marked `running`, indicating an interrupted execution. The canonical sandbox working directory is now recorded as `PWD`; non-UTF-8 working directories are rejected before launch.
 
@@ -267,7 +267,7 @@ Tasks:
 - [x] `Sandbox` trait, `SandboxMode { Bwrap, Native }`, `SandboxPreference { Auto, Bwrap, Native }`, `CommandSpec`, `ProcessOutput`.
 - [x] `establish_sandbox` fail-closed: probe `bwrap`, unprivileged user namespaces, and the full isolation policy; collect `Attempted { mechanism, cause }` for every mechanism tried; `SandboxUnavailable` carries the full list (drives exit 4 and the `no sandbox available` diagnostic).
 - [x] bwrap backend: read-only source overlay, writable tmpfs for output **and** `CARGO_HOME`, `--unshare-net` by default, `--die-with-parent`, `--new-session`, minimal `/dev` and `/proc`, plus the seccomp and descriptor controls above.
-- [x] Network-enabled sandbox requests fail explicitly until the proxy exists (WP-2.1); no unproxied IP egress fallback is provided.
+- [x] Network-enabled sandbox requests fail explicitly until the proxy exists (WP-2.1); no unproxied IP egress fallback is provided. (Superseded by WP-2.1: `NetworkAccess::Allowlist(ProxyPolicy)` now runs through the proxy.)
 - [x] Wall-clock timeouts (tokio timer + kill); stdout/stderr captured to workspace logs; environment scrubbed; `tool_invocation` recorded for every execution.
 - [x] Crate-root `#![forbid(unsafe_code)]`; the native backend (M3) is the only scoped exception.
 
@@ -318,18 +318,21 @@ Goal (spec §21): Cargo analyzer (sandboxed `cargo metadata` with allowlisted ne
 
 **Spec refs:** §10.2, §7.6 (LLM endpoint allowlisting), §16.
 
-Files: `robigus/src/sandbox/proxy.rs`, `robigus/src/config.rs`.
+Files: `robigus/src/sandbox/proxy/{mod,policy,server,tls}.rs`, `robigus/src/sandbox.rs` (transport and wiring), `robigus/src/cli.rs` (`[network]` configuration; the plan's separate `config.rs` was not needed).
+
+Transport (spec decision 29): the sandbox keeps its own network namespace. A fixed bootstrap (`/usr/bin/python3 -I -S`) binds `127.0.0.1:3128` inside it and passes the listening socket to robigus over a private `SOCK_SEQPACKET` socketpair mapped to fd 4; the sandbox shell then closes fd 4 and `exec`s the workload, which holds neither the control socket nor the listener. robigus validates the received descriptor (one listening IPv4 TCP socket bound to the proxy address) and serves it until the sandbox exits, then gives in-flight connections a 2-second drain to log their close. Setup failures (bootstrap error, timeout, early exit) are `SandboxError::BwrapSetup` and the workload never starts.
 
 Tasks:
 
-- [ ] In-process tokio listener on the host side, exposed to the sandbox through proxy env vars (`HTTP_PROXY`/`HTTPS_PROXY`); direct egress blocked by the network namespace. Design and test an explicit sandbox-to-proxy transport: proxy variables alone do not make a host listener reachable from an isolated network namespace.
-- [ ] Define and enforce HTTP `Host`, HTTPS `CONNECT` authority, and TLS SNI validation separately, including malformed requests and mismatches. Allowed → blind TCP passthrough (no MITM; TLS stays end-to-end); denied → close + log. Account for cases where SNI is absent or unavailable.
-- [ ] Default allowlist: `crates.io`, `ubuntu.com`, `github.com`, `gitlab.com`, `codeberg.org` subdomains; `[network] allow/deny` config overrides; `--offline` disables egress entirely.
-- [ ] Request logging via `tracing` to a workspace log file.
+- [x] In-process tokio proxy serving a listener created inside the sandbox's network namespace; `http_proxy`/`https_proxy`/uppercase forms/`CARGO_HTTP_PROXY` point at it, and callers cannot override them. Direct egress stays impossible (no route off the host); the seccomp policy is unchanged. `/etc/ssl/certs` is added read-only for network-enabled runs.
+- [x] Request policy: HTTP/1.x `CONNECT` and absolute-form `GET`/`HEAD` `http://` only; literal DNS names only (IP literals and numeric names `403`); allowlist and port checks (default 80, 443); `Host` must match the target (required for HTTP; checked on `CONNECT` when present; duplicates refused); bodies, other methods, origin-form and `https://` without `CONNECT` refused. For `CONNECT`, robigus connects upstream first (`502`/`504` on failure), then requires a well-formed ClientHello whose SNI equals the `CONNECT` host; missing SNI, mismatched SNI, or non-TLS bytes close the tunnel before any client byte is forwarded. Allowed tunnels are relayed blindly (no MITM). Plain HTTP is forwarded in origin form without hop-by-hop/`Proxy-*` headers, one request per connection.
+- [x] Host-side resolution refuses any name resolving to a non-public address (loopback, private, shared, link-local/metadata, unique-local, multicast, NAT64, ...); `ProxyPolicy::resolve` pins trusted addresses.
+- [x] Default allowlist (`DEFAULT_ALLOWLIST`) with subdomain matching on label boundaries; `[network] allowlist` replaces, `allow` adds, `deny` removes (denial wins). `NetworkConfig::proxy_policy` validates entries as `HostName`s at config load. `--offline` maps to `NetworkAccess::Offline` once `analyze` lands (WP-2.3).
+- [x] Logging: `proxy.jsonl` in the invocation's log directory (`request` record with decision/status/reason; `close` record with byte counts and duration), mirrored as `tracing` events under `robigus::proxy`. Client-supplied text is bounded and control characters replaced.
 
-Tests: `wiremock` allowed/denied hosts; log assertions; smoke test running `cargo metadata` through the proxy inside the sandbox.
+Tests: TLS ClientHello parser unit tests (fragmented records, missing SNI, malformed/duplicate extensions, truncation and corruption sweeps); request parsing/policy unit tests; host-name, allowlist and address-classification tests; in-process proxy tests with `wiremock` and an echo origin (allowed HTTP forwarding and header stripping, denials without upstream contact, non-public resolution, matching/mismatched/missing SNI with byte-level forwarding checks, upstream failure and header timeout, log assertions); sandbox integration tests (`allowlisted_network_is_mediated_by_the_proxy`: allowed, subdomain-denied, unlisted, IP-literal, direct-connection and port-takeover cases, descriptor isolation, recorded environment; `networked_missing_program_is_an_ordinary_exit_127`; `invalid_network_policy_is_rejected_before_launch`); live smoke test `cargo_metadata_reaches_crates_io_through_the_proxy`, enabled with `ROB_NETWORK_TESTS=1`.
 
-Acceptance: §10.2 network rules enforced; cargo reaches crates.io through the proxy and nothing else.
+Acceptance: §10.2 network rules enforced and verified locally as an unprivileged user (strict suite: 22 passed). The live smoke test passed locally: `cargo metadata --locked` resolved a crates.io dependency through the proxy, contacting only `index.crates.io` and `static.crates.io`. CI does not run the live test (it needs internet access); consider enabling `ROB_NETWORK_TESTS=1` in the sandbox job. Residual risks: domain fronting inside TLS, and exfiltration to allowlisted hosts (documented in `robigus/SECURITY.md`).
 
 ### WP-2.2 — Cargo analyzer (L, ~5d)
 
@@ -516,8 +519,8 @@ Tests: fixture with a known divergence between methods.
 |---|---|---|
 | MSRV CI job (1.93.1) | WP-1.1 | Passed remotely on the PR |
 | `cargo deny` (licenses + advisories) | WP-1.1 | Passed remotely on the PR and locally |
-| Nightly fuzz CI job | WP-1.3 | Scheduled/manual workflow with predicate and dpkg targets. It now fails if no targets are found and uploads crash artifacts on failure. GitHub runs scheduled workflows only from the default branch, and `main` still carries the old workflow, so a run must be observed after merging (or started manually with `workflow_dispatch` against this branch). **Remaining M1 item** |
-| Sandbox-capable CI job | WP-1.7 | Required unprivileged `ROB_REQUIRE_BWRAP=1` job in the CI gate on `ubuntu-26.04` (bubblewrap ≥ 0.11, distribution `cargo`/`rustc`). Passed remotely |
+| Nightly fuzz CI job | WP-1.3 | Scheduled/manual workflow with predicate and dpkg targets; fails if no targets are found and uploads crash artifacts on failure. Passed remotely after the M1 merge |
+| Sandbox-capable CI job | WP-1.7, WP-2.1 | Required unprivileged `ROB_REQUIRE_BWRAP=1` job in the CI gate on `ubuntu-26.04` (bubblewrap ≥ 0.11, distribution `cargo`/`rustc`, `python3`). Passed remotely for M1. The live proxy test needs `ROB_NETWORK_TESTS=1`, which the job does not set yet |
 | Push-trigger CI | WP-1.1 | Build/test workflow triggers on pushes to `main` and PRs targeting `main` |
 | rustdoc with examples | each WP | Every public item in `robigus` and `rapt` is documented, and both crates enable `#![warn(missing_docs)]` (CI's `-D warnings` makes a gap a failure). Key entry points have doctests (graph, predicates, dpkg, features, store, export, detection, fetch, sandbox); new APIs must keep this up |
 | Workspace README | DoD | `README.md` at the workspace root gives an overview of both crates, a `tsp-analyzer` quickstart, library examples, sandbox host requirements, and the development workflow. Update it when `analyze` lands (M2) |
@@ -558,8 +561,8 @@ Proposed slicing only, not a record of actual PRs or merge state; each eventual 
 | 6 | WP-1.6 detection | fixture tests |
 | 7 | WP-1.7 sandbox foundation | sandbox suite |
 | 8 | WP-1.8 CLI skeleton | integration tests |
-| 9 | WP-1.9 export | round-trip test; CI gate including the sandbox job green (observed); **M1 done** once a nightly fuzz run passes |
-| 10 | WP-2.1 proxy | wiremock tests |
+| 9 | WP-1.9 export | round-trip test; CI gate including the sandbox job green — **M1 done** |
+| 10 | WP-2.1 proxy | proxy unit/wiremock tests; sandbox proxy integration tests; live smoke test |
 | 11 | WP-2.2 cargo analyzer | snapshots |
 | 12 | WP-2.3 expansion + `analyze` + `print --why` | resume/limit tests |
 | 13 | WP-2.4 fixtures + WP-2.5 E2E | E2E green — **M2 done** |
@@ -577,8 +580,10 @@ Proposed slicing only, not a record of actual PRs or merge state; each eventual 
 | Host IPC through sandbox mounts or inherited state | Offline sandbox could reach host services | Mitigated | Private `nodev` overlays, seccomp socket/keyring policy, descriptor sanitation; regressions for sockets, FIFOs, descriptors and keyrings run in the required sandbox job |
 | Dpkg comparison/hash regressions | Hashed identities could behave incorrectly | Mitigated | UTF-8, `Eq`/`Hash`, differential, property, and fuzz-target coverage added; verify scheduled fuzz runs |
 | Local cache contents tampered after publication | Cache hit returned as verified despite modified contents | Low (trusted-cache policy) | Spec §7.2: the cache is user-owned trusted state and must not be shared with less-trusted users |
-| `cargo metadata` needs network + writable `CARGO_HOME` inside sandbox | Primary analyzer fails | Medium | WP-2.1 proxy + tmpfs `CARGO_HOME`; smoke test through proxy |
-| Proxy breaks cargo TLS | Analysis fails | Low | CONNECT passthrough after host validation — no MITM |
+| `cargo metadata` needs network + writable `CARGO_HOME` inside sandbox | Primary analyzer fails | Low (smoke test passes locally) | WP-2.1 proxy + tmpfs `CARGO_HOME`; live smoke test behind `ROB_NETWORK_TESTS=1` |
+| Proxy breaks cargo TLS | Analysis fails | Low | CONNECT passthrough after host and SNI validation — no MITM; CA bundle overlaid read-only |
+| Domain fronting or exfiltration through allowlisted hosts | Data leaves via a permitted endpoint | Medium | Documented residual risk; narrow `[network]` for untrusted analyses; every request logged |
+| Host lacks `/usr/bin/python3` | Network-enabled analysis unavailable | Low on Ubuntu | Fails closed with `SandboxError::NetworkUnavailable`; offline analysis unaffected |
 | `ON CONFLICT` vs partial unique indexes | Duplicate edges | Medium | Merge in Rust on constraint violation (WP-1.4) |
 | insta snapshot churn across environments | CI flakiness | Medium | Redactions from day one (WP-2.4); review checklist |
 | petgraph graph not serializable | Data loss on load | None by design | Store is source of truth; `load()` rebuilds the graph |
@@ -598,7 +603,7 @@ Proposed slicing only, not a record of actual PRs or merge state; each eventual 
 - [ ] Sandbox: fail-closed verified (exit 4 with diagnostics); bwrap and native backends pass the sandbox suite on a required capable runner; the allowlist proxy blocks non-allowlisted hosts. (Host-IPC isolation is fixed for bwrap and passes locally.)
 - [ ] Offline mode produces declared-but-unresolved graphs with `network_mode = "offline"`.
 - [ ] LLM sub-agents: opt-in only, anchor-verified, capped at L3, injection-resistant (tested).
-- [ ] CI green on PR and push: fmt, clippy `-D warnings`, doc, test, audit, deny, MSRV 1.93.1; nightly fuzz running. (PR CI is green; push-to-`main` and fuzz runs remain to be observed.)
+- [ ] CI green on PR and push: fmt, clippy `-D warnings`, doc, test, audit, deny, MSRV 1.93.1; nightly fuzz running. (Observed for M1; must stay green through M2/M3.)
 - [x] `robigus/Cargo.toml` carries full §18 metadata; `robigus/SECURITY.md` exists with its own reporting path (spec §17).
 - [ ] Differential and fuzz tests cover dpkg comparison; accepted-input and `Eq`/`Hash` fixes are implemented, but scheduled fuzz runs remain to be verified.
 - [x] rustdoc complete for the current public API (enforced by `missing_docs`); README quickstart. Both must be extended as M2/M3 add APIs and `analyze`.

@@ -1,11 +1,15 @@
-//! Fail-closed sandbox foundation (spec §10; WP-1.7).
+//! Fail-closed sandbox (spec §10; WP-1.7, WP-2.1).
 //!
-//! Only bubblewrap is available in M1. Network access and the native backend
-//! are deliberately unavailable until their respective work packages land.
+//! Only bubblewrap is available; the native backend is deliberately
+//! unavailable until WP-3.5. Network access is offline by default and
+//! otherwise mediated by the allowlisting [`proxy`].
+
+pub mod proxy;
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -42,15 +46,18 @@ pub enum SandboxPreference {
     Native,
 }
 
-/// Network policy for a command. Allowlisted networking requires WP-2.1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Network policy for a command. There is no unrestricted mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkAccess {
-    /// No network: the command runs in its own empty network namespace.
+    /// No network: the command runs in its own network namespace with only
+    /// an unconnected loopback interface.
     Offline,
-    /// Egress through robigus's allowlisting proxy (spec §10.2). Not yet
-    /// implemented: [`Sandbox::run`] rejects it with
-    /// [`SandboxError::NetworkUnavailable`] rather than running unrestricted.
-    Allowlist,
+    /// Egress only through robigus's allowlisting forward proxy (spec §10.2),
+    /// enforcing this policy. The command still runs in its own network
+    /// namespace; see [`proxy`] for the transport and request rules.
+    /// Requires `/usr/bin/python3` on the host, which binds the proxy
+    /// listener inside the sandbox.
+    Allowlist(proxy::ProxyPolicy),
 }
 
 /// A single sandboxed execution. `program` is an absolute path **inside** the
@@ -72,8 +79,10 @@ pub enum NetworkAccess {
 /// and denies io_uring and the kernel keyring syscalls (the host session
 /// keyring is not namespaced); named Unix sockets are unavailable even inside
 /// the sandbox. Inherited descriptors other than stdio are closed before
-/// bubblewrap starts. Not covered here: resource limits (WP-3.5) and
-/// allowlisted networking, which needs an explicit proxy transport (WP-2.1).
+/// bubblewrap starts. With [`NetworkAccess::Allowlist`], the proxy
+/// environment variables point at the in-sandbox proxy listener and the
+/// host's `/etc/ssl/certs` is added as a read-only overlay so TLS clients can
+/// verify servers. Not covered here: resource limits (WP-3.5).
 ///
 /// Bubblewrap uses a fixed shell wrapper to restore stdin; failure to execute
 /// the requested program is reported as the shell's exit status (126 or 127).
@@ -94,13 +103,16 @@ pub struct CommandSpec {
     /// `RUST_BACKTRACE`, `CARGO_NET_OFFLINE` and `SOURCE_DATE_EPOCH` are
     /// accepted, with values free of NUL bytes; any other key rejects the
     /// command. They extend the fixed sandbox environment (`PATH`, `HOME`,
-    /// `CARGO_HOME`, `CARGO_TARGET_DIR`, `TMPDIR`, `PWD`) and are recorded with it.
+    /// `CARGO_HOME`, `CARGO_TARGET_DIR`, `TMPDIR`, `PWD`, and for
+    /// [`NetworkAccess::Allowlist`] the proxy variables) and are recorded
+    /// with it.
     pub env: BTreeMap<String, String>,
     /// Wall-clock limit for the execution; must be nonzero. When it expires
     /// the sandbox's process group is killed and the status is
     /// [`ProcessStatus::TimedOut`].
     pub timeout: Duration,
-    /// Network policy; currently only [`NetworkAccess::Offline`] is accepted.
+    /// Network policy. With [`NetworkAccess::Allowlist`], every proxy
+    /// request is logged to `proxy.jsonl` in the execution's log directory.
     pub network: NetworkAccess,
     /// Existing host directory that receives the logs. It is not mounted into
     /// the sandbox.
@@ -149,10 +161,11 @@ pub struct ProcessOutput {
 /// Failure to prepare, launch, or record an execution.
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
-    /// [`NetworkAccess::Allowlist`] was requested; rejected before anything
-    /// runs because the allowlisting proxy is not implemented yet.
-    #[error("allowlisted network access is unavailable until the sandbox proxy is implemented")]
-    NetworkUnavailable,
+    /// [`NetworkAccess::Allowlist`] was requested, but the proxy transport
+    /// cannot be provided on this host (for example `/usr/bin/python3` is
+    /// missing). Nothing was launched; there is no unproxied fallback.
+    #[error("allowlisted network access is unavailable: {0}")]
+    NetworkUnavailable(String),
     /// Bubblewrap was selected, but setup or supervision did not complete.
     /// The command may already have run if the supervisor failed afterward.
     #[error("bubblewrap setup or supervision failed: {cause} (stderr log: {})", stderr_path.display())]
@@ -319,6 +332,7 @@ async fn probe_bwrap() -> Result<PathBuf, String> {
             status,
             Stdio::null(),
             Stdio::piped(),
+            None,
         )?;
         cmd.args(["/usr/bin/true"]);
         let result = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await;
@@ -446,28 +460,79 @@ async fn read_bounded(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
 }
 
 /// Fixed, trusted host shell that closes every inherited descriptor except
-/// stdio and the seccomp filter before exec'ing bubblewrap.
+/// stdio, the seccomp filter and (with networking) the proxy control socket
+/// before exec'ing bubblewrap.
 const SANITIZER: &str = "/usr/bin/bash";
 
-/// The sanitizer script. It receives no untrusted text: `$@` is bubblewrap and
-/// its arguments, passed as separate words and never evaluated. Descriptor
-/// numbers come from `/proc/self/fd` and are checked to be numeric before use.
-/// Closing happens in a single-threaded process, so no descriptor can be
-/// opened concurrently; the final check fails closed if any survives.
-const SANITIZE_FDS: &str = r#"keep=$1; shift
+/// The sanitizer script. It receives no untrusted text: `$1` is the
+/// space-separated list of descriptors to keep, built by robigus from
+/// constants, and the remaining words are bubblewrap and its arguments,
+/// passed as separate words and never evaluated. Descriptor numbers come
+/// from `/proc/self/fd` and are checked to be numeric before use. Closing
+/// happens in a single-threaded process, so no descriptor can be opened
+/// concurrently; the final check fails closed if any survives.
+const SANITIZE_FDS: &str = r#"keep=" $1 "; shift
 for entry in /proc/self/fd/*; do
   fd=${entry##*/}
   case $fd in ''|*[!0-9]*) echo "robigus: unexpected descriptor entry" >&2; exit 125;; esac
-  if [ "$fd" -gt 2 ] && [ "$fd" -ne "$keep" ]; then exec {fd}>&-; fi
+  case $keep in *" $fd "*) continue;; esac
+  if [ "$fd" -gt 2 ]; then exec {fd}>&-; fi
 done
 for entry in /proc/self/fd/*; do
   fd=${entry##*/}
-  if [ "$fd" -gt 2 ] && [ "$fd" -ne "$keep" ] && [ -e "$entry" ]; then
+  case $keep in *" $fd "*) continue;; esac
+  if [ "$fd" -gt 2 ] && [ -e "$entry" ]; then
     target=$(readlink "$entry" 2>/dev/null)
     case $target in /proc/*/fd) ;; *) echo "robigus: descriptor $fd survived sanitation" >&2; exit 125;; esac
   fi
 done
 exec "$@""#;
+
+/// Descriptor number of the proxy control socket inside the sandbox.
+const CONTROL_FD: i32 = 4;
+
+/// Longest wait for the bootstrap to hand over the proxy listener.
+const PROXY_SETUP_LIMIT: Duration = Duration::from_secs(30);
+
+/// Longest wait, after the sandbox exits, for proxied connections to finish
+/// and log. They normally end at once: the sandbox side is already closed.
+const PROXY_DRAIN_LIMIT: Duration = Duration::from_secs(2);
+
+/// Interpreter for [`PROXY_BOOTSTRAP`], taken from the read-only runtime.
+const PYTHON: &str = "/usr/bin/python3";
+
+/// Binds the proxy listener inside the sandbox's network namespace and sends
+/// it to robigus over the control socket. It takes no input; the address and
+/// descriptor are fixed (checked against [`proxy::SANDBOX_PROXY_ADDR`] and
+/// [`CONTROL_FD`] by a unit test). It runs with `-I -S`, so no environment
+/// variable, user site or `site` hook can alter it.
+const PROXY_BOOTSTRAP: &str = r#"import socket
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.bind(("127.0.0.1", 3128))
+listener.listen(128)
+control = socket.socket(fileno=4)
+socket.send_fds(control, [b"L"], [listener.fileno()])
+"#;
+
+/// Runs the bootstrap, then drops the control socket before exec'ing the
+/// workload, so the workload holds neither the control socket nor the
+/// listener. `$1` is [`PROXY_BOOTSTRAP`]; the rest is the workload. If the
+/// bootstrap fails, the workload never runs.
+const NETWORK_WRAPPER: &str =
+    "exec </dev/null; /usr/bin/python3 -I -S -c \"$1\" || exit 125; exec 4>&-; shift; exec \"$@\"";
+
+/// CA certificates exposed read-only to network-enabled sandboxes.
+const CA_CERTIFICATES: &str = "/etc/ssl/certs";
+
+/// Proxy variables set for network-enabled sandboxes. Callers cannot set
+/// them; see [`allowed_env`].
+const PROXY_ENV: [&str; 5] = [
+    "http_proxy",
+    "https_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "CARGO_HTTP_PROXY",
+];
 
 /// Host trees exposed to the sandbox. Directories are mounted as private
 /// read-only overlays; symlinks (for example a merged-`/usr` `/bin`) are
@@ -519,7 +584,9 @@ fn mount_runtime(cmd: &mut Command, empty: &Path) -> Result<(), String> {
 
 /// Builds a sanitized bubblewrap command with the complete isolation policy,
 /// ending with `--` so the caller appends only the workload. `status` becomes
-/// bubblewrap's stdin and its `--json-status-fd`.
+/// bubblewrap's stdin and its `--json-status-fd`. `control`, for
+/// network-enabled runs, becomes [`CONTROL_FD`] in the sandbox and adds the
+/// CA certificate overlay.
 #[allow(clippy::too_many_arguments)]
 fn isolated_command(
     executable: &Path,
@@ -530,6 +597,7 @@ fn isolated_command(
     status: std::fs::File,
     stdout: Stdio,
     stderr: Stdio,
+    control: Option<std::os::fd::OwnedFd>,
 ) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     let filter = crate::sandbox_seccomp::filter_file()?;
@@ -540,6 +608,19 @@ fn isolated_command(
     {
         use command_fds::{CommandFdExt, FdMapping};
         let filter_fd = crate::sandbox_seccomp::FILTER_FD;
+        let networked = control.is_some();
+        let mut mappings = vec![FdMapping {
+            parent_fd: filter.into(),
+            child_fd: filter_fd,
+        }];
+        let mut keep = filter_fd.to_string();
+        if let Some(control) = control {
+            mappings.push(FdMapping {
+                parent_fd: control,
+                child_fd: CONTROL_FD,
+            });
+            keep.push_str(&format!(" {CONTROL_FD}"));
+        }
         let mut cmd = Command::new(SANITIZER);
         cmd.env_clear()
             .kill_on_drop(true)
@@ -549,11 +630,8 @@ fn isolated_command(
         // All descriptor mappings go through one call: command-fds cannot
         // detect collisions between separate calls.
         cmd.as_std_mut()
-            .fd_mappings(vec![FdMapping {
-                parent_fd: filter.into(),
-                child_fd: filter_fd,
-            }])
-            .map_err(|error| format!("cannot map sandbox seccomp descriptor: {error}"))?;
+            .fd_mappings(mappings)
+            .map_err(|error| format!("cannot map sandbox descriptors: {error}"))?;
         cmd.args([
             "--noprofile",
             "--norc",
@@ -561,7 +639,7 @@ fn isolated_command(
             SANITIZE_FDS,
             "robigus-fd-sanitizer",
         ])
-        .arg(filter_fd.to_string())
+        .arg(keep)
         .arg(executable)
         .args([
             "--unshare-user",
@@ -601,6 +679,12 @@ fn isolated_command(
             "/home/sandbox",
         ]);
         overlay_tree(&mut cmd, source, empty, Path::new("/source"));
+        let certificates = Path::new(CA_CERTIFICATES);
+        if networked
+            && std::fs::symlink_metadata(certificates).is_ok_and(|metadata| metadata.is_dir())
+        {
+            overlay_tree(&mut cmd, certificates, empty, certificates);
+        }
         for (key, value) in env {
             cmd.arg("--setenv").arg(key).arg(value);
         }
@@ -609,8 +693,110 @@ fn isolated_command(
     }
 }
 
+/// Host side of the proxy control channel: the socketpair end robigus keeps,
+/// and the end mapped into the sandbox as [`CONTROL_FD`]. Both are
+/// close-on-exec; the descriptor mapping clears the flag in the child only.
+#[cfg(target_os = "linux")]
+fn control_socketpair() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+    Ok(socketpair(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None,
+    )?)
+}
+
+/// Waits for the bootstrap to send the proxy listener and validates it.
+///
+/// Fails if the sandbox exits or closes the channel first, sends anything
+/// other than one listening IPv4 TCP socket on the proxy address, or takes
+/// longer than `limit`. The receive blocks a worker thread (bounded by a
+/// socket timeout), because registering a raw descriptor with tokio requires
+/// `unsafe`. When the sandbox exits, every copy of its end is closed and the
+/// receive returns end-of-file.
+#[cfg(target_os = "linux")]
+async fn receive_listener(
+    host: std::os::fd::OwnedFd,
+    limit: Duration,
+) -> Result<tokio::net::TcpListener, String> {
+    use std::io::IoSliceMut;
+    use std::mem::MaybeUninit;
+
+    use rustix::net::sockopt::{
+        Timeout, set_socket_timeout, socket_acceptconn, socket_domain, socket_type,
+    };
+    use rustix::net::{
+        AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+        SocketType, recvmsg,
+    };
+
+    let receive = move || -> Result<std::net::TcpListener, String> {
+        set_socket_timeout(&host, Timeout::Recv, Some(limit))
+            .map_err(|error| format!("cannot configure proxy control socket: {error}"))?;
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+        let mut byte = [0_u8; 2];
+        let message = loop {
+            match recvmsg(
+                &host,
+                &mut [IoSliceMut::new(&mut byte)],
+                &mut ancillary,
+                RecvFlags::CMSG_CLOEXEC,
+            ) {
+                Ok(message) => break message,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(rustix::io::Errno::AGAIN) => {
+                    return Err("timed out waiting for the sandbox proxy listener".into());
+                }
+                Err(error) => return Err(format!("cannot receive proxy listener: {error}")),
+            }
+        };
+        let mut descriptors = Vec::new();
+        for item in ancillary.drain() {
+            if let RecvAncillaryMessage::ScmRights(fds) = item {
+                descriptors.extend(fds);
+            }
+        }
+        if message.bytes == 0 && descriptors.is_empty() {
+            return Err("sandbox closed the proxy control socket without a listener".into());
+        }
+        if message
+            .flags
+            .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
+            || message.bytes != 1
+            || byte[0] != b'L'
+            || descriptors.len() != 1
+        {
+            return Err("unexpected message on the proxy control socket".into());
+        }
+        let listener = descriptors.remove(0);
+        let is_tcp_listener = socket_domain(&listener).is_ok_and(|d| d == AddressFamily::INET)
+            && socket_type(&listener).is_ok_and(|t| t == SocketType::STREAM)
+            && socket_acceptconn(&listener).unwrap_or(false);
+        if !is_tcp_listener {
+            return Err("proxy control socket did not carry a listening TCP socket".into());
+        }
+        let listener = std::net::TcpListener::from(listener);
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("cannot inspect proxy listener: {error}"))?;
+        proxy::check_listener(address, proxy::SANDBOX_PROXY_ADDR)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("cannot configure proxy listener: {error}"))?;
+        Ok(listener)
+    };
+    let listener = tokio::task::spawn_blocking(receive)
+        .await
+        .map_err(|error| format!("proxy setup task failed: {error}"))??;
+    tokio::net::TcpListener::from_std(listener)
+        .map_err(|error| format!("cannot register proxy listener: {error}"))
+}
+
 /// Environment keys permitted from the caller. None may override the fixed
-/// sandbox paths or inject a dynamic linker, shell, or Cargo configuration.
+/// sandbox paths or proxy variables, or inject a dynamic linker, shell, or
+/// Cargo configuration.
 fn allowed_env(key: &str) -> bool {
     matches!(
         key,
@@ -658,9 +844,23 @@ impl Sandbox for BwrapSandbox {
     }
 
     async fn run(&self, spec: &CommandSpec) -> Result<ProcessOutput, SandboxError> {
-        if spec.network != NetworkAccess::Offline {
-            return Err(SandboxError::NetworkUnavailable);
-        }
+        let policy = match &spec.network {
+            NetworkAccess::Offline => None,
+            NetworkAccess::Allowlist(policy) => {
+                policy.validate().map_err(SandboxError::InvalidCommand)?;
+                if !cfg!(target_os = "linux") {
+                    return Err(SandboxError::NetworkUnavailable(
+                        "the sandbox proxy requires Linux".into(),
+                    ));
+                }
+                if !Path::new(PYTHON).is_file() {
+                    return Err(SandboxError::NetworkUnavailable(format!(
+                        "{PYTHON} is required to bind the proxy listener inside the sandbox"
+                    )));
+                }
+                Some(Arc::new(policy.clone()))
+            }
+        };
         if !spec.program.is_absolute() || spec.program.as_os_str().is_empty() {
             return Err(SandboxError::InvalidCommand(
                 "program must be an absolute sandbox path".into(),
@@ -773,7 +973,31 @@ impl Sandbox for BwrapSandbox {
             ("TMPDIR".into(), "/tmp".into()),
             ("PWD".into(), pwd.into()),
         ]);
+        if policy.is_some() {
+            for key in PROXY_ENV {
+                env.insert(key.into(), proxy::SANDBOX_PROXY_URL.into());
+            }
+            // The proxy resolves names; local resolution would fail anyway.
+            env.insert("no_proxy".into(), String::new());
+            env.insert("NO_PROXY".into(), String::new());
+        }
         env.extend(spec.env.clone());
+        let proxy_log = match &policy {
+            Some(_) => Some(Arc::new(proxy::ProxyLog::create(
+                &log_dir.join("proxy.jsonl"),
+            )?)),
+            None => None,
+        };
+        #[cfg(target_os = "linux")]
+        let (control_host, control_sandbox) = match &policy {
+            Some(_) => {
+                let (host, sandbox) = control_socketpair()?;
+                (Some(host), Some(sandbox))
+            }
+            None => (None, None),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let control_sandbox: Option<std::os::fd::OwnedFd> = None;
         // The overlay's second lower layer must be an empty directory that does
         // not overlap the source; keep it with this invocation's logs.
         let empty_layer = log_dir.join("empty-layer");
@@ -789,6 +1013,7 @@ impl Sandbox for BwrapSandbox {
             status_file,
             Stdio::from(stdout),
             Stdio::from(stderr),
+            control_sandbox,
         );
         let mut cmd = match launch {
             Ok(cmd) => cmd,
@@ -798,14 +1023,23 @@ impl Sandbox for BwrapSandbox {
         };
         #[cfg(unix)]
         cmd.process_group(0);
-        cmd.args([
-            "/bin/sh",
-            "-c",
-            "exec </dev/null; exec \"$@\"",
-            "robigus-sandbox",
-        ])
-        .arg(&spec.program)
-        .args(&spec.args);
+        if policy.is_some() {
+            cmd.args([
+                "/bin/sh",
+                "-c",
+                NETWORK_WRAPPER,
+                "robigus-sandbox",
+                PROXY_BOOTSTRAP,
+            ]);
+        } else {
+            cmd.args([
+                "/bin/sh",
+                "-c",
+                "exec </dev/null; exec \"$@\"",
+                "robigus-sandbox",
+            ]);
+        }
+        cmd.arg(&spec.program).args(&spec.args);
 
         let relative_log = log_dir
             .strip_prefix(&workspace)
@@ -828,7 +1062,12 @@ impl Sandbox for BwrapSandbox {
             })
             .await?;
         let started = Instant::now();
-        let outcome = match cmd.spawn() {
+        let spawned = cmd.spawn();
+        // The command owns the mapped descriptors, including the sandbox end
+        // of the proxy control socket; release them so only the sandbox holds
+        // that end.
+        drop(cmd);
+        let outcome = match spawned {
             Err(error) => Err(SandboxError::BwrapSetup {
                 cause: format!("could not launch {}: {error}", self.executable.display()),
                 stderr_path: stderr_path.clone(),
@@ -836,7 +1075,44 @@ impl Sandbox for BwrapSandbox {
             Ok(child) => {
                 let group = child.id();
                 let mut guard = ChildGuard { child, group };
-                match tokio::time::timeout(spec.timeout, guard.child.wait()).await {
+                // The whole execution, including proxy setup, shares one
+                // deadline. The proxy runs only while the child does; after
+                // it exits, connections in progress get a short grace period
+                // to finish logging, and are aborted on timeout or error.
+                let deadline = tokio::time::Instant::now() + spec.timeout;
+                let mut proxy_task: Option<proxy::ProxyTask> = None;
+                let supervised = async {
+                    #[cfg(target_os = "linux")]
+                    if let (Some(control), Some(policy), Some(log)) =
+                        (control_host, &policy, &proxy_log)
+                    {
+                        let limit = spec.timeout.min(PROXY_SETUP_LIMIT);
+                        let listener = tokio::select! {
+                            received = receive_listener(control, limit) => received,
+                            exited = guard.child.wait() => {
+                                exited.map_err(SandboxError::Io)?;
+                                Err("sandbox exited before providing the proxy listener".into())
+                            }
+                        };
+                        let listener = listener.map_err(|cause| SandboxError::BwrapSetup {
+                            cause: format!("sandbox proxy setup failed: {cause}"),
+                            stderr_path: stderr_path.clone(),
+                        })?;
+                        proxy_task = Some(proxy::ProxyTask::spawn(
+                            listener,
+                            policy.clone(),
+                            log.clone(),
+                        ));
+                    }
+                    guard.child.wait().await.map_err(SandboxError::Io)
+                };
+                let supervised = tokio::time::timeout_at(deadline, supervised).await;
+                if let Some(task) = proxy_task.take()
+                    && matches!(supervised, Ok(Ok(_)))
+                {
+                    task.finish(PROXY_DRAIN_LIMIT).await;
+                }
+                match supervised {
                     Ok(Ok(status)) => {
                         guard.group = None;
                         const STATUS_LIMIT: usize = 64 * 1024;
@@ -881,7 +1157,8 @@ impl Sandbox for BwrapSandbox {
                     }
                     Ok(Err(error)) => {
                         guard.terminate();
-                        Err(SandboxError::Io(error))
+                        let _ = guard.child.wait().await;
+                        Err(error)
                     }
                     Err(_) => {
                         guard.terminate();
@@ -940,6 +1217,24 @@ mod tests {
             tool_version: None,
         };
         (dir, spec)
+    }
+
+    #[test]
+    fn proxy_bootstrap_matches_the_transport_constants() {
+        let address = proxy::SANDBOX_PROXY_ADDR;
+        assert!(PROXY_BOOTSTRAP.contains(&format!(
+            "listener.bind((\"{}\", {}))",
+            address.ip(),
+            address.port()
+        )));
+        assert!(PROXY_BOOTSTRAP.contains(&format!("socket.socket(fileno={CONTROL_FD})")));
+        assert!(NETWORK_WRAPPER.contains(&format!("exec {CONTROL_FD}>&-;")));
+        assert!(NETWORK_WRAPPER.contains("|| exit 125"));
+        assert_eq!(proxy::SANDBOX_PROXY_URL, format!("http://{address}"));
+        assert_ne!(CONTROL_FD, crate::sandbox_seccomp::FILTER_FD);
+        for key in PROXY_ENV {
+            assert!(!allowed_env(key));
+        }
     }
 
     #[test]
@@ -1017,12 +1312,23 @@ mod tests {
         let sandbox = BwrapSandbox {
             executable: "/does/not/exist".into(),
         };
-        spec.network = NetworkAccess::Allowlist;
+        let mut invalid = proxy::ProxyPolicy::default();
+        invalid.ports.clear();
+        spec.network = NetworkAccess::Allowlist(invalid);
         assert!(matches!(
             sandbox.run(&spec).await,
-            Err(SandboxError::NetworkUnavailable)
+            Err(SandboxError::InvalidCommand(message)) if message.contains("ports")
         ));
         spec.network = NetworkAccess::Offline;
+        for key in PROXY_ENV.into_iter().chain(["no_proxy", "NO_PROXY"]) {
+            spec.env
+                .insert(key.into(), "http://attacker.example".into());
+            assert!(matches!(
+                sandbox.run(&spec).await,
+                Err(SandboxError::InvalidCommand(_))
+            ));
+            spec.env.clear();
+        }
         spec.env.insert("LD_PRELOAD".into(), "evil.so".into());
         assert!(matches!(
             sandbox.run(&spec).await,

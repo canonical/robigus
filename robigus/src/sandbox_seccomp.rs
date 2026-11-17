@@ -7,7 +7,8 @@
 //!
 //! Policy:
 //! - `socket()` is limited to `AF_INET`/`AF_INET6` (the network namespace has
-//!   no route off the host; WP-2.1 will add an explicit proxy transport);
+//!   no route off the host; allowlisted egress goes through the in-namespace
+//!   proxy listener, see `sandbox::proxy`);
 //! - `socketpair()` is limited to fixed-peer `AF_UNIX` stream/seqpacket pairs,
 //!   which cannot be reconnected to another peer;
 //! - io_uring entry points are denied, since rings can perform socket

@@ -12,7 +12,12 @@ use crate::commands::{fetch::FetchArgs, print::PrintArgs};
 
 const CONFIG_HELP: &str = "TOML acquisition configuration (unknown fields are errors). Schema:
 [network]
-allowlist = [\"crates.io\"] # future analysis proxy only; NOT enforced by fetch
+# Sandboxed analysis egress (spec 10.2). Each entry covers the host and its
+# subdomains; deny wins. Defaults: crates.io, ubuntu.com, github.com,
+# gitlab.com, codeberg.org. Not applied to fetch, which runs on the host.
+allowlist = [\"crates.io\"] # replaces the default allowlist
+allow = [\"pypi.org\"] # added to the allowlist
+deny = [\"gitlab.com\"] # removed, including subdomains
 [limits.download]
 max_bytes = 536870912
 connect_timeout = 30 # seconds, positive integer
@@ -156,7 +161,44 @@ pub struct Config {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
+    /// Replaces the default allowlist when present.
     pub allowlist: Option<Vec<String>>,
+    /// Added to the (default or replaced) allowlist.
+    pub allow: Vec<String>,
+    /// Denied hosts and subdomains; denial overrides any allowance.
+    pub deny: Vec<String>,
+}
+
+impl NetworkConfig {
+    /// The proxy policy these settings describe (spec §10.2). `--offline`
+    /// disables egress entirely and is handled by the caller. Validated at
+    /// config load; `analyze` (WP-2.3) will pass it to the sandbox.
+    pub fn proxy_policy(&self) -> Result<robigus::ProxyPolicy, CliError> {
+        let parse = |field: &str, host: &String| {
+            host.parse::<robigus::HostName>()
+                .map_err(|error| CliError::Usage(format!("network.{field} entry: {error}")))
+        };
+        let mut allowlist = match &self.allowlist {
+            Some(hosts) => {
+                let mut list = robigus::Allowlist::empty();
+                for host in hosts {
+                    list.allow(parse("allowlist", host)?);
+                }
+                list
+            }
+            None => robigus::Allowlist::default(),
+        };
+        for host in &self.allow {
+            allowlist.allow(parse("allow", host)?);
+        }
+        for host in &self.deny {
+            allowlist.deny(parse("deny", host)?);
+        }
+        Ok(robigus::ProxyPolicy {
+            allowlist,
+            ..robigus::ProxyPolicy::default()
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -202,24 +244,8 @@ pub struct GitConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<(), CliError> {
-        if let Some(hosts) = &self.network.allowlist {
-            for host in hosts {
-                // Future proxy policy uses literal DNS hosts, not URLs or wildcards.
-                if host.len() > 253
-                    || host.split('.').any(|label| {
-                        label.is_empty()
-                            || label.len() > 63
-                            || label.starts_with('-')
-                            || label.ends_with('-')
-                            || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-                    })
-                {
-                    return Err(CliError::Usage(format!(
-                        "network.allowlist entry '{host}' must be a literal DNS hostname"
-                    )));
-                }
-            }
-        }
+        // Proxy policy uses literal DNS hosts, not URLs, wildcards or IPs.
+        self.network.proxy_policy()?;
         if let Some(schemes) = &self.limits.git.submodule_schemes {
             for scheme in schemes {
                 if !scheme.starts_with(|c: char| c.is_ascii_lowercase())
@@ -282,9 +308,10 @@ impl Config {
     }
 
     pub fn describe_future_settings(&self) {
-        if self.network.allowlist.is_some() {
+        let network = &self.network;
+        if network.allowlist.is_some() || !network.allow.is_empty() || !network.deny.is_empty() {
             eprintln!(
-                "notice: network.allowlist is reserved for the future analysis proxy; fetch does NOT enforce this host allowlist"
+                "notice: [network] settings apply to sandboxed analysis (analyze, not yet implemented); fetch runs on the host and does NOT enforce them"
             );
         }
         if self.subagent.enabled {
@@ -462,10 +489,50 @@ mod tests {
         for text in [
             "[network]\nallowlist = ['https://crates.io']",
             "[network]\nallowlist = ['*.example.org']",
+            "[network]\nallow = ['127.0.0.1']",
+            "[network]\nallow = ['example.org:8080']",
+            "[network]\ndeny = ['']",
             "[limits.git]\nsubmodule_schemes = ['https://']",
         ] {
-            assert!(toml::from_str::<Config>(text).unwrap().validate().is_err());
+            assert!(
+                toml::from_str::<Config>(text).unwrap().validate().is_err(),
+                "accepted {text}"
+            );
         }
+    }
+
+    #[test]
+    fn network_settings_build_the_proxy_policy() {
+        let host = |name: &str| name.parse::<robigus::HostName>().unwrap();
+        let defaults = Config::default().network.proxy_policy().unwrap();
+        assert_eq!(defaults, robigus::ProxyPolicy::default());
+
+        let config: Config = toml::from_str(
+            "[network]\nallow = ['PyPI.org']\ndeny = ['gitlab.com', 'static.crates.io']",
+        )
+        .unwrap();
+        let policy = config.network.proxy_policy().unwrap();
+        assert!(policy.allowlist.permits(&host("files.pypi.org")));
+        assert!(policy.allowlist.permits(&host("index.crates.io")));
+        assert!(!policy.allowlist.permits(&host("static.crates.io")));
+        assert!(!policy.allowlist.permits(&host("gitlab.com")));
+
+        let config: Config =
+            toml::from_str("[network]\nallowlist = ['crates.io']\nallow = ['ubuntu.com']").unwrap();
+        let policy = config.network.proxy_policy().unwrap();
+        assert!(policy.allowlist.permits(&host("index.crates.io")));
+        assert!(policy.allowlist.permits(&host("archive.ubuntu.com")));
+        assert!(!policy.allowlist.permits(&host("github.com")));
+
+        let empty: Config = toml::from_str("[network]\nallowlist = []").unwrap();
+        assert!(
+            !empty
+                .network
+                .proxy_policy()
+                .unwrap()
+                .allowlist
+                .permits(&host("crates.io"))
+        );
     }
 
     #[test]

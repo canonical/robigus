@@ -3206,6 +3206,7 @@ dependencies = [
  "flate2",
  "gix",
  "glob",
+ "httparse",
  "ignore",
  "libc",
  "miette",

@@ -28,7 +28,7 @@ flowchart TD
 
 robigus analyzes a target software project, discovers and expands its full transitive dependency graph, and persists that graph so it can later be mapped onto the Ubuntu archive. The normative specification is [`robigus/AGENTS.md`](robigus/AGENTS.md); progress is tracked in [`robigus/plans/phase_1_plan.md`](robigus/plans/phase_1_plan.md).
 
-### What is implemented (Milestone M1)
+### What is implemented (Milestone M1 and WP-2.1)
 
 - **Acquisition** (`fetch`): git repositories (pinned commits, recursive submodules), source tarballs (gzip, xz, zstd), and local paths, stored in a content-addressed cache. Extraction is hardened against path traversal, escaping links, device nodes, setuid entries, and decompression bombs. A crates.io helper verifies checksums against the sparse index.
 - **Detection** (`detect`): languages, build systems (Cargo, CMake, Meson, Autotools, Make, …), test systems, and analysis roots, including Cargo workspace membership rules.
@@ -38,8 +38,9 @@ robigus analyzes a target software project, discovers and expands its full trans
 - **Persistence** (`store`): one SQLite database per analysis, with forward-only migrations, per-node analysis status (`Not_Started`, `Started`, `Complete`, `Error`) for resumable runs, recorded tool invocations, and an integrity checker.
 - **Export** (`export`): lossless JSON snapshots and lossy Graphviz DOT.
 - **Sandbox** (`sandbox`): a mandatory, fail-closed bubblewrap sandbox for any project code robigus runs (see [Sandbox requirements](#sandbox-requirements)).
+- **Allowlist proxy** (`sandbox::proxy`): sandboxed commands that need the network reach it only through an allowlisting forward proxy. It enforces the host allowlist, `Host`/`CONNECT`/TLS SNI agreement and public-only upstream addresses, relays TLS without interception, and logs every request.
 
-Not yet implemented: the `analyze` command, the Cargo and C/C++ analyzers, graph expansion and resume, the network allowlist proxy, the native (Landlock) sandbox, and LLM-assisted analysis. These are Milestones M2 and M3 in the plan.
+Not yet implemented: the `analyze` command, the Cargo and C/C++ analyzers, graph expansion and resume, the native (Landlock) sandbox, and LLM-assisted analysis. These are the rest of Milestones M2 and M3 in the plan.
 
 ### `tsp-analyzer` quickstart
 
@@ -112,7 +113,9 @@ The bubblewrap backend requires:
 - `/usr/bin/bash`, which is used to close inherited file descriptors before bubblewrap starts.
 - An unprivileged user. robigus refuses to run as root.
 
-Inside the sandbox, only the system runtime (`/usr`, `/bin`, `/lib`, `/lib64`) and a read-only view of the source are visible. The home directory, environment, host sockets, and network are not. Toolchains therefore come from the system: install the distribution `cargo` and `rustc` packages, because a rustup toolchain under `~/.cargo` is not visible inside the sandbox. See [`robigus/SECURITY.md`](robigus/SECURITY.md) for the security scope.
+Inside the sandbox, only the system runtime (`/usr`, `/bin`, `/lib`, `/lib64`) and a read-only view of the source are visible. The home directory, environment, host sockets, and network are not. Toolchains therefore come from the system: install the distribution `cargo` and `rustc` packages, because a rustup toolchain under `~/.cargo` is not visible inside the sandbox.
+
+Network access is offline unless a command opts in to the allowlist. Then the sandbox stays in its own network namespace and can reach only the robigus proxy (`http://127.0.0.1:3128`, set in the standard proxy variables), which permits `crates.io`, `ubuntu.com`, `github.com`, `gitlab.com` and `codeberg.org` and their subdomains by default. Adjust this in the `--config` file with `[network] allowlist` (replace), `allow` (add) and `deny` (remove). Network-enabled runs need `/usr/bin/python3`, which creates the proxy listener inside the sandbox, and see the host's `/etc/ssl/certs` read-only. See [`robigus/SECURITY.md`](robigus/SECURITY.md) for the security scope.
 
 ## rapt
 
@@ -176,6 +179,8 @@ The sandbox integration tests skip, with a printed reason, when bubblewrap canno
 ```bash
 ROB_REQUIRE_BWRAP=1 cargo test -p robigus --test sandbox
 ```
+
+Add `ROB_NETWORK_TESTS=1` to also run the live smoke test, which resolves a crates.io dependency with `cargo metadata` through the proxy and needs internet access.
 
 Fuzz targets for the predicate parser and the dpkg comparator live in [`fuzz/`](fuzz/). They need a nightly toolchain: `cargo +nightly fuzz run parse_arbitrary`.
 

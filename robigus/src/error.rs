@@ -216,6 +216,19 @@ pub enum DpkgError {
     EmptyRevision,
 }
 
+/// A network allowlist entry or proxy request host that is not a literal DNS
+/// host name (spec §10.2). URLs, wildcards, ports and IP addresses are
+/// rejected; internationalized names must be given in their ASCII (`xn--`)
+/// form.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid host name {host:?}: {reason}")]
+pub struct InvalidHost {
+    /// The rejected input, truncated to 256 characters.
+    pub host: String,
+    /// Which rule it broke.
+    pub reason: &'static str,
+}
+
 /// One failed sandbox-establishment attempt.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{mechanism}: {cause}")]

@@ -29,10 +29,14 @@ You can expect an acknowledgment within 48 hours. We follow coordinated disclosu
 
 Project code executed during analysis runs in a bubblewrap sandbox: unprivileged user, mount, PID, network, IPC and UTS namespaces; private read-only overlays of the source and system runtime; a seccomp socket policy; and closure of inherited descriptors. Bypasses of this boundary are security vulnerabilities.
 
+Network-enabled runs stay in their own network namespace. Egress is possible only through robigus's allowlisting forward proxy, whose listener is created inside the namespace and handed to robigus. The proxy enforces the host allowlist, allowed ports, `Host`/`CONNECT`/TLS SNI agreement, and refuses names that resolve to non-public addresses; TLS is relayed without interception. Reaching a host the policy forbids, or anything on the host or its network, is a security vulnerability.
+
 Known limitations that are **not** yet in scope:
 
 - CPU, memory and process-count limits (planned for the native backend, WP-3.5).
-- Allowlisted network egress, which is unavailable until the proxy lands (WP-2.1).
+- Domain fronting: inside a TLS tunnel the encrypted HTTP `Host` header cannot be checked, so a client can address another site served by the same allowlisted endpoint.
+- Exfiltration *to* allowlisted hosts (for example a public repository on an allowlisted forge) is not prevented; narrow the allowlist for untrusted analyses.
+- Network-enabled runs need `/usr/bin/python3` on the host to bind the proxy listener inside the sandbox; without it they fail closed.
 - The tool refuses to run as root; running it under other privileged configurations is unsupported.
 - bubblewrap 0.11 or newer (Ubuntu 26.04 or later) is required for the read-only overlays; older versions, such as Ubuntu 24.04's 0.9.0, are rejected and no sandbox is established.
 
