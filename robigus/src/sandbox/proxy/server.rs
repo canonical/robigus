@@ -119,10 +119,13 @@ impl Decision {
 }
 
 /// One proxy log line. `event` is `request` for the decision and `close`
-/// when a forwarded connection ends.
+/// when a forwarded connection ends. `time` is RFC 3339 UTC; it is omitted
+/// (and the clock error logged) if the system clock is unusable, because a
+/// logging failure must not change a proxy decision.
 #[derive(Debug, Default, Serialize)]
 struct Record {
-    time: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time: Option<String>,
     connection: u64,
     event: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,7 +305,11 @@ struct Connection {
 impl Connection {
     fn record(&self, event: &'static str, summary: &Summary) -> Record {
         Record {
-            time: chrono::Utc::now().to_rfc3339(),
+            time: crate::clock::now_rfc3339()
+                .inspect_err(|error| {
+                    tracing::error!(target: "robigus::proxy", %error, "proxy log record has no time");
+                })
+                .ok(),
             connection: self.id,
             event,
             method: summary.method.as_deref().map(bounded),
@@ -1206,6 +1213,12 @@ mod tests {
         );
         assert!(response.ends_with(b"release-body"));
         let records = proxy.wait_for_records(2).await;
+        for record in &records {
+            let time = record["time"].as_str().unwrap();
+            assert!(time.ends_with('Z'), "{time}");
+            time.parse::<jiff::Timestamp>()
+                .expect("RFC 3339 log timestamp");
+        }
         assert_eq!(records[0]["event"], "request");
         assert_eq!(records[0]["decision"], "allowed");
         assert_eq!(records[0]["method"], "GET");

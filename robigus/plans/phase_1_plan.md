@@ -119,7 +119,7 @@ Goal (spec §21): predicate AST and parser (including `cfg` atoms), model extens
 Tasks:
 
 - [x] `robigus/Cargo.toml`: add `description`, `license = "GPL-3.0-only"`, `repository`, `keywords`, `categories`, `rust-version = "1.93.1"`.
-- [x] Workspace `Cargo.toml`: add shared deps — `petgraph`, `rusqlite` (bundled), `rusqlite_migration`, `tracing`, `tracing-subscriber`, `miette`, `sha2`, `tar`, `zstd`, `walkdir`, `ignore`, `toml`, `gix`, `cargo_metadata`, `toml_edit`; dev-deps `insta`, `proptest`, `wiremock`. (`reqwest`, `clap`, `flate2`, `xz2`, `chrono`, `regex`, `serde*`, `thiserror`, `tokio`, `ubuntu-info-rust` already exist.)
+- [x] Workspace `Cargo.toml`: add shared deps — `petgraph`, `rusqlite` (bundled), `rusqlite_migration`, `tracing`, `tracing-subscriber`, `miette`, `sha2`, `tar`, `zstd`, `walkdir`, `ignore`, `toml`, `gix`, `cargo_metadata`, `toml_edit`; dev-deps `insta`, `proptest`, `wiremock`. (`reqwest`, `clap`, `flate2`, `xz2`, `regex`, `serde*`, `thiserror`, `tokio`, `ubuntu-info-rust` already exist. `chrono` was later replaced by `jiff` after RUSTSEC-2026-0543 reported it unmaintained.)
 - [x] Add `deny.toml` and a `cargo deny` CI job (licenses must accept GPL-3.0-only family; advisories on).
 - [x] Repository-level `SECURITY.md` covers the workspace; `robigus/SECURITY.md` gives robigus its own reporting path and sandbox scope (spec §17 updated accordingly).
 - [x] CI: MSRV job pinned to 1.93.1, build/test triggers for pushes to `main` and PRs targeting `main`, a separate doctest step, a required unprivileged sandbox job, and a scheduled/manual nightly fuzz workflow (predicate and dpkg targets; the stale missing-target success fallback is removed).

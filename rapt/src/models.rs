@@ -634,13 +634,37 @@ impl CacheStats {
     }
 }
 
+/// The current time without `jiff::Timestamp::now()`'s panic on an
+/// out-of-range system clock. Such a clock saturates to the nearest
+/// representable instant, so caches still work: one stamped far in the
+/// future looks fresh until the clock is corrected, and the next `update`
+/// rewrites it.
+fn now() -> jiff::Timestamp {
+    clamp_system_time(std::time::SystemTime::now())
+}
+
+fn clamp_system_time(time: std::time::SystemTime) -> jiff::Timestamp {
+    jiff::Timestamp::try_from(time).unwrap_or_else(|_| {
+        if time >= std::time::SystemTime::UNIX_EPOCH {
+            jiff::Timestamp::MAX
+        } else {
+            jiff::Timestamp::MIN
+        }
+    })
+}
+
 /// Cache data bundle for a specific Ubuntu series.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeriesCache {
     /// Series name (e.g. resolute, noble).
     pub series: String,
-    /// Timestamp of when the cache was generated/updated in RFC 3339 format.
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// When the cache was generated or updated. Serialized as an RFC 3339
+    /// UTC timestamp; any RFC 3339 offset is accepted when loading.
+    ///
+    /// This is a [`jiff::Timestamp`]; before the chrono-to-jiff migration it
+    /// was a `chrono::DateTime<chrono::Utc>`. Cache files written by either
+    /// version load unchanged.
+    pub updated_at: jiff::Timestamp,
     /// Map of package name to all binary package versions.
     pub packages: BTreeMap<String, Vec<BinaryPackage>>,
     /// Map of source package name to all source package versions.
@@ -655,18 +679,22 @@ impl SeriesCache {
     pub fn new(series: impl Into<String>) -> Self {
         Self {
             series: series.into(),
-            updated_at: chrono::Utc::now(),
+            updated_at: now(),
             packages: BTreeMap::new(),
             source_packages: BTreeMap::new(),
             provides: BTreeMap::new(),
         }
     }
 
-    /// Checks if the cache was updated within the last hour.
+    /// Checks if the cache was updated within the last hour. A timestamp in
+    /// the future (clock skew) counts as fresh.
     #[must_use]
     pub fn is_fresh(&self) -> bool {
-        let one_hour = chrono::Duration::hours(1);
-        chrono::Utc::now().signed_duration_since(self.updated_at) < one_hour
+        self.is_fresh_at(now())
+    }
+
+    fn is_fresh_at(&self, now: jiff::Timestamp) -> bool {
+        now.duration_since(self.updated_at) < jiff::SignedDuration::from_hours(1)
     }
 
     /// Computes cache statistics.
@@ -732,5 +760,45 @@ impl SeriesCache {
             total_distinct_versions,
             total_dependencies,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jiff::{SignedDuration, Timestamp};
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn freshness_window_is_one_hour() {
+        let now: Timestamp = "2026-11-17T14:00:00Z".parse().unwrap();
+        let mut cache = SeriesCache::new("resolute");
+        for (offset, fresh) in [
+            (SignedDuration::ZERO, true),
+            (SignedDuration::from_mins(59), true),
+            (SignedDuration::from_hours(1), false),
+            (SignedDuration::from_mins(61), false),
+            // A timestamp in the future (clock skew) counts as fresh.
+            (SignedDuration::from_mins(-5), true),
+        ] {
+            cache.updated_at = now - offset;
+            assert_eq!(cache.is_fresh_at(now), fresh, "{offset}");
+        }
+    }
+
+    #[test]
+    fn out_of_range_system_clocks_saturate_instead_of_panicking() {
+        let span = Duration::from_secs(400_000_000_000);
+        if let Some(future) = SystemTime::UNIX_EPOCH.checked_add(span) {
+            assert_eq!(clamp_system_time(future), Timestamp::MAX);
+        }
+        if let Some(past) = SystemTime::UNIX_EPOCH.checked_sub(span) {
+            assert_eq!(clamp_system_time(past), Timestamp::MIN);
+        }
+        assert_eq!(
+            clamp_system_time(SystemTime::UNIX_EPOCH),
+            Timestamp::UNIX_EPOCH
+        );
+        assert!(SeriesCache::new("resolute").is_fresh());
     }
 }

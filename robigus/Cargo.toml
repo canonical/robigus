@@ -16,13 +16,13 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 async-trait = "0.1"
-chrono = { workspace = true }
 flate2 = { workspace = true }
 gix = { workspace = true, features = ["blocking-http-transport-reqwest"] }
 glob = { workspace = true }
 # HTTP/1.x request-head parsing for the sandbox proxy (already locked via hyper).
 httparse = "1.10"
 ignore = { workspace = true }
+jiff = { workspace = true }
 miette = { workspace = true }
 petgraph = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }

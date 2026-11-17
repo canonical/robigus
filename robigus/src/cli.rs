@@ -351,6 +351,8 @@ impl CliError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Analysis(_) | Self::NotImplemented(_) => 1,
+            // A bad system clock is not a database or schema error.
+            Self::Database(robigus::StoreError::Clock(_)) => 1,
             Self::Usage(_) => 2,
             Self::Database(_) => 3,
             Self::Sandbox(_) => 4,
@@ -425,6 +427,12 @@ mod tests {
                     supported: 1,
                 }),
                 3,
+            ),
+            (
+                CliError::Database(robigus::StoreError::Clock(robigus::ClockError(
+                    "year 20000".into(),
+                ))),
+                1,
             ),
             (
                 CliError::Sandbox(robigus::SandboxUnavailable { attempts: vec![] }),

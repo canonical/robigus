@@ -12,7 +12,8 @@
 /// each variant.
 #[derive(Debug, thiserror::Error)]
 pub enum RobigusError {
-    /// A database or schema failure (CLI exit code 3).
+    /// A database or schema failure (CLI exit code 3; exit code 1 for
+    /// [`StoreError::Clock`]).
     #[error(transparent)]
     Store(#[from] StoreError),
     /// Source acquisition failed. Invalid caller input
@@ -37,8 +38,8 @@ pub enum RobigusError {
 
 /// SQLite persistence failures.
 ///
-/// Every variant is a database or schema error: the CLI reports it with exit
-/// code 3 (spec §14).
+/// Every variant except [`StoreError::Clock`] is a database or schema error:
+/// the CLI reports it with exit code 3 (spec §14).
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// SQLite itself failed, or the store could not reach it: an error from
@@ -84,7 +85,20 @@ pub enum StoreError {
     /// yield an equal value (spec §11.3, lossless round trip).
     #[error("cannot store losslessly: {0}")]
     Unrepresentable(String),
+    /// The store could not timestamp a write because the system clock is
+    /// unusable. Nothing was written. Unlike the other variants, the CLI
+    /// reports this as an analysis failure (exit code 1), since the database
+    /// itself is not at fault.
+    #[error(transparent)]
+    Clock(#[from] ClockError),
 }
+
+/// The system clock cannot be represented as a timestamp: it is set before
+/// the year -9999 or after 9999, the range `jiff` supports. robigus reports
+/// this instead of recording a wrong time.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("system clock is outside the supported timestamp range: {0}")]
+pub struct ClockError(pub String);
 
 impl From<rusqlite::Error> for StoreError {
     fn from(error: rusqlite::Error) -> Self {

@@ -13,6 +13,7 @@
 // undocumented public item fails the build.
 #![warn(missing_docs)]
 
+mod clock;
 pub mod detect;
 pub mod dpkg;
 pub mod error;
@@ -33,8 +34,8 @@ pub use detect::{
     TestSystem, analyzers, detect,
 };
 pub use error::{
-    DetectError, DpkgError, FetchError, InvalidHost, PredicateError, RobigusError, SandboxAttempt,
-    SandboxUnavailable, StoreError,
+    ClockError, DetectError, DpkgError, FetchError, InvalidHost, PredicateError, RobigusError,
+    SandboxAttempt, SandboxUnavailable, StoreError,
 };
 pub use feature::{FeatureExpr, FeatureExprError};
 pub use fetch::{

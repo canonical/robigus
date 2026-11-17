@@ -12,6 +12,19 @@ Written in pure async Rust, `rapt` performs network requests directly against th
 - **Ubuntu Metadata**: Series, pockets, components, architectures, and archive locations come from the [`ubuntu-info-rust`](https://crates.io/crates/ubuntu-info-rust) crate, which is the source of truth for Ubuntu distribution information.
 - **Archive Mirrors**: Uses the archive locations from `ubuntu-info-rust`: `http://archive.ubuntu.com/ubuntu` for `amd64`, `amd64v3`, and `i386`; `http://security.ubuntu.com/ubuntu` for the security pocket on those architectures; and `http://ports.ubuntu.com/ubuntu-ports` for `arm64`, `armhf`, `ppc64el`, `s390x`, and `riscv64`.
 
+## Upgrading: chrono replaced by jiff
+
+`rapt` no longer depends on `chrono`, which is unmaintained ([RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543)). `SeriesCache::updated_at` is now a [`jiff::Timestamp`](https://docs.rs/jiff/latest/jiff/struct.Timestamp.html) instead of `chrono::DateTime<chrono::Utc>`. This is a breaking change for Rust code that reads or sets that field:
+
+| Before (chrono) | After (jiff) |
+|---|---|
+| `chrono::Utc::now()` | `jiff::Timestamp::now()` |
+| `dt.to_rfc3339()` | `ts.to_string()` |
+| `DateTime::parse_from_rfc3339(s)` | `s.parse::<jiff::Timestamp>()` |
+| `a.signed_duration_since(b)` | `a.duration_since(b)` (a `jiff::SignedDuration`) |
+
+Existing cache files need no migration: timestamps written by chrono (`+00:00` or `Z`, with or without fractional seconds) load unchanged, and are rewritten in jiff's `Z` form the next time the cache is saved. `SeriesCache::is_fresh` keeps its behavior: a cache is fresh for one hour, and a timestamp in the future counts as fresh.
+
 ## Installation & Build
 
 Build the project using Cargo:

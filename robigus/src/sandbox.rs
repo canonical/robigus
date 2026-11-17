@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use chrono::Utc;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
@@ -1046,6 +1045,9 @@ impl Sandbox for BwrapSandbox {
             .map_err(|error| SandboxError::InvalidCommand(error.to_string()))?;
         let mut argv = vec![spec.program.to_string_lossy().into_owned()];
         argv.extend(spec.args.iter().cloned());
+        // Checked before launch: an unusable clock never leaves a command
+        // running without an invocation record.
+        let started_at = crate::clock::now_rfc3339().map_err(StoreError::from)?;
         let invocation_id = spec
             .store
             .begin_invocation(&ToolInvocation {
@@ -1056,7 +1058,7 @@ impl Sandbox for BwrapSandbox {
                 tool_version: spec.tool_version.clone(),
                 sandbox_mode: "bwrap".into(),
                 exit_status: "running".into(),
-                started_at: Utc::now().to_rfc3339(),
+                started_at,
                 duration_ms: 0,
                 log_path: Some(relative_log.to_string_lossy().into_owned()),
             })
@@ -1405,15 +1407,19 @@ mod tests {
             Err(SandboxError::BwrapSetup { .. })
         ));
         let db = rusqlite::Connection::open(dir.path().join("analysis.db")).unwrap();
-        let (status, path): (String, String) = db
+        let (status, path, started_at): (String, String, String) = db
             .query_row(
-                "SELECT exit_status, log_path FROM tool_invocation",
+                "SELECT exit_status, log_path, started_at FROM tool_invocation",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert!(status.starts_with("setup_error:"));
         assert!(spec.workspace.join(path).join("stdout.log").exists());
+        assert!(started_at.ends_with('Z'), "{started_at}");
+        started_at
+            .parse::<jiff::Timestamp>()
+            .expect("RFC 3339 started_at");
     }
 
     #[cfg(unix)]
