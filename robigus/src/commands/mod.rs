@@ -28,7 +28,7 @@ pub async fn run(cli: &Cli, config: &Config) -> Result<CommandOutput, CliError> 
         Command::Fetch(args) => {
             let cache = Cache::new(cli.cache.clone().unwrap_or_else(Cache::default_dir));
             let options = config.fetch_options();
-            let source = fetch::run(args, cli.offline, &cache, &options).await?;
+            let source = fetch::run(args, cli.offline, &cache, config, &options).await?;
             Ok(CommandOutput::success(render_fetch(&source, json)?))
         }
         Command::Check => {
@@ -113,26 +113,41 @@ struct FetchOutput<'a> {
     path: &'a Path,
     digest: &'a str,
     provenance: robigus::fetch::Provenance,
+    /// Registry sources only: name, version and yanked state.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    registry_crate: Option<&'a robigus::fetch::RegistryCrate>,
 }
 
 fn render_fetch(source: &FetchedSource, json: bool) -> Result<String, CliError> {
     if json {
-        Ok(format!(
+        return Ok(format!(
             "{}\n",
             serde_json::to_string(&FetchOutput {
                 path: &source.tree,
                 digest: &source.digest,
                 provenance: source.provenance,
+                registry_crate: source.registry_crate.as_ref(),
             })
             .map_err(output_error)?
-        ))
-    } else {
-        Ok(format!(
-            "path: {}\ndigest: {}\n",
-            source.tree.display(),
-            source.digest
-        ))
+        ));
     }
+    let mut text = format!(
+        "path: {}\ndigest: {}\n",
+        source.tree.display(),
+        source.digest
+    );
+    if let Some(registry) = &source.registry_crate {
+        let yanked = match registry.yanked {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown (served from the cache)",
+        };
+        text.push_str(&format!(
+            "crate: {} {}\nyanked: {yanked}\n",
+            registry.name, registry.version
+        ));
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -151,6 +166,7 @@ mod tests {
             kind: SourceKind::Path {
                 path: "source-tree".into(),
             },
+            registry_crate: None,
         };
         assert_eq!(
             render_fetch(&source, false).unwrap(),
@@ -164,6 +180,23 @@ mod tests {
                 "path": "source-tree", "digest": "abc123", "provenance": "Verified",
             })
         );
+
+        let mut registry = source.clone();
+        registry.registry_crate = Some(robigus::fetch::RegistryCrate {
+            name: "itoa".into(),
+            version: "1.0.11".into(),
+            yanked: None,
+        });
+        assert!(
+            render_fetch(&registry, false)
+                .unwrap()
+                .ends_with("crate: itoa 1.0.11\nyanked: unknown (served from the cache)\n")
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&render_fetch(&registry, true).unwrap()).unwrap();
+        assert_eq!(value["name"], "itoa");
+        assert_eq!(value["version"], "1.0.11");
+        assert_eq!(value["yanked"], serde_json::Value::Null);
     }
 
     #[tokio::test]

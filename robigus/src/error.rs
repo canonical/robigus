@@ -121,9 +121,9 @@ impl From<PredicateError> for StoreError {
 /// Source acquisition failures.
 ///
 /// Through the CLI, [`FetchError::InvalidDigest`],
-/// [`FetchError::InvalidCacheKey`], and [`FetchError::UnsupportedFormat`] are
-/// usage errors (exit code 2); every other variant is an analysis failure
-/// (exit code 1).
+/// [`FetchError::InvalidCacheKey`], [`FetchError::UnsupportedFormat`], and
+/// [`FetchError::InvalidRegistry`] are usage errors (exit code 2); every
+/// other variant is an analysis failure (exit code 1).
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     /// A git clone, fetch, checkout, or submodule step failed, including a
@@ -165,10 +165,19 @@ pub enum FetchError {
     /// The source archive is in a format robigus cannot extract.
     #[error("unsupported archive format: {0}")]
     UnsupportedFormat(String),
-    /// A crate registry lookup or download failed: an HTTP error, an invalid
-    /// crate name or index URL, malformed index data, or a yanked version.
+    /// A crate registry lookup or download failed: an HTTP error, a missing
+    /// crate or version, malformed index data, or a yanked version.
     #[error("registry error: {0}")]
     Registry(String),
+    /// A registry source or configuration is invalid: an index URL that is
+    /// not `sparse+https`, an invalid crate name, or a version that is not
+    /// exact. A usage error (CLI exit code 2).
+    #[error("invalid registry source: {0}")]
+    InvalidRegistry(String),
+    /// A registry requires authentication and no usable token was obtained,
+    /// or the registry rejected it. Never contains the token.
+    #[error("registry authentication failed: {0}")]
+    Credential(String),
     /// An underlying filesystem operation failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

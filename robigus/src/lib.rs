@@ -14,6 +14,7 @@
 #![warn(missing_docs)]
 
 mod clock;
+pub mod credentials;
 pub mod detect;
 pub mod dpkg;
 pub mod error;
@@ -22,12 +23,14 @@ pub mod feature;
 pub mod fetch;
 pub mod model;
 pub mod predicate;
+pub mod registry;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 mod sandbox_seccomp;
 pub mod solver;
 pub mod store;
 
+pub use credentials::CredentialSource;
 pub use detect::{
     CargoAnalyzer, Confidence, CppAnalyzer, DetectionDiagnostic, DetectionLimits, DetectionReport,
     DetectionSignal, Language, ProjectAnalyzer, ProjectCharacteristics, ProjectRoot, ProjectTree,
@@ -39,8 +42,8 @@ pub use error::{
 };
 pub use feature::{FeatureExpr, FeatureExprError};
 pub use fetch::{
-    Cache, DownloadLimits, ExtractionLimits, FetchOptions, FetchedSource, GitOptions, IndexRecord,
-    Provenance, RegistryClient, SourceInput, fetch_offline,
+    Cache, DownloadLimits, ExtractionLimits, FetchOptions, FetchedSource, GitOptions, Provenance,
+    RegistryCrate, RegistrySource, SourceInput, fetch_offline,
 };
 pub use model::{
     AnalysisStatus, AnalysisStrategy, AnalyzerId, BuildSystem, ConfidenceTier, Conflict,
@@ -49,6 +52,7 @@ pub use model::{
     SourceKind, Target, TargetKind, VersionConstraint, path_tree_digest,
 };
 pub use predicate::{Atom, Configuration, DEFAULT_DNF_TERM_CAP, DnfError, Evaluator, Predicate};
+pub use registry::{CRATES_IO_INDEX, IndexRecord, RegistryClient, RegistrySpec};
 pub use sandbox::proxy::{Allowlist, DEFAULT_ALLOWLIST, HostName, ProxyPolicy};
 pub use sandbox::{
     CommandSpec, NetworkAccess, ProcessOutput, ProcessStatus, Sandbox, SandboxError, SandboxMode,

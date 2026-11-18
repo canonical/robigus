@@ -71,6 +71,55 @@ pub enum SourceInput {
         /// Directory containing the source tree.
         path: PathBuf,
     },
+    /// A crate version published in a Cargo sparse registry (spec §7.2.1).
+    Registry(RegistrySource),
+}
+
+/// A crate version to fetch from a sparse registry (spec §7.2.1).
+///
+/// # Examples
+///
+/// ```
+/// use robigus::fetch::{RegistrySource, SourceInput};
+/// use robigus::registry::{RegistrySpec, parse_exact_version};
+///
+/// # fn main() -> Result<(), robigus::FetchError> {
+/// let input = SourceInput::Registry(RegistrySource {
+///     registry: RegistrySpec::crates_io(),
+///     name: "itoa".into(),
+///     version: parse_exact_version("1.0.11")?,
+///     digest: None,
+///     allow_yanked: false,
+/// });
+/// # let _ = input;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct RegistrySource {
+    /// The registry, its normalized index URL, and its credential source.
+    pub registry: crate::registry::RegistrySpec,
+    /// Crate name (matched case-insensitively; `-` and `_` are distinct).
+    pub name: String,
+    /// Exact version; build metadata is ignored when matching.
+    pub version: semver::Version,
+    /// Expected SHA-256 of the `.crate`; must equal the index checksum, and
+    /// is required for offline cache hits.
+    pub digest: Option<String>,
+    /// Fetch the version even if it is yanked.
+    pub allow_yanked: bool,
+}
+
+/// What a registry fetch resolved, as the index spells it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RegistryCrate {
+    /// Crate name.
+    pub name: String,
+    /// Crate version.
+    pub version: String,
+    /// Whether the version is yanked; `None` when served from the cache
+    /// without consulting the index (offline).
+    pub yanked: Option<bool>,
 }
 
 /// How strongly the recorded digest is vouched for (spec §7.2).
@@ -90,12 +139,15 @@ pub struct FetchedSource {
     /// Directory containing the source tree.
     pub tree: PathBuf,
     /// SHA-256 of the content (tree digest for paths, archive digest for
-    /// tarballs, resolved commit for git).
+    /// tarballs, `.crate` checksum for registry crates), or the resolved
+    /// commit for git.
     pub digest: String,
     /// Whether [`digest`](Self::digest) is vouched for.
     pub provenance: Provenance,
     /// Where the source came from, as recorded in the [`SourceId`].
     pub kind: SourceKind,
+    /// For a registry source, the crate it resolved to.
+    pub registry_crate: Option<RegistryCrate>,
 }
 
 impl FetchedSource {
@@ -317,6 +369,7 @@ pub async fn fetch(
             fetch_tarball(&url, digest.as_deref(), cache, options).await
         }
         SourceInput::Path { path } => fetch_path(&path).await,
+        SourceInput::Registry(request) => fetch_registry(&request, cache, options).await,
     }
 }
 
@@ -325,8 +378,8 @@ pub async fn fetch(
 /// This does not fall back to a fetch if a cache entry disappears.
 ///
 /// A [`SourceInput::Path`] is handled like [`fetch_path`]. A git source needs
-/// [`GitReference::Rev`] with a full commit hash; a tarball needs its
-/// `digest`. Without a pin or a cache entry this fails with
+/// [`GitReference::Rev`] with a full commit hash; a tarball or registry
+/// crate needs its `digest`. Without a pin or a cache entry this fails with
 /// [`FetchError::OfflineCacheMiss`]. Cache hits are returned as
 /// [`Provenance::Verified`] without re-hashing (see [`Cache`]).
 ///
@@ -364,7 +417,23 @@ pub async fn fetch_offline(
     let cache = cache.clone();
     spawn_blocking(move || -> Result<FetchedSource, FetchError> {
         match input {
-            SourceInput::Path { .. } => unreachable!("local paths were handled above"),
+            SourceInput::Path { .. } => Err(FetchError::Walk(
+                "local paths are resolved without the cache".into(),
+            )),
+            SourceInput::Registry(request) => {
+                validate_registry_request(&request)?;
+                let digest = request.digest.as_deref().ok_or_else(|| {
+                    FetchError::OfflineCacheMiss(
+                        "a registry crate requires its cached SHA-256 checksum supplied with --sha256"
+                            .into(),
+                    )
+                })?;
+                let digest = normalize_sha256(digest)?;
+                let tree = crate_cache_hit(&cache, &digest)?.ok_or_else(|| {
+                    FetchError::OfflineCacheMiss(format!("crate checksum {digest} is not cached"))
+                })?;
+                cached_registry_source(&request, tree, digest)
+            }
             SourceInput::Git { url, reference } => {
                 let (tree, digest) = git_cache_hit(&cache, &reference)?.ok_or_else(|| {
                     FetchError::OfflineCacheMiss(
@@ -376,6 +445,7 @@ pub async fn fetch_offline(
                     digest,
                     provenance: Provenance::Verified,
                     kind: SourceKind::Git { url, reference },
+                    registry_crate: None,
                 })
             }
             SourceInput::Tarball { url, digest } => {
@@ -399,6 +469,7 @@ pub async fn fetch_offline(
                         url,
                         digest: Some(digest),
                     },
+                    registry_crate: None,
                 })
             }
         }
@@ -457,6 +528,7 @@ pub async fn fetch_tarball(
                     url: url.clone(),
                     digest: Some(digest.clone()),
                 },
+                registry_crate: None,
             });
         }
     }
@@ -492,6 +564,7 @@ pub async fn fetch_path(path: &Path) -> Result<FetchedSource, RobigusError> {
             tree,
             digest,
             provenance: Provenance::Verified,
+            registry_crate: None,
         })
     })
     .await
@@ -516,6 +589,7 @@ fn fetch_git_sync(
                 url: url.clone(),
                 reference: reference.clone(),
             },
+            registry_crate: None,
         });
     }
 
@@ -557,6 +631,7 @@ fn fetch_git_sync(
             url: url.clone(),
             reference: reference.clone(),
         },
+        registry_crate: None,
     })
 }
 
@@ -919,20 +994,57 @@ async fn download(url: &Url, limits: &DownloadLimits) -> Result<Vec<u8>, FetchEr
         .map_err(|error| failed(&error))
 }
 
-/// The HTTP client for every download: robigus user agent plus the connect
-/// and whole-request timeouts.
-fn http_client(limits: &DownloadLimits) -> Result<reqwest::Client, reqwest::Error> {
+/// Most redirects followed by any download (spec §7.2).
+pub(crate) const MAX_REDIRECTS: usize = 5;
+
+/// The HTTP client for every download: robigus user agent, the connect and
+/// whole-request timeouts, and the restricted redirect policy.
+pub(crate) fn http_client(limits: &DownloadLimits) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .user_agent(http_user_agent())
         .connect_timeout(limits.connect_timeout)
         .timeout(limits.timeout)
+        .redirect(redirect_policy())
         .build()
+}
+
+/// At most [`MAX_REDIRECTS`] hops, and never from `https` to anything else
+/// (spec §7.2). Redirects to other hosts are followed; reqwest removes
+/// `Authorization` (and cookies) whenever the scheme, host or port changes,
+/// so registry tokens are never forwarded.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        match check_redirect(attempt.url(), attempt.previous()) {
+            Ok(()) => attempt.follow(),
+            Err(reason) => attempt.error(reason),
+        }
+    })
+}
+
+/// The redirect rule: `previous` holds the original URL and every earlier
+/// redirect target, so `previous.len()` is the number of hops including this
+/// one. Once any hop used `https`, every later one must too.
+fn check_redirect(next: &Url, previous: &[Url]) -> Result<(), String> {
+    if previous.len() > MAX_REDIRECTS {
+        return Err(format!("more than {MAX_REDIRECTS} redirects"));
+    }
+    if previous.iter().any(|url| url.scheme() == "https") && next.scheme() != "https" {
+        return Err(format!(
+            "refusing a redirect from https to {}://{}",
+            next.scheme(),
+            next.host_str().unwrap_or("?")
+        ));
+    }
+    Ok(())
 }
 
 /// Reads a response body, failing as soon as it exceeds `max_bytes`: a
 /// declared `Content-Length` over the limit is rejected before reading, and
 /// an undeclared or lying body is cut off while streaming.
-async fn read_capped(mut response: reqwest::Response, max_bytes: u64) -> Result<Vec<u8>, String> {
+pub(crate) async fn read_capped(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
     let too_large = || format!("response exceeds the {max_bytes}-byte download limit");
     if response
         .content_length()
@@ -974,6 +1086,7 @@ fn install_tarball(
                 url: url.clone(),
                 digest: Some(digest),
             },
+            registry_crate: None,
         });
     }
 
@@ -996,6 +1109,7 @@ fn install_tarball(
             url: url.clone(),
             digest: Some(digest),
         },
+        registry_crate: None,
     })
 }
 
@@ -1437,178 +1551,205 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
-// 8. Registry helper (used by the Cargo analyzer, WP-2.2)
-/// A client for a Cargo sparse registry index: index lookups and
-/// checksum-verified `.crate` downloads (spec §7.2, §8.1).
-pub struct RegistryClient {
-    index: Url,
-    http: reqwest::Client,
-    limits: DownloadLimits,
-    /// The index `config.json`, fetched at most once per client.
-    config: tokio::sync::OnceCell<IndexConfig>,
+// 8. Registry sources (spec §7.2.1)
+/// Fetches a crate version from a sparse registry: downloads the `.crate`,
+/// verifies it against the index checksum, and installs its single
+/// `<name>-<version>` directory into `crate/<cksum>`. A pinned `digest`
+/// whose entry is cached makes no network request.
+pub async fn fetch_registry(
+    request: &RegistrySource,
+    cache: &Cache,
+    options: &FetchOptions,
+) -> Result<FetchedSource, RobigusError> {
+    validate_registry_request(request)?;
+    let expected = request
+        .digest
+        .as_deref()
+        .map(normalize_sha256)
+        .transpose()?;
+    if let Some(digest) = &expected
+        && let Some(tree) = crate_cache_hit(cache, digest)?
+    {
+        return Ok(cached_registry_source(request, tree, digest.clone())?);
+    }
+    let client = crate::registry::RegistryClient::new(request.registry.clone(), options.download)?;
+    let downloaded = client
+        .download_crate(
+            &request.name,
+            &request.version,
+            expected.as_deref(),
+            request.allow_yanked,
+        )
+        .await?;
+    let record = downloaded.record;
+    let crate_info = RegistryCrate {
+        name: record.name.clone(),
+        version: record.vers.clone(),
+        yanked: Some(record.yanked),
+    };
+    let (cache, limits, cksum) = (cache.clone(), options.extraction, record.cksum.clone());
+    let tree = spawn_blocking(move || {
+        install_crate(
+            &downloaded.bytes,
+            &cksum,
+            &record.name,
+            &record.vers,
+            &cache,
+            &limits,
+        )
+    })
+    .await
+    .map_err(|error| FetchError::Extraction(format!("crate install task failed: {error}")))??;
+    let digest = tree_digest_key(&tree)?;
+    Ok(registry_source(request, tree, digest, crate_info))
 }
 
-/// One record of a sparse-index entry.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct IndexRecord {
-    /// Crate name.
-    pub name: String,
-    /// Crate version.
-    pub vers: String,
-    /// SHA-256 of the `.crate` file as hex, checked by
-    /// [`RegistryClient::download_crate`].
-    pub cksum: String,
-    /// Whether the version is yanked (`false` when absent); yanked versions
-    /// are refused for download.
-    #[serde(default)]
-    pub yanked: bool,
-    /// Per-record download override, if the registry defines one.
-    pub dl: Option<String>,
+fn validate_registry_request(request: &RegistrySource) -> Result<(), FetchError> {
+    crate::registry::validate_crate_name(&request.name)
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct IndexConfig {
-    dl: String,
+/// The `crate/<cksum>` key of an installed tree (its parent directory name).
+fn tree_digest_key(tree: &Path) -> Result<String, FetchError> {
+    tree.parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| FetchError::Extraction("unexpected crate cache layout".into()))
 }
 
-impl RegistryClient {
-    /// A client with the default [`DownloadLimits`].
-    pub fn new(index_url: Url) -> Result<Self, FetchError> {
-        Self::with_limits(index_url, DownloadLimits::default())
+fn registry_source(
+    request: &RegistrySource,
+    tree: PathBuf,
+    digest: String,
+    registry_crate: RegistryCrate,
+) -> FetchedSource {
+    FetchedSource {
+        tree,
+        digest,
+        provenance: Provenance::Verified,
+        kind: SourceKind::CargoRegistry {
+            index_url: request.registry.index_url.clone(),
+        },
+        registry_crate: Some(registry_crate),
     }
+}
 
-    /// A client whose index lookups and `.crate` downloads are bounded by
-    /// `limits` (size cap and timeouts).
-    pub fn with_limits(index_url: Url, limits: DownloadLimits) -> Result<Self, FetchError> {
-        Ok(Self {
-            index: index_url,
-            http: http_client(&limits)
-                .map_err(|error| FetchError::Registry(format!("http client failed: {error}")))?,
-            limits,
-            config: tokio::sync::OnceCell::new(),
-        })
+/// A cache hit for a pinned checksum. The cached tree is the `.crate`'s
+/// `<name>-<version>` directory as the index spelled them, and it MUST be
+/// the requested crate: the checksum alone identifies bytes, not which crate
+/// a caller asked for, so pinning another crate's checksum is an error
+/// rather than a silent substitution. The yanked state is unknown because
+/// the index was not consulted.
+fn cached_registry_source(
+    request: &RegistrySource,
+    tree: PathBuf,
+    digest: String,
+) -> Result<FetchedSource, FetchError> {
+    let directory = tree
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let (name, version) =
+        crate::registry::cached_crate_identity(directory, &request.name, &request.version)
+            .ok_or_else(|| {
+                FetchError::Registry(format!(
+                    "checksum {digest} belongs to '{}', not {} {}; check the --sha256 value",
+                    crate::credentials::bounded(directory),
+                    request.name,
+                    request.version
+                ))
+            })?;
+    Ok(registry_source(
+        request,
+        tree,
+        digest,
+        RegistryCrate {
+            name,
+            version,
+            yanked: None,
+        },
+    ))
+}
+
+/// The cached tree for a `.crate` checksum: the single directory inside
+/// `crate/<cksum>`, if the entry exists.
+fn crate_cache_hit(cache: &Cache, cksum: &str) -> Result<Option<PathBuf>, FetchError> {
+    let entry = cache.path_for("crate", cksum)?;
+    if !entry.is_dir() {
+        return Ok(None);
     }
+    single_top_level_dir(&entry).map(Some)
+}
 
-    /// GETs `url` and reads the body within the download limits.
-    async fn get_capped(&self, url: Url, what: &str) -> Result<Vec<u8>, FetchError> {
-        let failed =
-            |error: &dyn std::fmt::Display| FetchError::Registry(format!("{what} failed: {error}"));
-        let response = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| failed(&error))?
-            .error_for_status()
-            .map_err(|error| failed(&error))?;
-        read_capped(response, self.limits.max_bytes)
-            .await
-            .map_err(|error| failed(&error))
+/// The one top-level directory of an extracted `.crate`.
+fn single_top_level_dir(root: &Path) -> Result<PathBuf, FetchError> {
+    let mut entries = fs::read_dir(root)?;
+    let first = entries
+        .next()
+        .transpose()?
+        .ok_or_else(|| FetchError::Extraction("the .crate archive is empty".into()))?;
+    if entries.next().is_some() {
+        return Err(FetchError::Extraction(
+            "a .crate archive must contain exactly one top-level directory".into(),
+        ));
     }
+    if !first.file_type()?.is_dir() {
+        return Err(FetchError::Extraction(
+            "the top-level entry of a .crate archive must be a directory".into(),
+        ));
+    }
+    Ok(first.path())
+}
 
-    /// The sparse-index path for a crate name (crates.io layout).
-    fn index_path(name: &str) -> Result<String, FetchError> {
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+/// Extracts a verified `.crate` into `crate/<cksum>` with the full
+/// extraction hardening, requiring exactly one top-level `<name>-<version>`
+/// directory. Returns that directory.
+fn install_crate(
+    bytes: &[u8],
+    cksum: &str,
+    name: &str,
+    version: &str,
+    cache: &Cache,
+    limits: &ExtractionLimits,
+) -> Result<PathBuf, FetchError> {
+    let entry = cache.path_for("crate", cksum)?;
+    if entry.is_dir() {
+        return single_top_level_dir(&entry);
+    }
+    let staging = cache.scratch_path("crate");
+    let archive = staging.with_extension("crate");
+    fs::create_dir_all(cache.root.join("tmp"))?;
+    fs::write(&archive, bytes)?;
+    if detect_compression(&archive)? != Compression::Gzip {
+        let _ = fs::remove_file(&archive);
+        return Err(FetchError::Extraction(
+            "a .crate archive must be gzip-compressed".into(),
+        ));
+    }
+    let extracted = extract_tarball(&archive, &staging, limits);
+    let _ = fs::remove_file(&archive);
+    extracted?;
+    let checked = single_top_level_dir(&staging).and_then(|top| {
+        let expected = format!("{name}-{version}");
+        if top
+            .file_name()
+            .is_some_and(|found| found == expected.as_str())
         {
-            return Err(FetchError::Registry(format!("invalid crate name '{name}'")));
+            Ok(())
+        } else {
+            Err(FetchError::Extraction(format!(
+                "the .crate's top-level directory must be '{expected}', found '{}'",
+                top.file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+            )))
         }
-        let chars: Vec<char> = name.chars().collect();
-        Ok(match chars.len() {
-            1 | 2 => format!("1/{name}"),
-            3 => format!("3/{}/{}", chars[0], name),
-            _ => format!(
-                "{}/{}/{name}",
-                chars[..2].iter().collect::<String>(),
-                chars[2..4].iter().collect::<String>()
-            ),
-        })
+    });
+    if let Err(error) = checked {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
     }
-
-    /// Looks up the index record for one crate version.
-    pub async fn index_record(&self, name: &str, version: &str) -> Result<IndexRecord, FetchError> {
-        let path = Self::index_path(name)?;
-        let url = self
-            .index
-            .join(&path)
-            .map_err(|error| FetchError::Registry(format!("invalid index URL: {error}")))?;
-        let body = self.get_capped(url, "index lookup").await?;
-        let text = String::from_utf8(body).map_err(|error| {
-            FetchError::Registry(format!("index lookup failed: not UTF-8: {error}"))
-        })?;
-        for line in text.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let record: IndexRecord = serde_json::from_str(line)
-                .map_err(|error| FetchError::Registry(format!("invalid index record: {error}")))?;
-            if record.name == name && record.vers == version {
-                return Ok(record);
-            }
-        }
-        Err(FetchError::Registry(format!(
-            "crate {name} {version} not found in the registry index"
-        )))
-    }
-
-    /// Downloads the `.crate` artifact and verifies its SHA-256 against the
-    /// index checksum. Verification is mandatory, never optional (spec §7.2).
-    pub async fn download_crate(
-        &self,
-        name: &str,
-        version: &str,
-    ) -> Result<(Vec<u8>, IndexRecord), FetchError> {
-        let record = self.index_record(name, version).await?;
-        if record.yanked {
-            return Err(FetchError::Registry(format!(
-                "crate {name} {version} is yanked"
-            )));
-        }
-        let download_url = self.download_url(name, version, &record).await?;
-        let bytes = self.get_capped(download_url, "crate download").await?;
-        let digest = crate::model::to_hex(Sha256::digest(bytes.as_slice()).as_slice());
-        if digest != record.cksum.to_ascii_lowercase() {
-            return Err(FetchError::Checksum {
-                expected: record.cksum,
-                actual: digest,
-            });
-        }
-        Ok((bytes, record))
-    }
-
-    /// Resolves the `.crate` download URL: a per-record `dl` override (full
-    /// URL or path template) or the index `config.json` endpoint.
-    async fn download_url(
-        &self,
-        name: &str,
-        version: &str,
-        record: &IndexRecord,
-    ) -> Result<Url, FetchError> {
-        let default_template = format!("{name}/{name}-{version}.crate");
-        let template = record.dl.clone().unwrap_or(default_template);
-        if let Ok(url) = Url::parse(&template) {
-            return Ok(url);
-        }
-        let config = self
-            .config
-            .get_or_try_init(|| async {
-                let config_url = self
-                    .index
-                    .join("config.json")
-                    .map_err(|error| FetchError::Registry(format!("invalid index URL: {error}")))?;
-                let body = self.get_capped(config_url, "index config lookup").await?;
-                serde_json::from_slice::<IndexConfig>(&body)
-                    .map_err(|error| FetchError::Registry(format!("invalid index config: {error}")))
-            })
-            .await?;
-        let template = template
-            .replace("{crate}", name)
-            .replace("{version}", version);
-        Url::parse(&format!("{}/{template}", config.dl.trim_end_matches('/')))
-            .map_err(|error| FetchError::Registry(format!("invalid download URL: {error}")))
-    }
+    install_into_cache(&staging, &entry, &cache.root.join("crate"))?;
+    single_top_level_dir(&entry)
 }
 
 fn http_user_agent() -> String {
@@ -2279,66 +2420,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_client_verifies_checksums() {
-        let server = wiremock::MockServer::start().await;
-        let index_url = Url::parse(&server.uri()).unwrap();
-
-        let cksum = crate::model::to_hex(Sha256::digest(b"crate-bytes").as_slice());
-        let record = format!(
-            "{{\"name\":\"foo\",\"vers\":\"1.0.0\",\"cksum\":\"{cksum}\",\"yanked\":false}}"
-        );
-        async fn mount_registry(
-            server: &wiremock::MockServer,
-            record: &str,
-            crate_body: &'static [u8],
-        ) {
-            wiremock::Mock::given(wiremock::matchers::method("GET"))
-                .and(wiremock::matchers::path("/3/f/foo"))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200).set_body_string(record.to_string()),
-                )
-                .mount(server)
-                .await;
-            wiremock::Mock::given(wiremock::matchers::method("GET"))
-                .and(wiremock::matchers::path("/config.json"))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200)
-                        .set_body_string(format!("{{\"dl\":\"{}/crates\"}}", server.uri())),
-                )
-                .mount(server)
-                .await;
-            wiremock::Mock::given(wiremock::matchers::method("GET"))
-                .and(wiremock::matchers::path("/crates/foo/foo-1.0.0.crate"))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200).set_body_bytes(crate_body.to_vec()),
-                )
-                .mount(server)
-                .await;
-        }
-
-        mount_registry(&server, &record, b"crate-bytes").await;
-        let client = RegistryClient::new(index_url).unwrap();
-        let (bytes, downloaded) = client.download_crate("foo", "1.0.0").await.unwrap();
-        assert_eq!(bytes, b"crate-bytes");
-        assert_eq!(downloaded.cksum, cksum);
-
-        // A corrupted artifact must be rejected against the index checksum.
-        server.reset().await;
-        mount_registry(&server, &record, b"corrupted").await;
-        let error = client.download_crate("foo", "1.0.0").await.unwrap_err();
-        assert!(matches!(error, FetchError::Checksum { .. }));
-    }
-
-    #[test]
-    fn index_paths_follow_the_sparse_layout() {
-        assert_eq!(RegistryClient::index_path("a").unwrap(), "1/a");
-        assert_eq!(RegistryClient::index_path("ab").unwrap(), "1/ab");
-        assert_eq!(RegistryClient::index_path("abc").unwrap(), "3/a/abc");
-        assert_eq!(RegistryClient::index_path("serde").unwrap(), "se/rd/serde");
-        assert!(RegistryClient::index_path("../evil").is_err());
-    }
-
-    #[tokio::test]
     async fn fetched_source_id_is_pinned_by_the_digest() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), b"hello").unwrap();
@@ -2367,6 +2448,33 @@ mod tests {
             .await;
         let url = Url::parse(&format!("{}/src.tar", server.uri())).unwrap();
         (server, url)
+    }
+
+    #[test]
+    fn redirects_are_bounded_and_never_downgrade_from_https() {
+        let url = |text: &str| Url::parse(text).unwrap();
+        let https = url("https://registry.example/a");
+        let http = url("http://mirror.example/a");
+        let from_https = std::slice::from_ref(&https);
+        let from_http = std::slice::from_ref(&http);
+        assert!(check_redirect(&url("https://cdn.example/b"), from_https).is_ok());
+        assert!(check_redirect(&url("https://cdn.example/b"), from_http).is_ok());
+        assert!(check_redirect(&url("http://other.example/b"), from_http).is_ok());
+        let error = check_redirect(&url("http://cdn.example/b"), from_https).unwrap_err();
+        assert!(
+            error.contains("from https to http://cdn.example"),
+            "{error}"
+        );
+        // An https hop earlier in the chain also forbids a later downgrade.
+        assert!(check_redirect(&url("http://x.example/"), &[http.clone(), https.clone()]).is_err());
+        let five = vec![https.clone(); MAX_REDIRECTS];
+        assert!(check_redirect(&https, &five).is_ok());
+        let six = vec![https.clone(); MAX_REDIRECTS + 1];
+        assert!(
+            check_redirect(&https, &six)
+                .unwrap_err()
+                .contains("more than 5")
+        );
     }
 
     #[tokio::test]
@@ -2412,65 +2520,6 @@ mod tests {
         let error = fetch_tarball(&url, None, &cache, &options)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("download limit"), "{error}");
-    }
-
-    /// The registry client caps index and `.crate` bodies and fetches the
-    /// index `config.json` once per client.
-    #[tokio::test]
-    async fn registry_client_limits_and_caches_config() {
-        /// A registry serving `foo` 1.0.0 and 1.1.0 as 2 KiB `.crate` files;
-        /// `config.json` must be requested exactly once.
-        async fn registry() -> (wiremock::MockServer, Url) {
-            let server = wiremock::MockServer::start().await;
-            let big = vec![7u8; 2048];
-            let cksum = crate::model::to_hex(Sha256::digest(&big).as_slice());
-            let records: String = ["1.0.0", "1.1.0"]
-                .iter()
-                .map(|vers| {
-                    format!("{{\"name\":\"foo\",\"vers\":\"{vers}\",\"cksum\":\"{cksum}\"}}\n")
-                })
-                .collect();
-            wiremock::Mock::given(wiremock::matchers::path("/3/f/foo"))
-                .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(records))
-                .mount(&server)
-                .await;
-            wiremock::Mock::given(wiremock::matchers::path("/config.json"))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200)
-                        .set_body_string(format!("{{\"dl\":\"{}/crates\"}}", server.uri())),
-                )
-                .expect(1)
-                .mount(&server)
-                .await;
-            wiremock::Mock::given(wiremock::matchers::path_regex("^/crates/foo/"))
-                .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(big))
-                .mount(&server)
-                .await;
-            let url = Url::parse(&server.uri()).unwrap();
-            (server, url)
-        }
-
-        let (server, index_url) = registry().await;
-        let client = RegistryClient::new(index_url).unwrap();
-        client.download_crate("foo", "1.0.0").await.unwrap();
-        client.download_crate("foo", "1.1.0").await.unwrap();
-        // `expect(1)` on config.json: two downloads, one config fetch.
-        server.verify().await;
-
-        // The index (~200 bytes) fits under a 1 KiB cap; the 2 KiB `.crate`
-        // does not.
-        let (_capped_server, capped_url) = registry().await;
-        let capped = RegistryClient::with_limits(
-            capped_url,
-            DownloadLimits {
-                max_bytes: 1024,
-                ..DownloadLimits::default()
-            },
-        )
-        .unwrap();
-        capped.index_record("foo", "1.0.0").await.unwrap();
-        let error = capped.download_crate("foo", "1.0.0").await.unwrap_err();
         assert!(error.to_string().contains("download limit"), "{error}");
     }
 

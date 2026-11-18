@@ -1,6 +1,6 @@
 # robigus — Phase 1 Implementation Plan
 
-Status: in progress — **M1 is complete**: every M1 work package meets its acceptance criteria, and the merge to `main`, push CI, and the nightly fuzz run have all passed. M2 has started: WP-2.1 (allowlist proxy) is implemented and verified locally. WP-2.6 (registry source input: a crate fetched from crates.io or a compatible sparse registry, including authenticated private registries) was added after M1 and is planned, not implemented. `analyze`, the Cargo analyzer, expansion, and M3 remain unimplemented.
+Status: in progress — **M1 is complete**: every M1 work package meets its acceptance criteria, and the merge to `main`, push CI, and the nightly fuzz run have all passed. M2 has started: WP-2.1 (allowlist proxy) is implemented and verified locally. WP-2.6 (registry source input: a crate fetched from crates.io or a compatible sparse registry, including authenticated private registries) was added after M1 and is implemented and verified locally. `analyze`, the Cargo analyzer, expansion, and M3 remain unimplemented.
 Scope: v1 = Milestones M1–M3 (dependency graph analysis only)
 Normative reference: [`../AGENTS.md`](../AGENTS.md) — if this plan and the spec disagree, the spec wins.
 
@@ -423,14 +423,14 @@ Threat model: the token is a long-lived secret that grants access to private sou
 
 #### Tasks
 
-- [x] **Spec amendment** (`robigus/AGENTS.md`): §1 and §7.1 (fourth input); §5.1 (registry identity); §6 (architecture diagram and acquisition component); §7.2 (redirect rule) with new §7.2.1 (registry sources) and §7.2.2 (registry authentication); §8.1 (registry identity, `Cargo.lock` checksums, authenticated dependencies); §10.2 (tokens never enter the sandbox); §11.2 (`source_precise` comment only; no schema change); §14 (source syntax, options table, `[registries]` configuration); §15 (`SourceInput::Registry`, `RegistrySpec`, token and HTTP API rules); §16 (registry, redirect and credential tests); §17 (credential handling); recorded decisions 30–34. `robigus/SECURITY.md` records the registry-credential guarantees as planned, not yet in scope.
-- [ ] **HTTP client:** a restricted redirect policy for all fetches (at most 5, no HTTPS-to-HTTP downgrade), and per-request `Authorization` only for in-scope hosts.
-- [ ] **Registry client fixes:** lowercase index paths; case-insensitive name matching without `-`/`_` folding; build-metadata-insensitive version matching; tolerant line parsing with skipping of `v > 2`; 404/410/451 handling; `cksum` validation; full `dl` markers and the no-marker default; removal of the per-record `dl` override; permissive `config.json` parsing; `auth-required` and 401 detection.
-- [ ] **Index URL handling:** `sparse+https` parsing and normalization, rejection of bare and git URLs, and the crates.io legacy-URL mapping as one shared function also used by WP-2.2.
-- [ ] **Credentials module:** `RegistryToken`, the environment, credential-process and token-file sources, in-memory session caching, core-dump suppression, error redaction, and token scoping.
-- [ ] **Source input:** `SourceInput::Registry` dispatch in `fetch` and `fetch_offline`; `fetch_registry` downloads with the client, then on a blocking thread verifies, extracts into scratch space, checks the single top-level directory and installs into `cache/crate/<cksum>` atomically. A pinned-checksum cache hit makes no network request.
-- [ ] **CLI and config:** `crate:<name>@<version>`, `--registry`, `--index`, `--allow-yanked`, the `[registries]` table with validation, and JSON output fields.
-- [ ] **Documentation:** rustdoc with examples; `README.md`, `robigus/SECURITY.md`, and `fetch --help`.
+- [x] **Spec amendment** (`robigus/AGENTS.md`): §1 and §7.1 (fourth input); §5.1 (registry identity); §6 (architecture diagram and acquisition component); §7.2 (redirect rule) with new §7.2.1 (registry sources) and §7.2.2 (registry authentication); §8.1 (registry identity, `Cargo.lock` checksums, authenticated dependencies); §10.2 (tokens never enter the sandbox); §11.2 (`source_precise` comment only; no schema change); §14 (source syntax, options table, `[registries]` configuration); §15 (`SourceInput::Registry`, `RegistrySpec`, token and HTTP API rules); §16 (registry, redirect and credential tests); §17 (credential handling); recorded decisions 30–34.
+- [x] **HTTP client:** a restricted redirect policy for all fetches (at most 5, no HTTPS-to-HTTP downgrade; `fetch::check_redirect`), and per-request `Authorization` only for in-scope hosts. reqwest strips `Authorization` whenever a redirect changes scheme, host or port.
+- [x] **Registry client fixes** (`robigus/src/registry.rs`, replacing the WP-1.5 helper in `fetch.rs`): lowercase index paths (also fixing two-character names, which live under `2/`, not `1/`); case-insensitive name matching without `-`/`_` folding; build-metadata-insensitive version matching; tolerant line parsing with skipping of `v > 2`; 404/410/451 handling; `cksum` validation; full `dl` markers and the no-marker default; removal of the per-record `dl` override; permissive `config.json` parsing; `auth-required` and 401 detection.
+- [x] **Index URL handling:** `registry::normalize_index_url` and `registry::crates_io_alias` (shared with WP-2.2).
+- [x] **Credentials module** (`robigus/src/credentials.rs`): `RegistryToken` (no `Display`/`Serialize`/`Clone`, redacted `Debug`, `zeroize` on drop, sensitive header value); environment, credential-process and token-file sources; in-memory caching per the provider's `cache` mode; core dumps disabled while a token exists (`PR_SET_DUMPABLE`); error redaction; token scoping to the index and `dl` hosts.
+- [x] **Source input:** `SourceInput::Registry(RegistrySource)` dispatch in `fetch` and `fetch_offline`; `fetch_registry` installs into `cache/crate/<cksum>` atomically after checking the single `<name>-<version>` directory. `FetchedSource::registry_crate` reports the name, version and yanked state as the index spells them.
+- [x] **CLI and config:** `crate:<name>@<version>`, `--registry`, `--index`, `--allow-yanked`, the `[registries]` table with validation at load, and the JSON `name`/`version`/`yanked` fields. Invalid registry sources are usage errors (exit 2).
+- [x] **Documentation:** rustdoc with examples; `README.md`, `robigus/SECURITY.md` (now in scope), and `fetch --help` / `--config` help.
 
 #### Tests
 
@@ -451,7 +451,26 @@ Threat model: the token is a long-lived secret that grants access to private sou
 
 #### Acceptance
 
-A published crate version can be fetched by name and exact version from crates.io, from a `wiremock` public sparse registry, and from a `wiremock` authenticated registry using each credential source. Archives are checksum-verified, extracted with the full §7.2 hardening, cached by checksum, and served offline when pinned. Git-protocol and bare-URL registries fail with explicit diagnostics. No test observes a token outside the `Authorization` header of an in-scope HTTPS request. The live crates.io test passes locally.
+A published crate version can be fetched by name and exact version from crates.io, from a `wiremock` public sparse registry, and from a `wiremock` authenticated registry using each credential source. Archives are checksum-verified, extracted with the full §7.2 hardening, cached by checksum, and served offline when pinned. Git-protocol and bare-URL registries fail with explicit diagnostics. No test observes a token outside the `Authorization` header of an in-scope request. The live crates.io test passes locally.
+
+**Status: met locally.** Tests: 21 `credentials` and `registry` unit tests, the `check_redirect` unit test, 21 integration tests in `robigus/tests/registry.rs` (including token redaction in errors and `Debug` output, scoping across redirects and `dl` hosts, and the live crates.io fetch with `ROB_NETWORK_TESTS=1`), the `tracing` redaction test in its own binary `robigus/tests/registry_tracing.rs` (registry requests are traced with their headers, and the token shows only as `Sensitive`), and CLI parsing and config tests.
+
+**Code-review fixes (applied):**
+- `RegistryClient::new` refuses credentials over plain HTTP. The only exception is the hidden test policy `IndexUrlPolicy::InsecureHttpWithCredentialsForTests`. The `*_with_policy` constructors are `#[doc(hidden)]`.
+- Credential-process tokens are deserialized directly into `Zeroizing` buffers. `Authorization` header values share one zeroizing buffer through `Bytes::from_owner`.
+- 401/403 diagnostics redact the token from a server-supplied `login_url`. URLs carrying userinfo are dropped, and the hint length is bounded.
+- Cache hits (online and offline) verify that the cached directory names the requested crate and version. A checksum belonging to another crate is an error.
+- Token files are opened component by component with `O_NOFOLLOW`, so symlinked directories are refused at open time. They are then checked with `fstat`, and FIFOs and devices are refused without blocking.
+- The core-dump guard is reference-counted under one lock and fails closed. It is held from before the token is read until the last copy drops.
+
+Regression tests cover each fix.
+
+Notes:
+- The mock registries use plain HTTP through the test-only policy, so the scheme part of token scoping is covered by unit tests rather than a TLS server.
+- Store and export redaction is structural: `FetchedSource` holds no token.
+- Zeroization is best effort, because the HTTP stack may copy header bytes into its own buffers.
+- Token files are supported on Linux only.
+- None of this has run in CI yet.
 
 ### WP-2.2 — Cargo analyzer (L, ~5d)
 

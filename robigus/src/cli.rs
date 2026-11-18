@@ -32,6 +32,13 @@ max_submodules = 64 # zero disables submodule fetching
 submodule_schemes = [\"https\"]
 [subagent]
 enabled = false # future opt-in placeholder; no sub-agent is invoked
+[registries.internal] # Cargo registry for `fetch crate:<name>@<version> --registry internal`
+index = \"sparse+https://registry.example.com/index/\" # required; sparse+https only
+credential-provider = { env = true } # default: ROBIGUS_REGISTRY_INTERNAL_TOKEN
+# credential-provider = { process = [\"/usr/bin/cargo-credential-libsecret\"] }
+# credential-provider = { file = \"/home/me/.config/robigus/internal.token\" } # mode 0600
+Tokens are used only for registries that require authentication, are never
+stored by robigus, and are never read from Cargo's credentials or config.
 All fields are optional. Size/count limits must be positive except the two
 submodule limits. Download limits apply to HTTP; extraction limits apply to
 tarballs and git checkouts; git limits apply to git acquisition. Local sources
@@ -156,6 +163,70 @@ pub struct Config {
     pub network: NetworkConfig,
     pub limits: LimitsConfig,
     pub subagent: SubagentConfig,
+    /// Named Cargo registries (spec §14), Cargo's `[registries]` syntax.
+    pub registries: std::collections::BTreeMap<String, RegistryConfig>,
+}
+
+/// One `[registries.<name>]` entry.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RegistryConfig {
+    /// Sparse index URL (`sparse+https://…`).
+    pub index: String,
+    /// Where the token comes from; defaults to the environment variable.
+    #[serde(default)]
+    pub credential_provider: Option<CredentialProviderConfig>,
+}
+
+/// A `credential-provider` table: exactly one key.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub enum CredentialProviderConfig {
+    /// `{ env = true }`: `ROBIGUS_REGISTRY_<NAME>_TOKEN`.
+    Env(bool),
+    /// `{ process = ["/abs/provider", "arg", …] }`.
+    Process(Vec<String>),
+    /// `{ file = "/abs/token" }`.
+    File(PathBuf),
+}
+
+impl Config {
+    /// The registry named `name`, validated, with its credential source.
+    pub fn registry(&self, name: &str) -> Result<robigus::RegistrySpec, CliError> {
+        let entry = self.registries.get(name).ok_or_else(|| {
+            let known: Vec<&str> = self.registries.keys().map(String::as_str).collect();
+            CliError::Usage(if known.is_empty() {
+                format!("unknown registry '{name}': no [registries] are configured")
+            } else {
+                format!(
+                    "unknown registry '{name}'; configured: {}",
+                    known.join(", ")
+                )
+            })
+        })?;
+        let credentials = match &entry.credential_provider {
+            None | Some(CredentialProviderConfig::Env(true)) => robigus::CredentialSource::Env {
+                registry: name.to_owned(),
+            },
+            Some(CredentialProviderConfig::Env(false)) => robigus::CredentialSource::None,
+            Some(CredentialProviderConfig::Process(command)) => {
+                let (program, args) = command.split_first().ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "registries.{name}.credential-provider.process needs a program"
+                    ))
+                })?;
+                robigus::CredentialSource::Process {
+                    program: program.into(),
+                    args: args.to_vec(),
+                }
+            }
+            Some(CredentialProviderConfig::File(path)) => {
+                robigus::CredentialSource::File { path: path.clone() }
+            }
+        };
+        robigus::RegistrySpec::named(name, &entry.index, credentials)
+            .map_err(|error| CliError::Usage(format!("registries.{name}: {error}")))
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -246,6 +317,14 @@ impl Config {
     pub fn validate(&self) -> Result<(), CliError> {
         // Proxy policy uses literal DNS hosts, not URLs, wildcards or IPs.
         self.network.proxy_policy()?;
+        for name in self.registries.keys() {
+            if robigus::registry::validate_crate_name(name).is_err() {
+                return Err(CliError::Usage(format!(
+                    "invalid registry name '{name}': use ASCII letters, digits, `-` or `_`, starting with a letter"
+                )));
+            }
+            self.registry(name)?;
+        }
         if let Some(schemes) = &self.limits.git.submodule_schemes {
             for scheme in schemes {
                 if !scheme.starts_with(|c: char| c.is_ascii_lowercase())
@@ -370,7 +449,8 @@ impl From<robigus::RobigusError> for CliError {
             robigus::RobigusError::Fetch(
                 error @ (robigus::FetchError::InvalidDigest(_)
                 | robigus::FetchError::InvalidCacheKey(_)
-                | robigus::FetchError::UnsupportedFormat(_)),
+                | robigus::FetchError::UnsupportedFormat(_)
+                | robigus::FetchError::InvalidRegistry(_)),
             ) => Self::Usage(error.to_string()),
             other => Self::Analysis(other.to_string()),
         }

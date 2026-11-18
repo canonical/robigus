@@ -46,6 +46,12 @@ url = { version = "2", features = ["serde"] }
 walkdir = { workspace = true }
 xz2 = { workspace = true }
 zstd = { workspace = true }
+# Zeroes registry tokens on drop (spec §7.2.2); already in the tree via rustls.
+# `serde` deserializes provider tokens straight into zeroizing buffers.
+zeroize = { version = "1.8", features = ["serde"] }
+# Lets the `Authorization` header own a zeroizing buffer; already in the tree
+# via reqwest and http.
+bytes = "1.10"
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

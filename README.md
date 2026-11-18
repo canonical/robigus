@@ -28,9 +28,10 @@ flowchart TD
 
 robigus analyzes a target software project, discovers and expands its full transitive dependency graph, and persists that graph so it can later be mapped onto the Ubuntu archive. The normative specification is [`robigus/AGENTS.md`](robigus/AGENTS.md); progress is tracked in [`robigus/plans/phase_1_plan.md`](robigus/plans/phase_1_plan.md).
 
-### What is implemented (Milestone M1 and WP-2.1)
+### What is implemented (Milestone M1, WP-2.1 and WP-2.6)
 
-- **Acquisition** (`fetch`): git repositories (pinned commits, recursive submodules), source tarballs (gzip, xz, zstd), and local paths, stored in a content-addressed cache. Extraction is hardened against path traversal, escaping links, device nodes, setuid entries, and decompression bombs. A crates.io helper verifies checksums against the sparse index.
+- **Acquisition** (`fetch`): git repositories (pinned commits, recursive submodules), source tarballs (gzip, xz, zstd), local paths, and published crates from crates.io or any compatible sparse registry, stored in a content-addressed cache. Crates are verified against the registry index checksum. Extraction is hardened against path traversal, escaping links, device nodes, setuid entries, and decompression bombs. Downloads follow at most 5 redirects and never downgrade from HTTPS to HTTP.
+- **Registry authentication** (`credentials`): private registries that require a token are supported through an environment variable, a Cargo-protocol credential process, or a `0600` token file. robigus never stores tokens or reads Cargo's credentials; tokens go only to their registry's hosts over HTTPS and never appear in logs, errors or records (see `robigus/SECURITY.md`).
 - **Detection** (`detect`): languages, build systems (Cargo, CMake, Meson, Autotools, Make, …), test systems, and analysis roots, including Cargo workspace membership rules.
 - **Dependency model** (`model`): packages, edges with sets of dependency kinds (normal, build, development, runtime), unresolved requirements (crates, pkg-config modules, headers, sonames, tools), evidence, and confidence tiers, held in a `petgraph`-backed `DependencyGraph`.
 - **Predicates** (`predicate`): a small language describing when an edge applies, for example `feature("asm") && arch("arm64") && !env("CC" = "clang")`. It covers Cargo `cfg(...)` and Debian architecture qualifiers, with canonicalization and evaluation against a configuration.
@@ -53,6 +54,9 @@ alias tsp-analyzer=target/release/tsp-analyzer
 tsp-analyzer fetch ./path/to/project
 tsp-analyzer fetch https://github.com/example/project.git --tag v1.2.3
 tsp-analyzer --format json fetch https://example.org/project-1.2.3.tar.gz --sha256 <DIGEST>
+tsp-analyzer fetch crate:serde@1.0.219                      # from crates.io
+tsp-analyzer fetch crate:internal-lib@2.1.0 --registry internal   # [registries.internal] in --config
+tsp-analyzer --offline fetch crate:serde@1.0.219 --sha256 <CHECKSUM>  # cached, no network
 
 # Work with an analysis database (produced by `analyze` once M2 lands).
 tsp-analyzer --db analysis.db check                       # integrity report; exit 3 on problems
