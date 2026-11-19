@@ -977,7 +977,10 @@ impl Configuration {
     /// A single-architecture configuration for `arch`, with the Cargo `cfg`
     /// facts derived from it (`target_os`, `target_family`, `target_env`,
     /// `target_vendor`, and — for concrete architectures — `target_arch`,
-    /// `target_endian`, `target_pointer_width`). This makes `arch("amd64")`
+    /// `target_endian`, `target_pointer_width`, plus `target`, the Rust
+    /// target triple, which matches Cargo's named-target dependency tables
+    /// such as `[target.x86_64-unknown-linux-gnu.dependencies]`; rustc has no
+    /// `target` cfg key, so it cannot collide). This makes `arch("amd64")`
     /// and `cfg("target_arch" = "x86_64")` evaluate identically by
     /// construction (spec §4.1). Hand-built configurations must keep the two
     /// forms consistent; the store never rewrites between them.
@@ -1006,6 +1009,7 @@ fn derived_cfg(arch: Option<Architecture>) -> BTreeMap<String, String> {
             "target_arch".to_string(),
             rust_target_arch(arch).to_string(),
         );
+        cfg.insert("target".to_string(), rust_target_triple(arch).to_string());
         cfg.insert("target_endian".to_string(), arch_endian(arch).to_string());
         cfg.insert(
             "target_pointer_width".to_string(),
@@ -1015,16 +1019,31 @@ fn derived_cfg(arch: Option<Architecture>) -> BTreeMap<String, String> {
     cfg
 }
 
-/// The Ubuntu architecture → Rust `target_arch` mapping.
+/// The Ubuntu architecture → Rust `target_arch` mapping, as rustc reports it
+/// in `--print cfg` (the triple's architecture component can differ: armhf
+/// is `armv7-…` but `target_arch = "arm"`).
 fn rust_target_arch(arch: Architecture) -> &'static str {
     match arch {
         Architecture::Amd64 | Architecture::Amd64v3 => "x86_64",
         Architecture::Arm64 => "aarch64",
-        Architecture::Armhf => "armv7",
-        Architecture::I386 => "i686",
-        Architecture::Ppc64el => "powerpc64le",
+        Architecture::Armhf => "arm",
+        Architecture::I386 => "x86",
+        Architecture::Ppc64el => "powerpc64",
         Architecture::Riscv64 => "riscv64",
         Architecture::S390x => "s390x",
+    }
+}
+
+/// The Rust target triple Ubuntu builds each architecture for.
+fn rust_target_triple(arch: Architecture) -> &'static str {
+    match arch {
+        Architecture::Amd64 | Architecture::Amd64v3 => "x86_64-unknown-linux-gnu",
+        Architecture::Arm64 => "aarch64-unknown-linux-gnu",
+        Architecture::Armhf => "armv7-unknown-linux-gnueabihf",
+        Architecture::I386 => "i686-unknown-linux-gnu",
+        Architecture::Ppc64el => "powerpc64le-unknown-linux-gnu",
+        Architecture::Riscv64 => "riscv64gc-unknown-linux-gnu",
+        Architecture::S390x => "s390x-unknown-linux-gnu",
     }
 }
 
@@ -1514,6 +1533,39 @@ mod tests {
             None
         ));
         assert!(!evaluator.evaluate(&Predicate::cfg("target_arch", "aarch64"), None));
+    }
+
+    /// `target_arch` follows rustc's `--print cfg` spelling, and `target`
+    /// holds the triple used by Cargo's named-target dependency tables.
+    #[test]
+    fn derived_cfg_matches_rustc_spellings() {
+        for (arch, target_arch, triple) in [
+            (Architecture::Amd64, "x86_64", "x86_64-unknown-linux-gnu"),
+            (Architecture::Armhf, "arm", "armv7-unknown-linux-gnueabihf"),
+            (Architecture::I386, "x86", "i686-unknown-linux-gnu"),
+            (
+                Architecture::Ppc64el,
+                "powerpc64",
+                "powerpc64le-unknown-linux-gnu",
+            ),
+            (
+                Architecture::Riscv64,
+                "riscv64",
+                "riscv64gc-unknown-linux-gnu",
+            ),
+        ] {
+            let cfg = Configuration::for_arch(MachineArch::Ubuntu(arch)).target_cfg;
+            assert_eq!(
+                cfg.get("target_arch").map(String::as_str),
+                Some(target_arch)
+            );
+            assert_eq!(cfg.get("target").map(String::as_str), Some(triple));
+        }
+        assert!(
+            !Configuration::for_arch(MachineArch::All)
+                .target_cfg
+                .contains_key("target")
+        );
     }
 
     #[test]

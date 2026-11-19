@@ -7,8 +7,9 @@ robigus is a modular Rust library and set of command-line tools for tracking, pl
 robigus is written in pure async Rust. It accepts a target software project as a Rust library call or through the `tsp-analyzer` command-line tool. The target may be supplied as:
 
 - a URL to a version control repository,
-- a URL to a source tarball, or
-- a local filesystem path.
+- a URL to a source tarball,
+- a local filesystem path, or
+- a published crate version in a Cargo registry (crates.io or a compatible private registry).
 
 ### 1.1 Delivery phases
 
@@ -140,7 +141,7 @@ Precedence: `!` binds tighter than `&&`, which binds tighter than `||`. An empty
 
 A node is a concrete package instance identified by `PackageId` (name + version + source + ecosystem). The TSP is the root node; a project may have multiple roots (for example workspace members).
 
-Source identity matches the persisted identity columns exactly (§11.2, §22.21): a git source is identified by its URL plus the exact commit (`SourceId.precise`) — the requested branch/tag/rev is stored (`source_reference`) but is not part of the identity, so the same commit requested by branch or by tag is one package; a tarball is identified by its URL plus its digest (`precise`, or the kind's `digest` when `precise` is unset); other sources compare structurally. The store rejects (`StoreError::Unrepresentable`) any `PackageId` that would not load back equal — in particular a version variant other than the one its ecosystem parses back to (SemVer for `rust`, dpkg for `ubuntu`, opaque otherwise).
+Source identity matches the persisted identity columns exactly (§11.2, §22.21): a git source is identified by its URL plus the exact commit (`SourceId.precise`) — the requested branch/tag/rev is stored (`source_reference`) but is not part of the identity, so the same commit requested by branch or by tag is one package; a tarball is identified by its URL plus its digest (`precise`, or the kind's `digest` when `precise` is unset); a Cargo registry package is identified by its normalized sparse index URL plus the `.crate` checksum (`precise`), whether it was fetched as the root or discovered as a dependency (§7.2, §8.1, §22.31); other sources compare structurally. The store rejects (`StoreError::Unrepresentable`) any `PackageId` that would not load back equal — in particular a version variant other than the one its ecosystem parses back to (SemVer for `rust`, dpkg for `ubuntu`, opaque otherwise).
 
 ```rust
 pub struct Node {
@@ -256,7 +257,7 @@ The existing `model.rs` MUST be extended as follows before M1 closes:
 
 ```mermaid
 flowchart TD
-    A[Source input: URL, tarball, path] --> B[Fetch and verify]
+    A[Source input: git URL, tarball, path, registry crate] --> B[Fetch and verify]
     B --> C[Safe extraction]
     C --> D[Project detection]
     D --> E[Analyzer registry]
@@ -271,7 +272,7 @@ flowchart TD
 
 ### 6.1 Components
 
-- **Acquisition** (`fetch`): fetch repositories, tarballs, and registry artifacts; verify digests; cache by content hash.
+- **Acquisition** (`fetch`): fetch repositories, tarballs, and registry crates (with registry authentication, §7.2.2); verify digests; cache by content hash.
 - **Detection** (`detect`): identify languages, build systems, test systems, and analyzers with a confidence score.
 - **Analyzers** (`analyzers`): per-ecosystem discovery of direct dependencies and artifacts.
 - **Expansion** (`expand`): recursive work queue over nodes, deduplication, cycle detection (SCC), analysis-plan selection, per-node status tracking, and resumability.
@@ -320,7 +321,8 @@ flowchart TD
 
 - Git URL (with optional branch, tag, or revision),
 - tarball URL,
-- local path.
+- local path,
+- registry crate: a crate name and exact version in a Cargo sparse registry — crates.io by default, or a private registry that serves the same index and `.crate` formats, with or without authentication (§7.2, §22.30–33).
 
 ### 7.2 Acquisition and extraction
 
@@ -332,7 +334,40 @@ flowchart TD
 - Never execute anything during extraction.
 - **Download limits**: every HTTP download (tarballs, registry index entries and `.crate` files) has a connect timeout, a whole-request timeout, and a size cap; bodies are streamed and abandoned once over the cap, never buffered unbounded (`DownloadLimits`).
 - **Git**: the whole clone, checkout, and submodule fetch is bounded by a wall-clock timeout, and the checked-out tree is held to the same entry-count and total-size limits as an extracted tarball (checked after checkout). Submodules are checked out recursively at the commit the superproject pins (`update = none` submodules are skipped), within depth and count limits. `.gitmodules` is untrusted: submodule names and paths are validated (no traversal, no symlink crossing) and only allowlisted URL schemes are fetched — `https` by default — so a hostile `file://` or `ssh://` URL cannot pull local repositories or use host credentials (`GitOptions`, §22.24).
-- `FetchedSource::source_id()` pins the root's `SourceId.precise` to the recorded digest (resolved commit, archive digest, or tree digest).
+- **HTTP redirects** (every download: tarballs, registry index files and `.crate` files): at most 5 hops, and never from `https` to `http`. Redirects to other hosts are followed, because registries and release hosts use CDNs, but registry credentials are never forwarded to another host (§17).
+- `FetchedSource::source_id()` pins the root's `SourceId.precise` to the recorded digest (resolved commit, archive digest, `.crate` checksum, or tree digest).
+
+#### 7.2.1 Registry sources
+
+A registry source names a crate and an exact version in a Cargo-compatible **sparse** registry (Cargo's [index format](https://doc.rust-lang.org/cargo/reference/registry-index.html)).
+
+- **Index URL:** must be `sparse+https://…`. It is normalized by removing `sparse+`, lowercasing the scheme and host, dropping a default port, and adding a trailing slash; userinfo, a query or a fragment are rejected. A URL without the `sparse+` prefix is a **git** index in Cargo and is rejected with a hint to use the registry's sparse URL; git-protocol indexes are not supported. Plain `http` is accepted only through a library option for tests, never from the CLI or configuration. With no registry given, the index is crates.io.
+- **crates.io identity:** crates.io is always `https://index.crates.io/`. Its legacy git URL, `https://github.com/rust-lang/crates.io-index` (with or without `registry+`), is mapped to that identity wherever it appears: source inputs, `Cargo.lock`, and `cargo metadata` output (§8.1).
+- **Names and versions:** the version is exact (`semver::Version`); requirement operators and "latest" are rejected, so analyses are reproducible. Versions match ignoring build metadata, because an index may list each version only once ignoring build metadata; two records that differ only in build metadata make that crate's index malformed. The index file path uses the lowercased name; record names match case-insensitively and are reported as the index spells them. `-` and `_` are distinct (they name different index files); when a name is not found, the error suggests the other spelling. Names must be ASCII alphanumerics, `-` or `_`, start with a letter, and be at most 64 characters.
+- **Index lookups:** `config.json` is requested first, then the crate's index file. A 404, 410 or 451 for the index file means the crate does not exist. Unknown `config.json` fields are ignored. Malformed lines for *other* versions, and records whose schema version `v` is above 2, are skipped; a malformed or duplicate record for the requested version is an error.
+- **Download URL:** derived only from `config.json`'s `dl`, with the markers `{crate}`, `{version}`, `{prefix}`, `{lowerprefix}` and `{sha256-checksum}`; when `dl` contains none, `/{crate}/{version}/download` is appended. Substituted values are percent-encoded. Index records cannot override the download location.
+- **Verification:** the record's `cksum` must be 64 hexadecimal characters, and the downloaded `.crate` MUST match it; the result has `Provenance::Verified`. A caller may also supply an expected SHA-256, which must equal `cksum`. The index itself is trusted over TLS, as in Cargo.
+- **Yanked versions** are refused unless the caller explicitly allows them (`--allow-yanked`); an allowed yanked fetch is reported as yanked and, for `analyze`, recorded in the metadata options.
+- **Cache and contents:** the cache entry is `crate/<cksum>`, separate from `tarball/`, so identical bytes from different registries share one entry. The `.crate` is a gzip tarball extracted with the same hardening and limits as any tarball; it MUST contain exactly one top-level entry, a directory named `<name>-<version>`, which becomes the source tree. Nothing in it is executed.
+- **Offline:** a registry source can be served offline only when its checksum is supplied and that cache entry exists. The yanked state cannot be checked offline and is reported as unknown.
+- **Cache identity:** a cache hit, online or offline, is used only if the cached `<name>-<version>` directory names the requested crate and version. Otherwise the fetch fails rather than returning another crate's source.
+- **Network:** registry fetches run on the host, like git and tarball fetches, bounded by `DownloadLimits`. They do not use the sandbox proxy, and the analysis allowlist (§10.2) does not apply to them.
+
+#### 7.2.2 Registry authentication
+
+Private registries may require a token, as described by Cargo's [registry authentication](https://doc.rust-lang.org/cargo/reference/registry-authentication.html) and [credential provider protocol](https://doc.rust-lang.org/cargo/reference/credential-provider-protocol.html). A token grants access to private source code: it MUST NOT reach any host other than its registry, the database, exports, logs, error messages, the process list, the sandbox, or core dumps, and robigus MUST NOT store it.
+
+- **When a token is used:** only for a registry whose `config.json` declares `"auth-required": true`, or that answers the unauthenticated `config.json` request with 401, in which case robigus obtains a token and retries `config.json` with it. A token is never obtained, read or sent for a registry that does not require one, including crates.io.
+- **Sources:** each named registry in robigus's configuration (`[registries.<name>]`, §14) uses exactly one credential source:
+  - an environment variable, `ROBIGUS_REGISTRY_<NAME>_TOKEN`, where `<NAME>` is the registry name uppercased with `-` replaced by `_` (the default);
+  - a credential process implementing Cargo's credential provider protocol (a `get` request with operation `read`), given as an absolute path and argument vector and run without a shell, with a cleared environment except `PATH` and `HOME`, no inherited descriptors other than stdio, a timeout and a bounded response. Its stdout is parsed as protocol messages and never logged. Tokens it marks `cache: "never"` are not reused; `session` and `expires` tokens are cached in memory for the current process only, until expiry;
+  - a token file at an absolute path, which MUST be a regular file owned by the invoking user, not reached through a symlink, and inaccessible to group and others (mode `0600` or stricter); the token is its first line. The path is opened one component at a time relative to the already-opened parent with `O_NOFOLLOW` (no check-then-open race), and the final open is non-blocking, so a FIFO or device is refused rather than hanging.
+- **Never used:** Cargo's credentials file and configuration, `CARGO_REGISTRY_TOKEN`, `CARGO_REGISTRIES_*` variables, `.netrc`, or tokens on the command line. An index given directly with `--index` never uses credentials, so an ad-hoc URL cannot receive a token configured for a named registry.
+- **Scoping:** a token is bound to its registry's normalized index URL. It is sent as the `Authorization` header only over `https`, and only to the index host and to the `dl` host from that registry's `config.json`. It is never sent on a redirect to another host, over `http`, or to any other host.
+- **Handling:** tokens are held in a type that cannot be displayed, serialized or cloned, whose debug form is redacted, and which is zeroed when dropped. Every buffer robigus owns that holds token bytes — token-file and credential-process output (deserialized directly into a zeroizing buffer), the token itself, and the `Authorization` header bytes it hands to the HTTP client — is zeroed when dropped. This is best effort: the HTTP stack may copy header bytes into its own write buffers. Core dumps are therefore disabled **before** any token is read, and a token is refused if they cannot be disabled; they stay disabled until the last token is dropped. The header value is marked sensitive so HTTP tracing omits it. Registry and credential-process error text is bounded, and any echo of the active token — including in a registry's `login_url` — is redacted.
+- **Never recorded:** tokens and `Authorization` headers never appear in `FetchedSource`, the store, `tool_invocation`, exports, proxy logs, `tracing` output or error messages, and never enter the sandbox (§10.2).
+- **Diagnostics:** 401 and 403 are reported distinctly (authentication required; token rejected or lacking access), naming the registry and the configured credential source but never the token. A `WWW-Authenticate: Cargo login_url="…"` challenge is shown so the user knows where to obtain a token. Requests are not retried in a loop.
+- **Maintenance:** robigus has no `login` or `logout` commands; tokens are issued, rotated and revoked at the registry and its credential provider. Read-only, least-privilege tokens are recommended (`robigus/SECURITY.md`).
 
 ### 7.3 Detection
 
@@ -420,7 +455,9 @@ In-process analyzers MUST be the default; sub-agents (out-of-process or LLM-assi
 - Use unfiltered `cargo metadata` (no `--filter-platform`) as the primary source so predicates for all targets are recorded. `cargo metadata --filter-platform <triple>` MAY be used in the Validation strategy to cross-check target-specific evaluation.
 - Parse `[target.'cfg(...)'.dependencies]` (stored as `cfg` atoms, §4.1), optional dependencies, and feature syntax (`dep:foo`, `foo?/bar`) via `FeatureExpr`.
 - Analyze `build.rs` for `cc`, `cxx`, `bindgen`, `pkg-config`, `cmake`, and `meson` usage, and for `cargo:` directives and the `links` key.
-- Fetch registry crates as `.crate` tarballs (checksum-verified, §7.2); fetch git dependencies with `gix` (in `spawn_blocking`); read path dependencies from disk.
+- Fetch registry crates as `.crate` tarballs (checksum-verified, §7.2.1); fetch git dependencies with `gix` (in `spawn_blocking`); read path dependencies from disk.
+- **Registry identity:** map Cargo's `source` strings to `SourceKind::CargoRegistry` with the §7.2.1 index-URL normalization, including crates.io's legacy git URL, which becomes `https://index.crates.io/`. Set each registry package's `SourceId.precise` to the `checksum` recorded in `Cargo.lock`, so a crate that is both the root and a dependency is one node (§5.1). A registry dependency without a lockfile checksum, or from another git-protocol index, is declared-but-unresolved with a recorded reason.
+- **Authenticated registries:** registry tokens never enter the sandbox (§7.2.2, §10.2), so `cargo metadata` cannot read authenticated registries in Phase 1. Dependencies hosted in one are declared-but-unresolved, with a reason naming the registry.
 - **Path containment**: path dependencies MUST resolve only within the fetched source tree. A path dependency that escapes the analysis root (for example `path = "../../outside"`) MUST be rejected and recorded as an error on that node; the sandbox's read-only source mount enforces the same rule at execution time.
 - Record both the declared requirement and the resolved version.
 
@@ -464,10 +501,13 @@ Fetched sources are untrusted. All analysis that executes project code MUST run 
 - `--sandbox <mode>` accepts `auto` (default: `bwrap` if available, else native), `bwrap`, or `native`. There is **no** `none` mode.
 - **Fail closed**: if no sandbox can be established — for example unprivileged user namespaces blocked by AppArmor on stock Ubuntu, `bwrap` missing, or seccomp/namespace setup failure — the tool MUST exit with code 4, print `no sandbox available`, and include a detailed diagnostic listing every mechanism attempted and why each failed. (Operator guidance, not a tool mode: run robigus where namespaces are permitted, such as a configured CI runner.)
 - Mount the source tree read-only; provide writable tmpfs for build output and a writable `CARGO_HOME` inside the sandbox (required by `cargo metadata`).
-- Do not expose the host home directory, SSH agent, environment secrets, or package manager credentials.
+- Do not expose the host home directory, SSH agent, environment secrets, or package manager credentials. Registry tokens (§7.2.2) are used only by host-side fetches and never enter the sandbox's environment, files or arguments.
 - Network egress is restricted to the allowlist by default; `--offline` disables all egress, and configuration may narrow the allowlist further. Unrestricted, unproxied egress is never available.
 - When egress is enabled, it MUST be mediated by an allowlisting forward proxy started by robigus and exposed to the sandbox (proxy environment variables), with direct egress blocked by the network namespace. The proxy validates CONNECT/SNI host names against the allowlist and logs every request.
-- Default allowlist: `crates.io` subdomains (registry index and static/CDN hosts), `ubuntu.com` subdomains (archive, security, ports, changelogs), `github.com` subdomains (including codeload and release assets), `gitlab.com` subdomains, and `codeberg.org` subdomains. A configuration file or CLI parameter may add other hosts or remove defaults.
+  - Transport: the sandbox keeps its own network namespace. A fixed bootstrap (`/usr/bin/python3 -I -S` from the read-only runtime) binds `127.0.0.1:3128` inside it and passes the listening socket to robigus over a private socketpair before the workload starts; the workload holds neither. robigus serves that listener and connects upstream from the host.
+  - Policy: HTTP/1.x `CONNECT` and absolute-form `GET`/`HEAD` `http://` requests only; literal DNS host names only (no IP literals); allowed ports (default 80, 443); the `Host` header must agree with the target; for `CONNECT`, the TLS ClientHello SNI must equal the `CONNECT` host, or the tunnel closes before any client byte is forwarded. Names resolving to any non-public address are refused. TLS is relayed unchanged (no MITM).
+  - Logging: one JSON line per decision and per closed connection in `proxy.jsonl` in the invocation's log directory, mirrored as `tracing` events (target `robigus::proxy`).
+- Default allowlist: `crates.io` subdomains (registry index and static/CDN hosts), `ubuntu.com` subdomains (archive, security, ports, changelogs), `github.com` subdomains (including codeload and release assets), `gitlab.com` subdomains, and `codeberg.org` subdomains. A configuration file or CLI parameter may add other hosts or remove defaults. Configuration: `[network] allowlist` replaces the defaults, `allow` adds hosts, and `deny` removes hosts; each entry covers its subdomains and denial always wins.
 - Enforce wall-clock timeouts and cgroup v2 limits (memory, pids, CPU) when cgroup delegation is available; when it is not, fall back to timeouts and process limits and record that fact in metadata.
 - Capture stdout and stderr and record the exact commands, environment (scrubbed), and tool versions for reproducibility (§11 `tool_invocation`).
 - If a sandbox cannot be established, analysis MUST fail closed rather than run unsandboxed.
@@ -517,7 +557,7 @@ CREATE TABLE package (
     ecosystem       TEXT NOT NULL,
     source_kind     TEXT NOT NULL,
     source_uri      TEXT NOT NULL DEFAULT '',
-    source_precise  TEXT NOT NULL DEFAULT '',  -- git commit / tarball digest; part of identity
+    source_precise  TEXT NOT NULL DEFAULT '',  -- git commit / tarball digest / .crate checksum; part of identity
     source_reference TEXT NOT NULL DEFAULT '', -- git only: 'default' | 'branch:<n>' | 'tag:<n>' | 'rev:<r>'; NOT identity
     is_root         INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL DEFAULT 'Not_Started',
@@ -672,6 +712,30 @@ The plan:
 | Command | Purpose |
 |---|---|
 | `fetch <SOURCE>` | Acquire and verify a source; print the local path and digest. |
+
+`SOURCE` is a local path, a git repository URL, a tarball URL, or `crate:<name>@<version>` for a registry crate (§7.2.1). The `crate:` form is recognized only when followed by a valid crate name, `@`, and an exact version; write `./crate:…` to name a local directory instead. Source options for `fetch` and `analyze`:
+
+| Option | Applies to | Meaning |
+|---|---|---|
+| `--branch`, `--tag`, `--rev` | git | Reference to check out (mutually exclusive). |
+| `--sha256 <DIGEST>` | tarball, registry | Expected SHA-256; required for offline cache hits. For a registry crate it must equal the index checksum. |
+| `--registry <NAME>` | registry | Use a registry defined in `[registries.<name>]`; unknown names are usage errors. |
+| `--index <URL>` | registry | Use a sparse index URL directly (`sparse+https://…`); never uses credentials. Conflicts with `--registry`. |
+| `--allow-yanked` | registry | Allow an explicitly requested yanked version. |
+
+Without `--registry` or `--index`, a registry crate comes from crates.io. Git options are usage errors for a registry source, and registry options for any other source. With `--format json`, `fetch` output for a registry crate adds `name`, `version` and `yanked` (`true`, `false`, or `null` when unknown offline).
+
+Registry configuration in the `--config` file (Cargo's `[registries]` syntax; robigus never reads Cargo's own configuration):
+
+```toml
+[registries.internal]
+index = "sparse+https://registry.example.com/index/"   # required; sparse+https only
+credential-provider = { env = true }                    # default: ROBIGUS_REGISTRY_INTERNAL_TOKEN
+# credential-provider = { process = ["/usr/bin/cargo-credential-libsecret"] }
+# credential-provider = { file = "/home/user/.config/robigus/internal.token" }
+```
+
+Entries are validated when the configuration is loaded: index URLs must be `sparse+https`, and process and file paths must be absolute. The credential sources are specified in §7.2.2.
 | `analyze <SOURCE>` | Fetch (if needed), analyze, and persist. Requires the global `--db`. If the database already exists, the analysis is **resumed**; the recorded source identity and configuration MUST match (§7.7). |
 | `check <DB>` | Validate schema and graph well-formedness (§11.3). |
 | `print <DB>` | Pretty-print the graph. Filters: `--kind`, `--arch`, `--platform`, `--feature`, `--build-profile`, `--series`, `--env`, `--depth`, `--status`, and `--why <PKG\|REQUIREMENT>` (feature/requirement provenance, §9). Filters evaluate predicates against the recorded configuration unless `--config` overrides it. |
@@ -696,6 +760,18 @@ pub enum SourceInput {
     Git { url: Url, reference: GitReference },
     Tarball { url: Url, digest: Option<String> },
     Path { path: PathBuf },
+    Registry {
+        registry: RegistrySpec,         // normalized sparse index URL (+ configured name)
+        name: String,
+        version: semver::Version,       // exact; no requirement operators
+        digest: Option<String>,         // expected SHA-256; must equal the index cksum
+    },
+}
+
+pub struct RegistrySpec {
+    pub index_url: Url,                 // normalized; `SourceKind::CargoRegistry` identity
+    pub name: Option<String>,           // configured name: credential lookup and diagnostics only
+    pub credentials: CredentialSource,  // None | Env | Process | File (§7.2.2)
 }
 
 pub struct AnalysisOptions {
@@ -738,6 +814,9 @@ pub fn establish_sandbox(preference: SandboxPreference)
 - Public types MUST implement `Debug`; errors MUST implement `std::error::Error` via `thiserror`.
 - Library code MUST NOT panic on malformed input.
 - The CLI MUST use `miette` for user-facing diagnostics.
+- `RegistrySpec` for an index given directly (`--index`) always has `CredentialSource::None`. Registry tokens are an opaque type with a redacted `Debug` and no `Display`, `Serialize` or `Clone` (§7.2.2); no public API returns a token.
+- Plain `http` registry indexes are accepted only through a library option intended for tests; the CLI and configuration cannot enable them. A registry with any credential source is refused over `http` by `RegistryClient::new`, which re-validates the `RegistrySpec` (its fields are public), unless built with the separate test-only policy that explicitly permits it for local mock servers.
+- A pinned `.crate` checksum that is cached for a different crate or version is an error, not a substitution: the cached `<name>-<version>` directory must match the request under the index-lookup rules (§7.2.1).
 
 ## 16. Testing Strategy
 
@@ -754,7 +833,8 @@ pub fn establish_sandbox(preference: SandboxPreference)
 - **Containment tests**: a path dependency escaping the analysis root is rejected.
 - **Integration tests** with `assert_cmd`, `predicates`, and `tempfile`.
 - **Test isolation from the developer's environment**: tests that run external tools (for example `git` to build fixture repositories) MUST clear the inherited environment and run only inside temporary directories. The repository's pre-commit hook runs `cargo test`, and git exports `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and similar variables to hooks; inherited, they redirect fixture commands to the enclosing repository.
-- **HTTP mocking** with `wiremock` for registry and archive interactions.
+- **HTTP mocking** with `wiremock` for registry and archive interactions, including sparse registries with each `dl` form, authenticated registries, and redirects.
+- **Credential tests:** a canary token MUST NOT appear in debug output, errors (including a server that echoes it), `tracing` output, the store, `tool_invocation`, exports, or any request other than an in-scope HTTPS request; Cargo credential files and `CARGO_REGISTRIES_*` variables are ignored even when present.
 - **Sandbox tests** verifying that analysis cannot reach non-allowlisted hosts or write outside its workspace.
 - **CI** MUST run `cargo fmt -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo doc --locked --no-deps --all-features`, `cargo test --locked --all-targets --all-features`, `cargo audit`, `cargo deny` (licenses and advisories), and an MSRV job pinned to 1.93.1; CI MUST trigger on pushes as well as pull requests.
 
@@ -764,6 +844,7 @@ pub fn establish_sandbox(preference: SandboxPreference)
 - Never execute build scripts outside the sandbox.
 - Validate archive extraction (§7.2).
 - Do not log secrets; scrub environment variables from sandbox logs and `tool_invocation` records.
+- Registry credentials follow §7.2.2: tokens are read only from robigus's own configured sources, never stored, sent only to their registry's hosts over HTTPS, kept out of every record and of the sandbox, zeroed (best effort) when dropped, and excluded from core dumps, which are disabled before a token is read (fail closed).
 - LLM sub-agents: run sandboxed; never include host secrets or credentials in prompt context; treat their output as untrusted and require anchor verification (§7.6) before it becomes evidence; record their interactions in `tool_invocation` for audit.
 - Record provenance for every discovered edge so results can be audited.
 - Provide a robigus-specific `SECURITY.md` (`robigus/SECURITY.md`) with its own reporting path and sandbox scope; the workspace `SECURITY.md` covers the repository's other crates.
@@ -855,3 +936,9 @@ Decisions binding on this specification:
 26. Confidence is one bounded type, `model::Confidence` (0–100), shared by `Evidence`, `Edge`, and detection signals. `Confidence::new` clamps; `TryFrom<u8>` and deserialization reject values above 100, so an out-of-range confidence cannot be constructed in Rust or loaded from JSON; the database column has a CHECK. It serializes as a plain number.
 27. The source cache is lock-free: work is staged in unique per-process scratch paths and published with an atomic `rename`; losing the race to an identical content-addressed entry is success.
 28. Git acquisition is isolated from the caller's git setup: repositories are opened with `gix::open::Options::isolated()`, so `GIT_*` environment variables and global/system git configuration (for example `url.<base>.insteadOf` rewrites) cannot change what is fetched.
+29. The sandbox-to-proxy transport is a listening socket created inside the sandbox's network namespace and passed to robigus (§10.2), rather than sharing the host network namespace or adding a forwarder process. The workload therefore never gains a route off the host, the seccomp socket policy is unchanged, and no extra binary is needed beyond the runtime's `/usr/bin/python3`. Upstream addresses are resolved on the host and must be public unicast; `ProxyPolicy::resolve` pins trusted addresses (mirrors, tests).
+30. Registry sources (§7.2.1) support only the sparse protocol, given as `sparse+https://…`. Git-protocol indexes would require cloning a whole index repository, and a URL without `sparse+` is a git index in Cargo, so both are rejected with a hint. Versions are exact, so analyses are reproducible; resolving "latest" or a range is out of scope.
+31. A registry package's identity is its normalized sparse index URL plus its `.crate` checksum, for fetched roots and for dependencies alike (dependencies take the checksum from `Cargo.lock`). crates.io is always `https://index.crates.io/`, and its legacy git URL maps to it everywhere, as Cargo does internally. The cache key is `crate/<cksum>`, separate from tarballs because the cached tree is the `.crate`'s single `<name>-<version>` directory.
+32. Yanked registry versions are refused unless explicitly allowed, matching Cargo, which never resolves to a yanked version but allows one that is explicitly pinned.
+33. Registry authentication is in v1 and designed in from the start (§7.2.2). robigus stores no tokens and reads them only from its own per-registry source (environment variable, Cargo-protocol credential process, or a `0600` token file), never from Cargo's credentials or configuration. Tokens are scoped to their registry's hosts over HTTPS, never follow cross-host redirects, never enter the sandbox or any record, are zeroed (best effort) when dropped, and are excluded from core dumps, which are disabled before any token is read (fail closed). Authentication for registry dependencies resolved inside the sandbox is deferred: such dependencies are declared-but-unresolved in Phase 1.
+34. Downloads follow at most 5 redirects and never downgrade from `https` to `http` (§7.2).

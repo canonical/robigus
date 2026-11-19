@@ -10,9 +10,9 @@ keywords = ["ubuntu", "apt", "packages", "archive", "debian"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-chrono = { workspace = true }
 clap = { workspace = true }
 flate2 = { workspace = true }
+jiff = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

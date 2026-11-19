@@ -15,7 +15,6 @@ use crate::model::{
     SourceId, SourceKind, Target, TargetKind, VersionConstraint,
 };
 use crate::predicate::{Configuration, Predicate};
-use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -632,7 +631,7 @@ impl Store {
             let metadata = snapshot.metadata;
             let options = checked_metadata_options(&metadata.options)?;
             let conn = lock(&conn)?;
-            let now = Utc::now().to_rfc3339();
+            let now = crate::clock::now_rfc3339()?;
             // Only a missing row means "first write"; any other error is real.
             let created_at: Option<String> = conn
                 .query_row("SELECT created_at FROM metadata WHERE id = 1", [], |row| {
@@ -1173,7 +1172,7 @@ impl Store {
         tokio::task::spawn_blocking(move || {
             let mut conn = lock(&conn)?;
             let tx = conn.transaction()?;
-            let now = Utc::now().to_rfc3339();
+            let now = crate::clock::now_rfc3339()?;
             for (subject, row) in &prepared {
                 let (package_id, root_path) =
                     match subject {
@@ -2566,7 +2565,13 @@ mod tests {
         let loaded = store.metadata().await.unwrap().expect("metadata");
         assert_eq!(loaded.project_name, "rav1e");
         assert_eq!(loaded.created_at, metadata.created_at);
-        assert!(!loaded.updated_at.is_empty());
+        // The store stamps an RFC 3339 UTC timestamp close to now.
+        let stamped: jiff::Timestamp = loaded.updated_at.parse().expect("RFC 3339 timestamp");
+        assert!(loaded.updated_at.ends_with('Z'), "{}", loaded.updated_at);
+        assert!(
+            jiff::Timestamp::now().duration_since(stamped).abs()
+                < jiff::SignedDuration::from_mins(5)
+        );
         assert_eq!(
             loaded.toolchain.get("cargo").map(String::as_str),
             Some("1.93.1")

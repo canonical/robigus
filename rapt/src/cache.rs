@@ -112,5 +112,37 @@ mod tests {
         let loaded = loaded.unwrap();
         assert_eq!(loaded.series, "resolute");
         assert!(loaded.is_fresh());
+        assert_eq!(loaded.updated_at, cache.updated_at);
+    }
+
+    #[test]
+    fn test_caches_written_by_chrono_still_load() {
+        // Timestamps as chrono's serde wrote them (RFC 3339, `Z` or `+00:00`,
+        // up to nanosecond precision), plus a non-UTC offset.
+        for (stamp, expected) in [
+            (
+                "2026-11-17T14:00:00.123456789Z",
+                "2026-11-17T14:00:00.123456789Z",
+            ),
+            ("2026-11-17T14:00:00+00:00", "2026-11-17T14:00:00Z"),
+            ("2026-11-17T16:00:00+02:00", "2026-11-17T14:00:00Z"),
+        ] {
+            let json = format!(
+                r#"{{"series":"resolute","updated_at":"{stamp}","packages":{{}},"source_packages":{{}},"provides":{{}}}}"#
+            );
+            let cache: SeriesCache = serde_json::from_str(&json).unwrap();
+            assert_eq!(cache.updated_at.to_string(), expected, "{stamp}");
+            // Re-saving writes the normalized UTC form, which loads back
+            // to the same instant.
+            let saved = serde_json::to_string(&cache).unwrap();
+            assert!(
+                saved.contains(&format!("\"updated_at\":\"{expected}\"")),
+                "{saved}"
+            );
+            let reloaded: SeriesCache = serde_json::from_str(&saved).unwrap();
+            assert_eq!(reloaded.updated_at, cache.updated_at, "{stamp}");
+        }
+        let invalid = r#"{"series":"resolute","updated_at":"yesterday","packages":{},"source_packages":{},"provides":{}}"#;
+        assert!(serde_json::from_str::<SeriesCache>(invalid).is_err());
     }
 }

@@ -12,7 +12,12 @@ use crate::commands::{fetch::FetchArgs, print::PrintArgs};
 
 const CONFIG_HELP: &str = "TOML acquisition configuration (unknown fields are errors). Schema:
 [network]
-allowlist = [\"crates.io\"] # future analysis proxy only; NOT enforced by fetch
+# Sandboxed analysis egress (spec 10.2). Each entry covers the host and its
+# subdomains; deny wins. Defaults: crates.io, ubuntu.com, github.com,
+# gitlab.com, codeberg.org. Not applied to fetch, which runs on the host.
+allowlist = [\"crates.io\"] # replaces the default allowlist
+allow = [\"pypi.org\"] # added to the allowlist
+deny = [\"gitlab.com\"] # removed, including subdomains
 [limits.download]
 max_bytes = 536870912
 connect_timeout = 30 # seconds, positive integer
@@ -27,6 +32,13 @@ max_submodules = 64 # zero disables submodule fetching
 submodule_schemes = [\"https\"]
 [subagent]
 enabled = false # future opt-in placeholder; no sub-agent is invoked
+[registries.internal] # Cargo registry for `fetch crate:<name>@<version> --registry internal`
+index = \"sparse+https://registry.example.com/index/\" # required; sparse+https only
+credential-provider = { env = true } # default: ROBIGUS_REGISTRY_INTERNAL_TOKEN
+# credential-provider = { process = [\"/usr/bin/cargo-credential-libsecret\"] }
+# credential-provider = { file = \"/home/me/.config/robigus/internal.token\" } # mode 0600
+Tokens are used only for registries that require authentication, are never
+stored by robigus, and are never read from Cargo's credentials or config.
 All fields are optional. Size/count limits must be positive except the two
 submodule limits. Download limits apply to HTTP; extraction limits apply to
 tarballs and git checkouts; git limits apply to git acquisition. Local sources
@@ -151,12 +163,113 @@ pub struct Config {
     pub network: NetworkConfig,
     pub limits: LimitsConfig,
     pub subagent: SubagentConfig,
+    /// Named Cargo registries (spec §14), Cargo's `[registries]` syntax.
+    pub registries: std::collections::BTreeMap<String, RegistryConfig>,
+}
+
+/// One `[registries.<name>]` entry.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RegistryConfig {
+    /// Sparse index URL (`sparse+https://…`).
+    pub index: String,
+    /// Where the token comes from; defaults to the environment variable.
+    #[serde(default)]
+    pub credential_provider: Option<CredentialProviderConfig>,
+}
+
+/// A `credential-provider` table: exactly one key.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub enum CredentialProviderConfig {
+    /// `{ env = true }`: `ROBIGUS_REGISTRY_<NAME>_TOKEN`.
+    Env(bool),
+    /// `{ process = ["/abs/provider", "arg", …] }`.
+    Process(Vec<String>),
+    /// `{ file = "/abs/token" }`.
+    File(PathBuf),
+}
+
+impl Config {
+    /// The registry named `name`, validated, with its credential source.
+    pub fn registry(&self, name: &str) -> Result<robigus::RegistrySpec, CliError> {
+        let entry = self.registries.get(name).ok_or_else(|| {
+            let known: Vec<&str> = self.registries.keys().map(String::as_str).collect();
+            CliError::Usage(if known.is_empty() {
+                format!("unknown registry '{name}': no [registries] are configured")
+            } else {
+                format!(
+                    "unknown registry '{name}'; configured: {}",
+                    known.join(", ")
+                )
+            })
+        })?;
+        let credentials = match &entry.credential_provider {
+            None | Some(CredentialProviderConfig::Env(true)) => robigus::CredentialSource::Env {
+                registry: name.to_owned(),
+            },
+            Some(CredentialProviderConfig::Env(false)) => robigus::CredentialSource::None,
+            Some(CredentialProviderConfig::Process(command)) => {
+                let (program, args) = command.split_first().ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "registries.{name}.credential-provider.process needs a program"
+                    ))
+                })?;
+                robigus::CredentialSource::Process {
+                    program: program.into(),
+                    args: args.to_vec(),
+                }
+            }
+            Some(CredentialProviderConfig::File(path)) => {
+                robigus::CredentialSource::File { path: path.clone() }
+            }
+        };
+        robigus::RegistrySpec::named(name, &entry.index, credentials)
+            .map_err(|error| CliError::Usage(format!("registries.{name}: {error}")))
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
+    /// Replaces the default allowlist when present.
     pub allowlist: Option<Vec<String>>,
+    /// Added to the (default or replaced) allowlist.
+    pub allow: Vec<String>,
+    /// Denied hosts and subdomains; denial overrides any allowance.
+    pub deny: Vec<String>,
+}
+
+impl NetworkConfig {
+    /// The proxy policy these settings describe (spec §10.2). `--offline`
+    /// disables egress entirely and is handled by the caller. Validated at
+    /// config load; `analyze` (WP-2.3) will pass it to the sandbox.
+    pub fn proxy_policy(&self) -> Result<robigus::ProxyPolicy, CliError> {
+        let parse = |field: &str, host: &String| {
+            host.parse::<robigus::HostName>()
+                .map_err(|error| CliError::Usage(format!("network.{field} entry: {error}")))
+        };
+        let mut allowlist = match &self.allowlist {
+            Some(hosts) => {
+                let mut list = robigus::Allowlist::empty();
+                for host in hosts {
+                    list.allow(parse("allowlist", host)?);
+                }
+                list
+            }
+            None => robigus::Allowlist::default(),
+        };
+        for host in &self.allow {
+            allowlist.allow(parse("allow", host)?);
+        }
+        for host in &self.deny {
+            allowlist.deny(parse("deny", host)?);
+        }
+        Ok(robigus::ProxyPolicy {
+            allowlist,
+            ..robigus::ProxyPolicy::default()
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -202,23 +315,15 @@ pub struct GitConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<(), CliError> {
-        if let Some(hosts) = &self.network.allowlist {
-            for host in hosts {
-                // Future proxy policy uses literal DNS hosts, not URLs or wildcards.
-                if host.len() > 253
-                    || host.split('.').any(|label| {
-                        label.is_empty()
-                            || label.len() > 63
-                            || label.starts_with('-')
-                            || label.ends_with('-')
-                            || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-                    })
-                {
-                    return Err(CliError::Usage(format!(
-                        "network.allowlist entry '{host}' must be a literal DNS hostname"
-                    )));
-                }
+        // Proxy policy uses literal DNS hosts, not URLs, wildcards or IPs.
+        self.network.proxy_policy()?;
+        for name in self.registries.keys() {
+            if robigus::registry::validate_crate_name(name).is_err() {
+                return Err(CliError::Usage(format!(
+                    "invalid registry name '{name}': use ASCII letters, digits, `-` or `_`, starting with a letter"
+                )));
             }
+            self.registry(name)?;
         }
         if let Some(schemes) = &self.limits.git.submodule_schemes {
             for scheme in schemes {
@@ -282,9 +387,10 @@ impl Config {
     }
 
     pub fn describe_future_settings(&self) {
-        if self.network.allowlist.is_some() {
+        let network = &self.network;
+        if network.allowlist.is_some() || !network.allow.is_empty() || !network.deny.is_empty() {
             eprintln!(
-                "notice: network.allowlist is reserved for the future analysis proxy; fetch does NOT enforce this host allowlist"
+                "notice: [network] settings apply to sandboxed analysis (analyze, not yet implemented); fetch runs on the host and does NOT enforce them"
             );
         }
         if self.subagent.enabled {
@@ -324,6 +430,8 @@ impl CliError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Analysis(_) | Self::NotImplemented(_) => 1,
+            // A bad system clock is not a database or schema error.
+            Self::Database(robigus::StoreError::Clock(_)) => 1,
             Self::Usage(_) => 2,
             Self::Database(_) => 3,
             Self::Sandbox(_) => 4,
@@ -341,7 +449,8 @@ impl From<robigus::RobigusError> for CliError {
             robigus::RobigusError::Fetch(
                 error @ (robigus::FetchError::InvalidDigest(_)
                 | robigus::FetchError::InvalidCacheKey(_)
-                | robigus::FetchError::UnsupportedFormat(_)),
+                | robigus::FetchError::UnsupportedFormat(_)
+                | robigus::FetchError::InvalidRegistry(_)),
             ) => Self::Usage(error.to_string()),
             other => Self::Analysis(other.to_string()),
         }
@@ -398,6 +507,12 @@ mod tests {
                     supported: 1,
                 }),
                 3,
+            ),
+            (
+                CliError::Database(robigus::StoreError::Clock(robigus::ClockError(
+                    "year 20000".into(),
+                ))),
+                1,
             ),
             (
                 CliError::Sandbox(robigus::SandboxUnavailable { attempts: vec![] }),
@@ -462,10 +577,50 @@ mod tests {
         for text in [
             "[network]\nallowlist = ['https://crates.io']",
             "[network]\nallowlist = ['*.example.org']",
+            "[network]\nallow = ['127.0.0.1']",
+            "[network]\nallow = ['example.org:8080']",
+            "[network]\ndeny = ['']",
             "[limits.git]\nsubmodule_schemes = ['https://']",
         ] {
-            assert!(toml::from_str::<Config>(text).unwrap().validate().is_err());
+            assert!(
+                toml::from_str::<Config>(text).unwrap().validate().is_err(),
+                "accepted {text}"
+            );
         }
+    }
+
+    #[test]
+    fn network_settings_build_the_proxy_policy() {
+        let host = |name: &str| name.parse::<robigus::HostName>().unwrap();
+        let defaults = Config::default().network.proxy_policy().unwrap();
+        assert_eq!(defaults, robigus::ProxyPolicy::default());
+
+        let config: Config = toml::from_str(
+            "[network]\nallow = ['PyPI.org']\ndeny = ['gitlab.com', 'static.crates.io']",
+        )
+        .unwrap();
+        let policy = config.network.proxy_policy().unwrap();
+        assert!(policy.allowlist.permits(&host("files.pypi.org")));
+        assert!(policy.allowlist.permits(&host("index.crates.io")));
+        assert!(!policy.allowlist.permits(&host("static.crates.io")));
+        assert!(!policy.allowlist.permits(&host("gitlab.com")));
+
+        let config: Config =
+            toml::from_str("[network]\nallowlist = ['crates.io']\nallow = ['ubuntu.com']").unwrap();
+        let policy = config.network.proxy_policy().unwrap();
+        assert!(policy.allowlist.permits(&host("index.crates.io")));
+        assert!(policy.allowlist.permits(&host("archive.ubuntu.com")));
+        assert!(!policy.allowlist.permits(&host("github.com")));
+
+        let empty: Config = toml::from_str("[network]\nallowlist = []").unwrap();
+        assert!(
+            !empty
+                .network
+                .proxy_policy()
+                .unwrap()
+                .allowlist
+                .permits(&host("crates.io"))
+        );
     }
 
     #[test]

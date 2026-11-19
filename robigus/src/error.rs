@@ -12,7 +12,8 @@
 /// each variant.
 #[derive(Debug, thiserror::Error)]
 pub enum RobigusError {
-    /// A database or schema failure (CLI exit code 3).
+    /// A database or schema failure (CLI exit code 3; exit code 1 for
+    /// [`StoreError::Clock`]).
     #[error(transparent)]
     Store(#[from] StoreError),
     /// Source acquisition failed. Invalid caller input
@@ -33,12 +34,51 @@ pub enum RobigusError {
     /// Project detection failed (CLI exit code 1).
     #[error(transparent)]
     Detect(#[from] DetectError),
+    /// An analyzer failed (CLI exit code 1).
+    #[error(transparent)]
+    Analyzer(#[from] AnalyzerError),
+}
+
+/// Analyzer failures (spec §7.5). Problems confined to one package — a
+/// rejected path dependency, a `cargo metadata` failure that falls back to
+/// manifest parsing — are not errors: they are recorded as failed plan rows
+/// in the analyzer's output. These variants stop the analysis of a root.
+#[derive(Debug, thiserror::Error)]
+pub enum AnalyzerError {
+    /// The analyzer has not been implemented yet.
+    #[error("analyzer not implemented: {0}")]
+    Unsupported(String),
+    /// The root's own manifest is missing, unreadable, malformed, or names
+    /// no package or workspace.
+    #[error("cannot analyze the project: {0}")]
+    Project(String),
+    /// Tool introspection was requested (allowlisted network) but no
+    /// sandbox was supplied; tools never run outside a sandbox (spec §10).
+    #[error("tool introspection requires an established sandbox")]
+    SandboxRequired,
+    /// A sandboxed tool could not be launched, supervised or recorded.
+    #[error(transparent)]
+    Sandbox(#[from] crate::sandbox::SandboxError),
+    /// A required tool is missing from the sandbox or failed to report its
+    /// version (for example `/usr/bin/cargo`).
+    #[error("toolchain unavailable: {0}")]
+    Toolchain(String),
+    /// A tool ran successfully but its output is malformed or oversized.
+    #[error("malformed tool output: {0}")]
+    ToolOutput(String),
+    /// The discovered packages cannot be represented consistently, for
+    /// example two different in-tree packages with the same identity.
+    #[error("inconsistent analysis result: {0}")]
+    Inconsistent(String),
+    /// A blocking analysis task failed to run or complete.
+    #[error("analysis task failed: {0}")]
+    Task(String),
 }
 
 /// SQLite persistence failures.
 ///
-/// Every variant is a database or schema error: the CLI reports it with exit
-/// code 3 (spec §14).
+/// Every variant except [`StoreError::Clock`] is a database or schema error:
+/// the CLI reports it with exit code 3 (spec §14).
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// SQLite itself failed, or the store could not reach it: an error from
@@ -84,7 +124,20 @@ pub enum StoreError {
     /// yield an equal value (spec §11.3, lossless round trip).
     #[error("cannot store losslessly: {0}")]
     Unrepresentable(String),
+    /// The store could not timestamp a write because the system clock is
+    /// unusable. Nothing was written. Unlike the other variants, the CLI
+    /// reports this as an analysis failure (exit code 1), since the database
+    /// itself is not at fault.
+    #[error(transparent)]
+    Clock(#[from] ClockError),
 }
+
+/// The system clock cannot be represented as a timestamp: it is set before
+/// the year -9999 or after 9999, the range `jiff` supports. robigus reports
+/// this instead of recording a wrong time.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("system clock is outside the supported timestamp range: {0}")]
+pub struct ClockError(pub String);
 
 impl From<rusqlite::Error> for StoreError {
     fn from(error: rusqlite::Error) -> Self {
@@ -107,9 +160,9 @@ impl From<PredicateError> for StoreError {
 /// Source acquisition failures.
 ///
 /// Through the CLI, [`FetchError::InvalidDigest`],
-/// [`FetchError::InvalidCacheKey`], and [`FetchError::UnsupportedFormat`] are
-/// usage errors (exit code 2); every other variant is an analysis failure
-/// (exit code 1).
+/// [`FetchError::InvalidCacheKey`], [`FetchError::UnsupportedFormat`], and
+/// [`FetchError::InvalidRegistry`] are usage errors (exit code 2); every
+/// other variant is an analysis failure (exit code 1).
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     /// A git clone, fetch, checkout, or submodule step failed, including a
@@ -151,10 +204,19 @@ pub enum FetchError {
     /// The source archive is in a format robigus cannot extract.
     #[error("unsupported archive format: {0}")]
     UnsupportedFormat(String),
-    /// A crate registry lookup or download failed: an HTTP error, an invalid
-    /// crate name or index URL, malformed index data, or a yanked version.
+    /// A crate registry lookup or download failed: an HTTP error, a missing
+    /// crate or version, malformed index data, or a yanked version.
     #[error("registry error: {0}")]
     Registry(String),
+    /// A registry source or configuration is invalid: an index URL that is
+    /// not `sparse+https`, an invalid crate name, or a version that is not
+    /// exact. A usage error (CLI exit code 2).
+    #[error("invalid registry source: {0}")]
+    InvalidRegistry(String),
+    /// A registry requires authentication and no usable token was obtained,
+    /// or the registry rejected it. Never contains the token.
+    #[error("registry authentication failed: {0}")]
+    Credential(String),
     /// An underlying filesystem operation failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -214,6 +276,19 @@ pub enum DpkgError {
     /// The version ends with `-`, leaving an empty Debian revision.
     #[error("debian revision cannot be empty after '-'")]
     EmptyRevision,
+}
+
+/// A network allowlist entry or proxy request host that is not a literal DNS
+/// host name (spec §10.2). URLs, wildcards, ports and IP addresses are
+/// rejected; internationalized names must be given in their ASCII (`xn--`)
+/// form.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid host name {host:?}: {reason}")]
+pub struct InvalidHost {
+    /// The rejected input, truncated to 256 characters.
+    pub host: String,
+    /// Which rule it broke.
+    pub reason: &'static str,
 }
 
 /// One failed sandbox-establishment attempt.

@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use robigus::{
-    CommandSpec, NetworkAccess, ProcessOutput, ProcessStatus, Sandbox, SandboxError,
-    SandboxPreference, Store, establish_sandbox,
+    CommandSpec, NetworkAccess, ProcessOutput, ProcessStatus, ProxyPolicy, Sandbox, SandboxError,
+    SandboxPreference, SourceMount, Store, establish_sandbox,
 };
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
@@ -55,6 +55,7 @@ impl Fixture {
             program: PathBuf::from("/bin/sh"),
             args: vec!["-c".into(), script.into()],
             source,
+            source_mount: SourceMount::ReadOnly,
             source_subdir: PathBuf::new(),
             env: BTreeMap::new(),
             timeout: Duration::from_secs(10),
@@ -880,6 +881,280 @@ async fn cargo_toolchain_runs_inside_the_sandbox() {
     );
 }
 
+/// Proxy log records for an execution, from `proxy.jsonl` beside its output.
+fn proxy_records(output: &ProcessOutput) -> Vec<serde_json::Value> {
+    let log = output
+        .stdout_path
+        .parent()
+        .expect("invocation log directory")
+        .join("proxy.jsonl");
+    std::fs::read_to_string(&log)
+        .unwrap_or_else(|error| panic!("read {}: {error}", log.display()))
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("proxy log line is JSON"))
+        .collect()
+}
+
+/// A policy that allows `allowed.test` but denies its subdomain
+/// `blocked.allowed.test`, pinning both to the host loopback `port`, so allow,
+/// deny and pinning are exercised without DNS or internet access.
+fn loopback_policy(port: u16) -> ProxyPolicy {
+    let allowed: robigus::HostName = "allowed.test".parse().unwrap();
+    let denied: robigus::HostName = "blocked.allowed.test".parse().unwrap();
+    let mut allowlist = robigus::Allowlist::empty();
+    allowlist.allow(allowed.clone());
+    allowlist.deny(denied.clone());
+    ProxyPolicy {
+        allowlist,
+        ports: [port].into(),
+        header_timeout: Duration::from_secs(5),
+        connect_timeout: Duration::from_secs(5),
+        resolve: [
+            (allowed, vec!["127.0.0.1".parse().unwrap()]),
+            (denied, vec!["127.0.0.1".parse().unwrap()]),
+        ]
+        .into(),
+        ..ProxyPolicy::default()
+    }
+}
+
+#[tokio::test]
+async fn allowlisted_network_is_mediated_by_the_proxy() {
+    let test = "allowlisted_network_is_mediated_by_the_proxy";
+    let Some(sandbox) = bwrap(test).await else {
+        return;
+    };
+    // A host-side origin that answers every request; the sandbox may only
+    // reach it through the proxy, by name.
+    let origin = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    let port = origin.local_addr().expect("origin address").port();
+    let served = tokio::spawn(async move {
+        let mut count = 0;
+        while let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(Duration::from_secs(20), origin.accept()).await
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            count += 1;
+            let mut head = vec![0_u8; 4096];
+            let _ = stream.read(&mut head).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\norigin",
+                )
+                .await;
+        }
+        count
+    });
+    let mut fixture = Fixture::new("").await;
+    fixture.spec.network = NetworkAccess::Allowlist(loopback_policy(port));
+    let script = format!(
+        r#"
+import os, socket, urllib.request, urllib.error
+port = {port}
+results = []
+# The proxy variables are set and point at the in-sandbox listener.
+results.append("env=" + os.environ.get("https_proxy", "") + "," + os.environ.get("CARGO_HTTP_PROXY", ""))
+def fetch(url):
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return f"{{response.status}}:{{response.read().decode()}}"
+    except urllib.error.HTTPError as error:
+        return f"{{error.code}}"
+    except Exception as error:
+        return "error:" + type(error).__name__
+results.append("allowed=" + fetch(f"http://allowed.test:{{port}}/index"))
+results.append("subdomain-denied=" + fetch(f"http://blocked.allowed.test:{{port}}/"))
+results.append("unlisted=" + fetch(f"http://example.org:{{port}}/"))
+results.append("ip-literal=" + fetch(f"http://127.0.0.1:{{port}}/"))
+# Direct connections bypassing the proxy cannot reach the host.
+try:
+    socket.create_connection(("127.0.0.1", port), timeout=3)
+    results.append("direct=connected")
+except OSError:
+    results.append("direct=blocked")
+# The workload cannot take over the proxy port or hold the listener.
+try:
+    socket.socket().bind(("127.0.0.1", 3128))
+    results.append("rebind=allowed")
+except OSError:
+    results.append("rebind=blocked")
+results.append("fds=" + " ".join(sorted(os.listdir("/proc/self/fd"))))
+print("|".join(results))
+"#
+    );
+    let Some(stdout) = run_python(sandbox.as_ref(), &mut fixture, test, &script).await else {
+        return;
+    };
+    assert_eq!(
+        stdout,
+        "env=http://127.0.0.1:3128,http://127.0.0.1:3128|allowed=200:origin|subdomain-denied=403|\
+         unlisted=403|ip-literal=403|direct=blocked|rebind=blocked|fds=0 1 2 3"
+    );
+    assert_eq!(
+        served.await.expect("origin task"),
+        1,
+        "origin saw unexpected connections"
+    );
+
+    let output_dir = fixture.spec.workspace.join(&fixture.spec.log_dir);
+    let invocation = std::fs::read_dir(&output_dir)
+        .expect("log directory")
+        .next()
+        .expect("invocation directory")
+        .expect("read log directory")
+        .path();
+    let output = ProcessOutput {
+        status: ProcessStatus::Exited(0),
+        stdout_path: invocation.join("stdout.log"),
+        stderr_path: invocation.join("stderr.log"),
+    };
+    let records = proxy_records(&output);
+    let close = records
+        .iter()
+        .find(|record| record["event"] == "close")
+        .unwrap_or_else(|| panic!("no close record: {records:#?}"));
+    assert_eq!(close["host"], "allowed.test");
+    assert!(
+        close["bytes_from_upstream"].as_u64().unwrap_or(0) > 0,
+        "{close}"
+    );
+    let decisions: Vec<(String, String)> = records
+        .iter()
+        .filter(|record| record["event"] == "request")
+        .map(|record| {
+            (
+                record["host"].as_str().unwrap_or("").to_owned(),
+                record["decision"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        decisions,
+        [
+            ("allowed.test".to_owned(), "allowed".to_owned()),
+            ("blocked.allowed.test".to_owned(), "denied".to_owned()),
+            ("example.org".to_owned(), "denied".to_owned()),
+            ("127.0.0.1".to_owned(), "denied".to_owned()),
+        ],
+        "{records:#?}"
+    );
+    // The recorded environment shows the proxy configuration.
+    let env: String = rusqlite::Connection::open(&fixture.db_path)
+        .expect("open raw database")
+        .query_row("SELECT env FROM tool_invocation", [], |row| row.get(0))
+        .expect("recorded env");
+    assert!(
+        env.contains("\"https_proxy\":\"http://127.0.0.1:3128\""),
+        "{env}"
+    );
+}
+
+#[tokio::test]
+async fn networked_missing_program_is_an_ordinary_exit_127() {
+    let test = "networked_missing_program_is_an_ordinary_exit_127";
+    let Some(sandbox) = bwrap(test).await else {
+        return;
+    };
+    // The bootstrap succeeds, so a missing workload is the shell's exit 127
+    // (as offline), not a proxy setup failure, and makes no proxy requests.
+    let mut fixture = Fixture::new("").await;
+    fixture.spec.network = NetworkAccess::Allowlist(loopback_policy(9));
+    fixture.spec.program = "/nonexistent/program".into();
+    fixture.spec.args.clear();
+    let output = sandbox
+        .run(&fixture.spec)
+        .await
+        .expect("run missing program");
+    assert_eq!(output.status, ProcessStatus::Exited(127));
+    assert!(proxy_records(&output).is_empty());
+}
+
+/// Live smoke test: `cargo metadata` resolves a crates.io dependency through
+/// the proxy with the default allowlist. Needs internet access, so it runs
+/// only when `ROB_NETWORK_TESTS=1`; `ROB_REQUIRE_BWRAP=1` alone does not
+/// enable it.
+#[tokio::test]
+async fn cargo_metadata_reaches_crates_io_through_the_proxy() {
+    let test = "cargo_metadata_reaches_crates_io_through_the_proxy";
+    if std::env::var_os("ROB_NETWORK_TESTS").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED {test}: set ROB_NETWORK_TESTS=1 to run tests that need internet access"
+        );
+        return;
+    }
+    let Some(sandbox) = bwrap(test).await else {
+        return;
+    };
+    if !Path::new("/usr/bin/cargo").exists() {
+        skip(test, "/usr/bin/cargo is required for the proxy smoke test");
+        return;
+    }
+    let mut fixture = Fixture::new("").await;
+    std::fs::create_dir(fixture.spec.source.join("src")).expect("create src");
+    std::fs::write(fixture.spec.source.join("src/lib.rs"), "").expect("write lib.rs");
+    std::fs::write(
+        fixture.spec.source.join("Cargo.toml"),
+        "[package]\nname = \"smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\nitoa = \"=1.0.11\"\n",
+    )
+    .expect("write manifest");
+    // A committed lockfile lets cargo work against the read-only source.
+    std::fs::write(
+        fixture.spec.source.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"itoa\"\nversion = \"1.0.11\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+         checksum = \"49f1f14873335454500d59611f1cf4a4b0f786f9ac11f4312a78e4cf2566695b\"\n\n\
+         [[package]]\nname = \"smoke\"\nversion = \"0.1.0\"\ndependencies = [\n \"itoa\",\n]\n",
+    )
+    .expect("write lockfile");
+    fixture.spec.program = "/usr/bin/cargo".into();
+    fixture.spec.args = ["metadata", "--format-version", "1", "--locked"]
+        .map(String::from)
+        .to_vec();
+    fixture.spec.timeout = Duration::from_secs(180);
+    fixture.spec.network = NetworkAccess::Allowlist(ProxyPolicy::default());
+    let output = sandbox
+        .run(&fixture.spec)
+        .await
+        .expect("run cargo metadata");
+    let stdout = std::fs::read_to_string(&output.stdout_path).unwrap_or_default();
+    let stderr = std::fs::read_to_string(&output.stderr_path).unwrap_or_default();
+    assert!(
+        matches!(output.status, ProcessStatus::Exited(0)) && stdout.contains("\"name\":\"itoa\""),
+        "cargo metadata failed: {:?}\nstderr: {stderr}",
+        output.status
+    );
+    let records = proxy_records(&output);
+    let hosts: std::collections::BTreeSet<&str> = records
+        .iter()
+        .filter(|record| record["event"] == "request")
+        .map(|record| {
+            assert_eq!(record["decision"], "allowed", "{record}");
+            record["host"].as_str().expect("host")
+        })
+        .collect();
+    assert!(
+        hosts.iter().all(|host| host.ends_with("crates.io")),
+        "cargo reached hosts outside crates.io: {hosts:?}"
+    );
+    assert!(hosts.contains("index.crates.io"), "{hosts:?}");
+    let closes = records
+        .iter()
+        .filter(|record| record["event"] == "close")
+        .count();
+    assert_eq!(
+        closes,
+        records.len() - closes,
+        "every forwarded connection is logged when it closes: {records:#?}"
+    );
+    let _ = writeln!(
+        std::io::stderr(),
+        "{test}: proxied hosts {hosts:?}, {} log records",
+        records.len()
+    );
+}
+
 #[tokio::test]
 async fn timeout_terminates_the_command() {
     let Some(sandbox) = bwrap("timeout_terminates_the_command").await else {
@@ -912,13 +1187,15 @@ async fn timeout_terminates_the_command() {
 }
 
 #[tokio::test]
-async fn allowlist_is_rejected_before_launch_until_proxy_exists() {
-    let Some(sandbox) = bwrap("allowlist_is_rejected_before_launch_until_proxy_exists").await
-    else {
+async fn invalid_network_policy_is_rejected_before_launch() {
+    let Some(sandbox) = bwrap("invalid_network_policy_is_rejected_before_launch").await else {
         return;
     };
     let mut fixture = Fixture::new("printf ROB_UNEXPECTED_LAUNCH_MARKER").await;
-    fixture.spec.network = NetworkAccess::Allowlist;
+    fixture.spec.network = NetworkAccess::Allowlist(ProxyPolicy {
+        max_connections: 0,
+        ..ProxyPolicy::default()
+    });
     // The nonexistent program checks validation order; the real shell checks
     // that a runnable command cannot execute under the rejected policy.
     for program in [
@@ -927,15 +1204,12 @@ async fn allowlist_is_rejected_before_launch_until_proxy_exists() {
     ] {
         fixture.spec.program = program;
         let error = match sandbox.run(&fixture.spec).await {
-            Ok(_) => panic!("allowlist networking must fail closed before proxy support exists"),
+            Ok(_) => panic!("an invalid proxy policy must fail closed before launch"),
             Err(error) => error,
         };
-        let message = error.to_string().to_lowercase();
         assert!(
-            message.contains("network")
-                || message.contains("allowlist")
-                || message.contains("proxy"),
-            "expected explicit network-policy error, got: {error}"
+            matches!(&error, SandboxError::InvalidCommand(message) if message.contains("proxy")),
+            "expected an explicit proxy-policy error, got: {error}"
         );
     }
     tokio::time::sleep(Duration::from_millis(250)).await;

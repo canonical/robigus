@@ -1,12 +1,12 @@
 # robigus — Phase 1 Implementation Plan
 
-Status: in progress — M1 work packages are implemented, and the required CI gate (build/lint/test, MSRV, deny, and the strict unprivileged sandbox job on `ubuntu-26.04`) has passed remotely on the `phase-1-testing` PR. The public API is fully documented, and a workspace `README.md` covers both crates. The one remaining M1 acceptance item is observing a successful run of the nightly fuzz workflow, which is triggered only from `main` (see §7). `analyze`, the proxy, expansion, and M2/M3 analysis remain unimplemented.
+Status: in progress — **M1 is complete**: every M1 work package meets its acceptance criteria, and the merge to `main`, push CI, and the nightly fuzz run have all passed. M2 has started: WP-2.1 (allowlist proxy) is implemented and verified locally. WP-2.6 (registry source input: a crate fetched from crates.io or a compatible sparse registry, including authenticated private registries) was added after M1 and is implemented and verified locally. `analyze`, the Cargo analyzer, expansion, and M3 remain unimplemented.
 Scope: v1 = Milestones M1–M3 (dependency graph analysis only)
 Normative reference: [`../AGENTS.md`](../AGENTS.md) — if this plan and the spec disagree, the spec wins.
 
 All paths are relative to the workspace root (the directory containing `Cargo.toml`, `rapt/`, and `robigus/`). The robigus crate lives in `robigus/`.
 
-Review baseline: local workspace tests, formatting, clippy, documentation, doctests, fuzz-target clippy, `cargo audit`, and `cargo deny check` passed on Rust 1.93.1. The strict sandbox suite (`ROB_REQUIRE_BWRAP=1`, run as an unprivileged user) passed 19 tests; its two ignored entries are subprocess helpers invoked by other tests. Remote PR CI passed, including the sandbox job. Remote push-to-`main` CI and scheduled fuzz results have not yet been observed.
+Review baseline: local workspace tests, formatting, clippy, documentation, doctests, fuzz-target clippy, `cargo audit`, and `cargo deny check` passed on Rust 1.93.1. The strict sandbox suite (`ROB_REQUIRE_BWRAP=1`, run as an unprivileged user) passed 22 tests; its two ignored entries are subprocess helpers invoked by other tests. With `ROB_NETWORK_TESTS=1` the live proxy smoke test also passed. Remote PR CI, push-to-`main` CI, and the nightly fuzz run passed for M1; WP-2.1 has not yet run in CI.
 
 ---
 
@@ -14,7 +14,7 @@ Review baseline: local workspace tests, formatting, clippy, documentation, docte
 
 Phase 1 delivers a pure-async Rust library plus the `tsp-analyzer` CLI that can:
 
-1. fetch a target software project (git URL, tarball URL, or local path) into a content-addressed cache with safe extraction;
+1. fetch a target software project (git URL, tarball URL, local path, or a published crate from crates.io or a compatible sparse registry, public or authenticated) into a content-addressed cache with safe extraction;
 2. detect languages/build systems and select analyzers;
 3. discover the complete transitive dependency graph for Rust/Cargo projects and the C/C++/assembly they use, recording predicates, evidence, and confidence;
 4. persist that graph to a one-analysis-per-database SQLite store with resumable, per-node analysis status;
@@ -53,6 +53,9 @@ flowchart TD
     WP13 --> WP22[WP-2.2 Cargo analyzer]
     WP14 --> WP22
     WP15 --> WP22
+    WP15 --> WP26[WP-2.6 Registry source input and auth]
+    WP18 --> WP26
+    WP26 --> WP22
     WP21 --> WP22
     WP22 --> WP23[WP-2.3 Expansion engine]
     WP23 --> WP24[WP-2.4 Fixtures and snapshots]
@@ -90,7 +93,8 @@ gantt
     M1 complete                         :milestone, 2026-12-03, 0d
     section M2 Rust analysis
     WP-2.1 Allowlist proxy              :m21, 2026-12-03, 4d
-    WP-2.2 Cargo analyzer               :m22, 2026-12-09, 5d
+    WP-2.6 Registry input and auth      :m26, 2026-12-07, 5d
+    WP-2.2 Cargo analyzer               :m22, 2026-12-14, 5d
     WP-2.3 Expansion engine             :m23, 2026-12-16, 5d
     WP-2.4 Fixtures and snapshots       :m24, 2026-12-16, 3d
     WP-2.5 analyze end-to-end           :m25, 2026-12-23, 2d
@@ -119,7 +123,7 @@ Goal (spec §21): predicate AST and parser (including `cfg` atoms), model extens
 Tasks:
 
 - [x] `robigus/Cargo.toml`: add `description`, `license = "GPL-3.0-only"`, `repository`, `keywords`, `categories`, `rust-version = "1.93.1"`.
-- [x] Workspace `Cargo.toml`: add shared deps — `petgraph`, `rusqlite` (bundled), `rusqlite_migration`, `tracing`, `tracing-subscriber`, `miette`, `sha2`, `tar`, `zstd`, `walkdir`, `ignore`, `toml`, `gix`, `cargo_metadata`, `toml_edit`; dev-deps `insta`, `proptest`, `wiremock`. (`reqwest`, `clap`, `flate2`, `xz2`, `chrono`, `regex`, `serde*`, `thiserror`, `tokio`, `ubuntu-info-rust` already exist.)
+- [x] Workspace `Cargo.toml`: add shared deps — `petgraph`, `rusqlite` (bundled), `rusqlite_migration`, `tracing`, `tracing-subscriber`, `miette`, `sha2`, `tar`, `zstd`, `walkdir`, `ignore`, `toml`, `gix`, `cargo_metadata`, `toml_edit`; dev-deps `insta`, `proptest`, `wiremock`. (`reqwest`, `clap`, `flate2`, `xz2`, `regex`, `serde*`, `thiserror`, `tokio`, `ubuntu-info-rust` already exist. `chrono` was later replaced by `jiff` after RUSTSEC-2026-0543 reported it unmaintained.)
 - [x] Add `deny.toml` and a `cargo deny` CI job (licenses must accept GPL-3.0-only family; advisories on).
 - [x] Repository-level `SECURITY.md` covers the workspace; `robigus/SECURITY.md` gives robigus its own reporting path and sandbox scope (spec §17 updated accordingly).
 - [x] CI: MSRV job pinned to 1.93.1, build/test triggers for pushes to `main` and PRs targeting `main`, a separate doctest step, a required unprivileged sandbox job, and a scheduled/manual nightly fuzz workflow (predicate and dpkg targets; the stale missing-target success fallback is removed).
@@ -212,7 +216,7 @@ Tasks:
 
 - [x] `SourceInput` dispatch: Git (via `gix` in `spawn_blocking`; record resolved commit; honor locked rev), Tarball (download via `reqwest`; verify a user/config-supplied digest, otherwise record SHA-256 with provenance `unverified`), Path (tree digest; analyze in place, read-only).
 - [x] Content-addressed cache `cache/<kind>/<digest>` with XDG-cache default (lock-free, spec §22.27) — done; the `--cache <PATH>` flag lands with the CLI (WP-1.8).
-- [x] Registry helper for WP-2.2: sparse-index lookup + `static.crates.io` download + **mandatory** checksum verification against the index `cksum`.
+- [x] Registry helper (`RegistryClient`) for WP-2.2: sparse-index lookup, `config.json` `dl` resolution (per-record `dl` overrides honored) + **mandatory** checksum verification against the index `cksum`; yanked versions refused. It is a library helper only: it is not a `SourceInput`, does not extract or cache, and the CLI cannot reach it.
 - [x] Safe tar extraction (`tar` + `flate2`/`xz2`/`zstd`): reject absolute paths, `..` components, symlink/hardlink targets escaping the destination, device nodes, setuid/setgid entries; enforce entry-count and total-uncompressed-size limits; never execute anything.
 - [x] `FetchOptions`: `DownloadLimits` (connect/request timeouts, streamed size cap) for tarballs and the registry client; `GitOptions` (wall-clock timeout, submodule depth/count limits, submodule URL scheme allowlist, `https` by default); git checkouts held to the extraction limits.
 - [x] Git submodules checked out recursively at the superproject's pinned commits (spec §7.2, §22.24); `FetchedSource::source_id()` pins `precise` to the digest.
@@ -220,7 +224,9 @@ Tasks:
 
 Tests: malicious-tarball fixtures (traversal, absolute path, escaping symlink, device node, setuid, gzip bomb, entry-count overflow); digest verify/mismatch; cache hit/miss; download size cap and timeout; local-repository git fixtures (default and non-default branch, pinned submodule, scheme restriction, `update = none`, checkout limits).
 
-Cache trust model (spec §7.2): the cache is trusted local state owned by the invoking user; digests are verified on install, and hits are not re-verified, so a cache must not be shared with less-trusted users. Deferred to WP-2.2: the registry helper rejects yanked releases, including potentially lockfile-pinned versions; decide and test the Cargo-compatible behavior there.
+Cache trust model (spec §7.2): the cache is trusted local state owned by the invoking user; digests are verified on install, and hits are not re-verified, so a cache must not be shared with less-trusted users. Deferred to WP-2.2: the registry helper rejects yanked releases, including potentially lockfile-pinned versions; decide and test the Cargo-compatible behavior there. (WP-2.6 sets the policy for an explicitly requested version: refused unless `--allow-yanked`.)
+
+**Revision (post-M1): registry source input.** WP-1.5 delivered three `SourceInput` variants (Git, Tarball, Path). A fourth — a published crate version fetched from crates.io or any registry implementing the same sparse-index protocol — is now required, so a published crate can be analyzed as the target project without first locating its repository or tarball. It is planned as **WP-2.6** rather than reopening WP-1.5, because M1 is accepted and merged. WP-2.6 reuses this package's `RegistryClient`, safe extraction, cache, and `DownloadLimits`, fixes the defects found in review (index-path casing, download-URL markers, per-record `dl` overrides, unrestricted redirects), and adds registry authentication. WP-1.5's acceptance is unchanged.
 
 Acceptance: every §7.2 hardening rule has a passing test.
 
@@ -258,7 +264,7 @@ Isolation boundary (implemented and tested as an unprivileged user):
 
 Host requirement: bubblewrap ≥ 0.11 (first release with `--overlay-src`/`--ro-overlay`), i.e. Ubuntu 26.04 or later. Ubuntu 24.04 ships 0.9.0 and is unsupported; the probe checks `bwrap --version` first and reports an actionable `SandboxUnavailable` cause instead of an unknown-option failure.
 
-Named Unix sockets are unavailable inside the sandbox. Cgroup/process resource limits remain WP-3.5; allowlisted networking needs an explicit proxy transport (WP-2.1). Informational: a workload can read bubblewrap's command line, which includes absolute host paths of the source and log directories (no file contents).
+Named Unix sockets are unavailable inside the sandbox. Cgroup/process resource limits remain WP-3.5; allowlisted networking is provided by WP-2.1. Informational: a workload can read bubblewrap's command line, which includes absolute host paths of the source and log directories (no file contents).
 
 `SandboxUnavailable` reports backend probing failures; after selection, `SandboxError::BwrapSetup` reports bubblewrap launch, setup, or supervision failures with the stderr log. A missing completion report does not prove the command never ran. Bubblewrap's completion protocol requires a shell wrapper to restore stdin: a missing requested executable is reported as exit 127, and command signals are encoded as 128 + signal. Command cancellation terminates the child and leaves its pre-launch invocation marked `running`, indicating an interrupted execution. The canonical sandbox working directory is now recorded as `PWD`; non-UTF-8 working directories are rejected before launch.
 
@@ -267,7 +273,7 @@ Tasks:
 - [x] `Sandbox` trait, `SandboxMode { Bwrap, Native }`, `SandboxPreference { Auto, Bwrap, Native }`, `CommandSpec`, `ProcessOutput`.
 - [x] `establish_sandbox` fail-closed: probe `bwrap`, unprivileged user namespaces, and the full isolation policy; collect `Attempted { mechanism, cause }` for every mechanism tried; `SandboxUnavailable` carries the full list (drives exit 4 and the `no sandbox available` diagnostic).
 - [x] bwrap backend: read-only source overlay, writable tmpfs for output **and** `CARGO_HOME`, `--unshare-net` by default, `--die-with-parent`, `--new-session`, minimal `/dev` and `/proc`, plus the seccomp and descriptor controls above.
-- [x] Network-enabled sandbox requests fail explicitly until the proxy exists (WP-2.1); no unproxied IP egress fallback is provided.
+- [x] Network-enabled sandbox requests fail explicitly until the proxy exists (WP-2.1); no unproxied IP egress fallback is provided. (Superseded by WP-2.1: `NetworkAccess::Allowlist(ProxyPolicy)` now runs through the proxy.)
 - [x] Wall-clock timeouts (tokio timer + kill); stdout/stderr captured to workspace logs; environment scrubbed; `tool_invocation` recorded for every execution.
 - [x] Crate-root `#![forbid(unsafe_code)]`; the native backend (M3) is the only scoped exception.
 
@@ -318,18 +324,153 @@ Goal (spec §21): Cargo analyzer (sandboxed `cargo metadata` with allowlisted ne
 
 **Spec refs:** §10.2, §7.6 (LLM endpoint allowlisting), §16.
 
-Files: `robigus/src/sandbox/proxy.rs`, `robigus/src/config.rs`.
+Files: `robigus/src/sandbox/proxy/{mod,policy,server,tls}.rs`, `robigus/src/sandbox.rs` (transport and wiring), `robigus/src/cli.rs` (`[network]` configuration; the plan's separate `config.rs` was not needed).
+
+Transport (spec decision 29): the sandbox keeps its own network namespace. A fixed bootstrap (`/usr/bin/python3 -I -S`) binds `127.0.0.1:3128` inside it and passes the listening socket to robigus over a private `SOCK_SEQPACKET` socketpair mapped to fd 4; the sandbox shell then closes fd 4 and `exec`s the workload, which holds neither the control socket nor the listener. robigus validates the received descriptor (one listening IPv4 TCP socket bound to the proxy address) and serves it until the sandbox exits, then gives in-flight connections a 2-second drain to log their close. Setup failures (bootstrap error, timeout, early exit) are `SandboxError::BwrapSetup` and the workload never starts.
 
 Tasks:
 
-- [ ] In-process tokio listener on the host side, exposed to the sandbox through proxy env vars (`HTTP_PROXY`/`HTTPS_PROXY`); direct egress blocked by the network namespace. Design and test an explicit sandbox-to-proxy transport: proxy variables alone do not make a host listener reachable from an isolated network namespace.
-- [ ] Define and enforce HTTP `Host`, HTTPS `CONNECT` authority, and TLS SNI validation separately, including malformed requests and mismatches. Allowed → blind TCP passthrough (no MITM; TLS stays end-to-end); denied → close + log. Account for cases where SNI is absent or unavailable.
-- [ ] Default allowlist: `crates.io`, `ubuntu.com`, `github.com`, `gitlab.com`, `codeberg.org` subdomains; `[network] allow/deny` config overrides; `--offline` disables egress entirely.
-- [ ] Request logging via `tracing` to a workspace log file.
+- [x] In-process tokio proxy serving a listener created inside the sandbox's network namespace; `http_proxy`/`https_proxy`/uppercase forms/`CARGO_HTTP_PROXY` point at it, and callers cannot override them. Direct egress stays impossible (no route off the host); the seccomp policy is unchanged. `/etc/ssl/certs` is added read-only for network-enabled runs.
+- [x] Request policy: HTTP/1.x `CONNECT` and absolute-form `GET`/`HEAD` `http://` only; literal DNS names only (IP literals and numeric names `403`); allowlist and port checks (default 80, 443); `Host` must match the target (required for HTTP; checked on `CONNECT` when present; duplicates refused); bodies, other methods, origin-form and `https://` without `CONNECT` refused. For `CONNECT`, robigus connects upstream first (`502`/`504` on failure), then requires a well-formed ClientHello whose SNI equals the `CONNECT` host; missing SNI, mismatched SNI, or non-TLS bytes close the tunnel before any client byte is forwarded. Allowed tunnels are relayed blindly (no MITM). Plain HTTP is forwarded in origin form without hop-by-hop/`Proxy-*` headers, one request per connection.
+- [x] Host-side resolution refuses any name resolving to a non-public address (loopback, private, shared, link-local/metadata, unique-local, multicast, NAT64, ...); `ProxyPolicy::resolve` pins trusted addresses.
+- [x] Default allowlist (`DEFAULT_ALLOWLIST`) with subdomain matching on label boundaries; `[network] allowlist` replaces, `allow` adds, `deny` removes (denial wins). `NetworkConfig::proxy_policy` validates entries as `HostName`s at config load. `--offline` maps to `NetworkAccess::Offline` once `analyze` lands (WP-2.3).
+- [x] Logging: `proxy.jsonl` in the invocation's log directory (`request` record with decision/status/reason; `close` record with byte counts and duration), mirrored as `tracing` events under `robigus::proxy`. Client-supplied text is bounded and control characters replaced.
 
-Tests: `wiremock` allowed/denied hosts; log assertions; smoke test running `cargo metadata` through the proxy inside the sandbox.
+Tests: TLS ClientHello parser unit tests (fragmented records, missing SNI, malformed/duplicate extensions, truncation and corruption sweeps); request parsing/policy unit tests; host-name, allowlist and address-classification tests; in-process proxy tests with `wiremock` and an echo origin (allowed HTTP forwarding and header stripping, denials without upstream contact, non-public resolution, matching/mismatched/missing SNI with byte-level forwarding checks, upstream failure and header timeout, log assertions); sandbox integration tests (`allowlisted_network_is_mediated_by_the_proxy`: allowed, subdomain-denied, unlisted, IP-literal, direct-connection and port-takeover cases, descriptor isolation, recorded environment; `networked_missing_program_is_an_ordinary_exit_127`; `invalid_network_policy_is_rejected_before_launch`); live smoke test `cargo_metadata_reaches_crates_io_through_the_proxy`, enabled with `ROB_NETWORK_TESTS=1`.
 
-Acceptance: §10.2 network rules enforced; cargo reaches crates.io through the proxy and nothing else.
+Acceptance: §10.2 network rules enforced and verified locally as an unprivileged user (strict suite: 22 passed). The live smoke test passed locally: `cargo metadata --locked` resolved a crates.io dependency through the proxy, contacting only `index.crates.io` and `static.crates.io`. CI does not run the live test (it needs internet access); consider enabling `ROB_NETWORK_TESTS=1` in the sandbox job. Residual risks: domain fronting inside TLS, and exfiltration to allowlisted hosts (documented in `robigus/SECURITY.md`).
+
+### WP-2.6 — Registry source input and authentication (L, ~5d)
+
+**Spec refs:** §7.1, §7.2, §8.1, §10.2, §14, §15, §17. The spec is amended first (see the first task). Numbered 2.6 because it was added after M2 was planned; it is scheduled before WP-2.2, which reuses its registry client and identity rules.
+
+Files: `robigus/src/fetch.rs` (or `robigus/src/fetch/registry.rs` if it grows), `robigus/src/credentials.rs` (new), `robigus/src/commands/fetch.rs`, `robigus/src/cli.rs` (`[registries]` config), `robigus/AGENTS.md`, `robigus/SECURITY.md`, `README.md`.
+
+Goal: a `SourceInput` that names an exact crate version in a Cargo-compatible **sparse** registry: crates.io by default, or a private registry that serves the same index and `.crate` formats, with or without authentication. The `.crate` is downloaded, verified against the index checksum, extracted safely into the cache, and analyzed as the TSP. crates.io is the primary target; authenticated private registries are fully supported in v1 and designed in from the start rather than added later.
+
+References: Cargo's [index format](https://doc.rust-lang.org/cargo/reference/registry-index.html), [registry authentication](https://doc.rust-lang.org/cargo/reference/registry-authentication.html) and [credential provider protocol](https://doc.rust-lang.org/cargo/reference/credential-provider-protocol.html).
+
+#### Current state (gap analysis against the WP-1.5 helper)
+
+- `RegistryClient` already provides sparse-index lookup, `config.json` `dl` resolution, mandatory checksum verification, yanked-version refusal, and `DownloadLimits`. It is unused outside tests and has no `SourceInput`, cache, CLI, offline path, or authentication.
+- `SourceKind::CargoRegistry { index_url }` already exists, and the store persists and reconstructs it (`cargo-registry`). No new kind or schema migration is needed.
+- Defects to fix:
+  - **Index paths are not lowercased.** Sparse index file paths use the lowercased name (`index.crates.io/it/oa/Itoa` returns 404).
+  - **Download URLs follow crates.io's layout, not the protocol.** When `config.json`'s `dl` has no markers, the protocol appends `/{crate}/{version}/download`; the helper appends `{name}/{name}-{version}.crate`. Only `{crate}` and `{version}` are substituted; `{prefix}`, `{lowerprefix}` and `{sha256-checksum}` are not.
+  - **Per-record `dl` overrides.** `IndexRecord.dl` lets one index line redirect a download anywhere. It is not part of the documented format; remove it.
+  - **One bad line fails every lookup.** Any unparsable line aborts the search, even for other versions.
+  - **The checksum's format is not validated** before comparison.
+  - **Redirects are unrestricted.** The shared HTTP client uses reqwest's default policy (10 redirects, any host, HTTPS-to-HTTP downgrade allowed). This also affects tarball downloads.
+
+#### Design decisions
+
+**Source input**
+
+- **Variant:** `SourceInput::Registry { registry: RegistrySpec, name: String, version: semver::Version, digest: Option<String> }`. `RegistrySpec` holds the normalized index URL and, when chosen by name, the configured registry name (used for credential lookup and diagnostics, never for identity).
+- **Exact versions only.** Requirement operators (`^`, `~`, `>=`, `*`) and "latest" are rejected: analyses must be reproducible.
+- **Version matching ignores build metadata**, as the index format requires: each version appears once ignoring build metadata. Two records for the requested version that differ only in build metadata make the index malformed for that crate. The record's own `vers` is reported.
+- **Name matching follows the index format.** The index file path uses the lowercased name; the name in a record is matched case-insensitively and reported as the index spells it. `-` and `_` are *not* interchangeable (that is a crates.io publishing rule, and `foo-bar` and `foo_bar` are different index files). When a name is not found, the error suggests the other spelling.
+- **Name validation:** ASCII alphanumerics, `-` and `_`, starting with a letter, at most 64 characters (crates.io's rules). Names outside these rules are refused with a clear message.
+- **`digest`** is an optional expected SHA-256. It must equal the index `cksum`, and it enables offline cache hits, as for tarballs.
+
+**Registries and identity**
+
+- **Sparse protocol only.** Index URLs must be `sparse+https://…`. A bare `https://…` URL is, in Cargo, a **git** index, so it is rejected with a hint that it looks like a git index and to use the registry's sparse URL. Git-protocol indexes are not supported in v1: they require cloning the whole index repository.
+- **Normalization:** strip `sparse+`, lowercase the scheme and host, drop a default port, add a trailing slash, and reject userinfo, a query or a fragment. Production URLs must be `https`. Plain `http` is accepted only through a library-only option (`RegistryOptions::allow_insecure_http`, for tests); there is no CLI flag or config key.
+- **Single crates.io identity:** crates.io is always `https://index.crates.io/`. The legacy git URL `https://github.com/rust-lang/crates.io-index` (as `registry+…` or bare, as Cargo writes it in `Cargo.lock` and `cargo metadata`) is mapped to it everywhere: source input, store identity, and WP-2.2's dependency mapping. Cargo makes the same substitution internally.
+- **Package identity:** a registry package's `SourceId` is `CargoRegistry { index_url }` with `precise` set to the `.crate` checksum. This holds for fetched roots and for dependencies (WP-2.2 reads the checksum from `Cargo.lock`), so a crate that is both the root and a dependency is one node.
+- **Default and named registries:** with no registry given, the index is crates.io. `[registries.<name>] index = "sparse+https://…"` in robigus's own config (Cargo's syntax) defines named registries; `--registry <NAME>` selects one and `--index <URL>` gives one directly. Unknown names are usage errors. Cargo's own config files are never read.
+
+**Verification, caching and contents**
+
+- **Checksum:** `cksum` must be 64 hex characters; the `.crate` must match it (mandatory, spec §7.2). The result is `Provenance::Verified`. The index is trusted transport over TLS, as in Cargo; there is no signature to check.
+- **Yanked versions:** refused unless `--allow-yanked` is given. Then the fetch output reports `yanked: true`, and the flag is recorded in metadata options once `analyze` exists. This matches Cargo, which never resolves to a yanked version but allows one that is explicitly pinned.
+- **Cache:** `cache/crate/<cksum>`, separate from `cache/tarball/`. The cached tree is the `.crate`'s single top-level `<name>-<version>/` directory, which must exist and be the only top-level entry; anything else is an extraction error. (A `.crate` fetched as a tarball URL today caches the wrapper directory, so the two layouts must not share a key.) Identical bytes from two registries share one entry, with distinct `SourceKind`s.
+- **Contents:** the `.crate` is a gzip tarball and goes through the existing hardened `extract_tarball` and `ExtractionLimits` unchanged; nothing in it is executed. `Cargo.toml` (normalized), `Cargo.toml.orig` and `.cargo_vcs_info.json` are kept for later analysis.
+- **Offline:** `fetch_offline` serves a registry source only with a pinned checksum (`--sha256`) whose cache entry exists. The yanked state cannot be checked offline and is reported as unknown. Index caching is follow-up work.
+
+**Protocol robustness**
+
+- **Index lookups:** request `config.json` first (as Cargo does), then the index file. 404, 410 and 451 on the index file mean "crate not found". Malformed lines for *other* versions are skipped; records whose schema version `v` is above 2 are skipped, as Cargo does; a malformed or duplicate record for the requested version is an error. Unknown `config.json` fields are ignored.
+- **Download URL:** from `config.json`'s `dl` only. All five markers are supported (`{crate}`, `{version}`, `{prefix}`, `{lowerprefix}`, `{sha256-checksum}`); with no marker, `/{crate}/{version}/download` is appended. Name and version are percent-encoded where they are substituted.
+- **Redirects (all fetches):** at most 5, and never from `https` to `http`. Cross-host redirects are allowed, because registries use CDNs; credentials are never forwarded across hosts (see below). This also hardens tarball fetches.
+
+**Network policy**
+
+- Registry fetches run on the host, like git and tarball fetches, under `DownloadLimits`. They do not use the sandbox proxy, and `[network]` does not apply to them. Their hosts are those the user named.
+
+**Authentication**
+
+Threat model: the token is a long-lived secret that grants access to private source code. It must not leak to hosts other than its registry, into the database, exports, logs, error messages, the process list, the sandbox, or core dumps, and it must not be stored by robigus.
+
+- **When a token is used.** Only for registries whose `config.json` declares `"auth-required": true`, or that answer the unauthenticated `config.json` request with 401. In that case robigus obtains a token and retries `config.json` with it, as Cargo does. A token is never obtained, read or sent for registries that do not require one, including crates.io.
+- **Where tokens come from.** robigus stores no tokens and never writes credentials. Per registry, in robigus's config, `credential-provider` selects exactly one source:
+  - **Environment variable** (default for named registries): `ROBIGUS_REGISTRY_<NAME>_TOKEN`, where `<NAME>` is the registry name uppercased with `-` replaced by `_`. Intended for CI secret stores. The variable is read only when needed and never logged.
+  - **Credential process:** a command implementing Cargo's credential provider protocol (`{"v":[1]}` hello, then a `get`/`read` request with the registry's index URL), so existing providers work unchanged (for example `cargo-credential-libsecret` and `cargo-credential-1password`). The command is given as an argument vector in robigus's config, never through a shell. It runs with a cleared environment plus `PATH` and `HOME`, no inherited descriptors except stdio, a timeout, and a bounded response. Its stderr is passed to the user; its stdout is parsed as protocol messages and never logged. Responses with `cache: "never"` are not reused; `session` and `expires` are cached in memory only, for one robigus process, and dropped at expiry.
+  - **Token file:** a path named explicitly in config, for systems without a keyring. The file must be owned by the invoking user, be a regular file not reached through a symlink, and have no group or other permissions (mode `0600` or stricter); otherwise robigus refuses to read it. It holds the token on its first line.
+- **Never used:** `~/.cargo/credentials.toml`, Cargo config, `CARGO_REGISTRY_TOKEN` or `CARGO_REGISTRIES_*_TOKEN`, Cargo's built-in providers by name, `.netrc`, and tokens on the command line (which would appear in the process list and shell history). The `--index` flag never uses credentials, so an ad-hoc URL cannot receive a token meant for a named registry.
+- **Scoping.** A token is bound to its registry's index URL. It is sent as the `Authorization` header only to the index host and to the `dl` host from that registry's `config.json` when both use `https`. It is never sent on a cross-host redirect, an `http` request, or to any other host. Redirects to another host proceed without the header; if that fails, the error says so.
+- **In memory.** Tokens are held in a `RegistryToken` type that does not implement `Display`, `Serialize` or `Clone`; its `Debug` prints `RegistryToken(<redacted>)`; it is zeroed on drop with the `zeroize` crate (already in the tree through rustls). The header value is marked sensitive (`HeaderValue::set_sensitive`) so HTTP tracing omits it. Core dumps are disabled for the process while a token is held (`prctl(PR_SET_DUMPABLE, 0)` on Linux, through `rustix`).
+- **Never recorded.** Tokens and `Authorization` headers never appear in `FetchedSource`, the store, `tool_invocation`, exports, proxy logs, `tracing` output or error text. Error messages from registries and credential processes are bounded and passed through a filter that redacts the active token if a server echoes it.
+- **Not in the sandbox.** Tokens are used only by the host-side fetch. They are never placed in a sandbox environment, file or argument, and `cargo metadata` inside the sandbox receives none. Analyzing a project whose *dependencies* live in an authenticated registry therefore needs a design for in-sandbox authentication, recorded as a WP-2.2 follow-up; until then such dependencies stay declared-but-unresolved with a recorded reason.
+- **Diagnostics.** 401 and 403 produce distinct errors ("authentication required", "token rejected or lacks access"), naming the registry and the configured credential source but never the token. A `WWW-Authenticate: Cargo login_url="…"` value is shown so users know where to obtain a token. There is no retry loop.
+- **Maintenance.** Tokens are revoked and rotated at the registry and its credential provider, not in robigus; nothing robigus holds needs cleanup. `robigus/SECURITY.md` documents the supported sources, the recommendation to use a credential process or CI secret store over a token file, least-privilege read-only tokens, and rotation.
+
+**CLI**
+
+- `tsp-analyzer fetch crate:<name>@<version>` uses crates.io; `--registry <NAME>` or `--index <URL>` selects another registry; `--sha256` pins the checksum; `--allow-yanked` as above. The `crate:` prefix is recognized only when followed by a valid name, `@`, and an exact version; to fetch a local directory of that name, write `./crate:…`. `--branch`, `--tag` and `--rev` are usage errors with a registry source. `--format json` adds `name`, `version` and `yanked` (`true`, `false` or `null` when unknown offline).
+- Config: `[registries.<name>]` with `index` (required) and `credential-provider`, one of `{ env = true }` (default), `{ process = ["/path/to/provider", "--arg"] }`, or `{ file = "/path/to/token" }`. Validated at load: index URLs must be `sparse+https`, process paths must be absolute, and file paths must be absolute.
+
+#### Tasks
+
+- [x] **Spec amendment** (`robigus/AGENTS.md`): §1 and §7.1 (fourth input); §5.1 (registry identity); §6 (architecture diagram and acquisition component); §7.2 (redirect rule) with new §7.2.1 (registry sources) and §7.2.2 (registry authentication); §8.1 (registry identity, `Cargo.lock` checksums, authenticated dependencies); §10.2 (tokens never enter the sandbox); §11.2 (`source_precise` comment only; no schema change); §14 (source syntax, options table, `[registries]` configuration); §15 (`SourceInput::Registry`, `RegistrySpec`, token and HTTP API rules); §16 (registry, redirect and credential tests); §17 (credential handling); recorded decisions 30–34.
+- [x] **HTTP client:** a restricted redirect policy for all fetches (at most 5, no HTTPS-to-HTTP downgrade; `fetch::check_redirect`), and per-request `Authorization` only for in-scope hosts. reqwest strips `Authorization` whenever a redirect changes scheme, host or port.
+- [x] **Registry client fixes** (`robigus/src/registry.rs`, replacing the WP-1.5 helper in `fetch.rs`): lowercase index paths (also fixing two-character names, which live under `2/`, not `1/`); case-insensitive name matching without `-`/`_` folding; build-metadata-insensitive version matching; tolerant line parsing with skipping of `v > 2`; 404/410/451 handling; `cksum` validation; full `dl` markers and the no-marker default; removal of the per-record `dl` override; permissive `config.json` parsing; `auth-required` and 401 detection.
+- [x] **Index URL handling:** `registry::normalize_index_url` and `registry::crates_io_alias` (shared with WP-2.2).
+- [x] **Credentials module** (`robigus/src/credentials.rs`): `RegistryToken` (no `Display`/`Serialize`/`Clone`, redacted `Debug`, `zeroize` on drop, sensitive header value); environment, credential-process and token-file sources; in-memory caching per the provider's `cache` mode; core dumps disabled while a token exists (`PR_SET_DUMPABLE`); error redaction; token scoping to the index and `dl` hosts.
+- [x] **Source input:** `SourceInput::Registry(RegistrySource)` dispatch in `fetch` and `fetch_offline`; `fetch_registry` installs into `cache/crate/<cksum>` atomically after checking the single `<name>-<version>` directory. `FetchedSource::registry_crate` reports the name, version and yanked state as the index spells them.
+- [x] **CLI and config:** `crate:<name>@<version>`, `--registry`, `--index`, `--allow-yanked`, the `[registries]` table with validation at load, and the JSON `name`/`version`/`yanked` fields. Invalid registry sources are usage errors (exit 2).
+- [x] **Documentation:** rustdoc with examples; `README.md`, `robigus/SECURITY.md` (now in scope), and `fetch --help` / `--config` help.
+
+#### Tests
+
+- **Registry protocol (`wiremock`):** `dl` with and without markers and with each marker; mixed-case names and 1-, 2-, 3- and 4+-character index paths; `-`/`_` names are distinct and the error suggests the other spelling; build metadata; checksum mismatch and malformed `cksum`; malformed lines for other versions skipped, duplicate or malformed records for the requested version rejected; `v: 3` records skipped; 404/410/451; yanked refused and allowed; size caps and timeouts.
+- **Redirects:** HTTPS-to-HTTP downgrade refused; more than 5 hops refused; cross-host redirect allowed without `Authorization`; tarball fetches covered too.
+- **Authentication (`wiremock` with an auth-required registry):**
+  - 401 on `config.json` triggers token retrieval and a retried request with the header; `auth-required: true` is honoured; a public registry is never sent a token;
+  - the header reaches only the index host and the configured `dl` host, never a redirect target, other host, or `http` URL;
+  - 403 versus 401 diagnostics, and the `login_url` hint;
+  - each source: environment variable; credential process (hello, `get` request contents, `cache` modes and expiry, `url-not-supported`/`not-found`/`other` errors, timeout, oversized or malformed output, environment cleared); token file permission, owner and symlink checks;
+  - redaction: a canary token never appears in `Debug` output, errors (including a server that echoes it), `tracing` output, the store, `tool_invocation` or exports;
+  - `--index` never uses credentials; Cargo credential files and `CARGO_REGISTRIES_*` variables are ignored even when present.
+- **Archives:** a well-formed `.crate`; a missing, extra or misnamed top-level directory; every existing extraction-hardening fixture packaged as a `.crate`.
+- **Cache and offline:** a cache hit makes no requests; offline with `--sha256` hits; offline without a pin or with a cold cache gives `OfflineCacheMiss`; identical bytes from two registries share one entry.
+- **Identity:** `sparse+https://index.crates.io/`, `registry+https://github.com/rust-lang/crates.io-index` and the bare legacy URL all map to one identity; a registry `SourceId` round-trips through `upsert_node` and `load`.
+- **CLI:** `crate:` parsing (valid, missing version, `^1`, invalid names, conflicts with git flags), named registries, unknown names (exit 2), `[registries]` validation, JSON fields.
+- **Live, behind `ROB_NETWORK_TESTS=1`:** fetch `itoa@1.0.11` from crates.io and compare its digest with the known index checksum.
+
+#### Acceptance
+
+A published crate version can be fetched by name and exact version from crates.io, from a `wiremock` public sparse registry, and from a `wiremock` authenticated registry using each credential source. Archives are checksum-verified, extracted with the full §7.2 hardening, cached by checksum, and served offline when pinned. Git-protocol and bare-URL registries fail with explicit diagnostics. No test observes a token outside the `Authorization` header of an in-scope request. The live crates.io test passes locally.
+
+**Status: met locally.** Tests: 21 `credentials` and `registry` unit tests, the `check_redirect` unit test, 21 integration tests in `robigus/tests/registry.rs` (including token redaction in errors and `Debug` output, scoping across redirects and `dl` hosts, and the live crates.io fetch with `ROB_NETWORK_TESTS=1`), the `tracing` redaction test in its own binary `robigus/tests/registry_tracing.rs` (registry requests are traced with their headers, and the token shows only as `Sensitive`), and CLI parsing and config tests.
+
+**Code-review fixes (applied):**
+- `RegistryClient::new` refuses credentials over plain HTTP. The only exception is the hidden test policy `IndexUrlPolicy::InsecureHttpWithCredentialsForTests`. The `*_with_policy` constructors are `#[doc(hidden)]`.
+- Credential-process tokens are deserialized directly into `Zeroizing` buffers. `Authorization` header values share one zeroizing buffer through `Bytes::from_owner`.
+- 401/403 diagnostics redact the token from a server-supplied `login_url`. URLs carrying userinfo are dropped, and the hint length is bounded.
+- Cache hits (online and offline) verify that the cached directory names the requested crate and version. A checksum belonging to another crate is an error.
+- Token files are opened component by component with `O_NOFOLLOW`, so symlinked directories are refused at open time. They are then checked with `fstat`, and FIFOs and devices are refused without blocking.
+- The core-dump guard is reference-counted under one lock and fails closed. It is held from before the token is read until the last copy drops.
+
+Regression tests cover each fix.
+
+Notes:
+- The mock registries use plain HTTP through the test-only policy, so the scheme part of token scoping is covered by unit tests rather than a TLS server.
+- Store and export redaction is structural: `FetchedSource` holds no token.
+- Zeroization is best effort, because the HTTP stack may copy header bytes into its own buffers.
+- Token files are supported on Linux only.
+- None of this has run in CI yet.
 
 ### WP-2.2 — Cargo analyzer (L, ~5d)
 
@@ -346,7 +487,9 @@ Tasks:
 - [ ] Use the existing `FeatureExpr` parser for `dep:foo` / `foo?/bar` in Cargo analysis; populate per-node `active_features` from the resolve graph.
 - [ ] `toml_edit` fallback for `--offline`: declared-but-unresolved edges (`to = None`), `Manifest` evidence, `network_mode = "offline"` in metadata, reduced confidence.
 - [ ] `build.rs` static scan (regex-based in M2; tree-sitter later): `cc`/`cxx`/`bindgen`/`pkg-config`/`cmake`/`meson` usage, `cargo:` directives, `links` key → `BuildScript`/`SourceScan` evidence at L2; discovered system requirements become unresolved edges.
-- [ ] Registry fetches via the WP-1.5 helper (checksum mandatory); git deps via `gix` at the locked rev; path deps with the containment rule — an escaping path dependency marks the node `Error`.
+- [ ] Registry fetches via the registry client as fixed in WP-2.6 (checksum mandatory); git deps via `gix` at the locked rev; path deps with the containment rule — an escaping path dependency marks the node `Error`.
+- [ ] Registry identity (WP-2.6 rules): map Cargo's `source` strings with WP-2.6's shared index-URL function — crates.io's legacy `registry+https://github.com/rust-lang/crates.io-index` becomes `https://index.crates.io/`, and `sparse+…` is normalized. Set each registry node's `precise` to its checksum from `Cargo.lock` (the `checksum` field), so a crate that is both the root and a dependency is one node. A registry dependency with no lockfile checksum, or from another git-protocol index, stays declared-but-unresolved with a recorded reason.
+- [ ] Dependencies in authenticated registries: WP-2.6 tokens never enter the sandbox, so `cargo metadata` cannot read such registries. Record these dependencies as declared-but-unresolved with a reason naming the registry, and design in-sandbox authentication (for example, the host-side proxy adding the `Authorization` header for that registry's hosts) as a separate follow-up.
 - [ ] Confidence mapping per the §5.3 ladder: Manifest+Lockfile agreement L4; Manifest alone L3; SourceScan L2; ToolOutput L3–L4.
 - [ ] Determinism: sorted everything.
 
@@ -516,8 +659,8 @@ Tests: fixture with a known divergence between methods.
 |---|---|---|
 | MSRV CI job (1.93.1) | WP-1.1 | Passed remotely on the PR |
 | `cargo deny` (licenses + advisories) | WP-1.1 | Passed remotely on the PR and locally |
-| Nightly fuzz CI job | WP-1.3 | Scheduled/manual workflow with predicate and dpkg targets. It now fails if no targets are found and uploads crash artifacts on failure. GitHub runs scheduled workflows only from the default branch, and `main` still carries the old workflow, so a run must be observed after merging (or started manually with `workflow_dispatch` against this branch). **Remaining M1 item** |
-| Sandbox-capable CI job | WP-1.7 | Required unprivileged `ROB_REQUIRE_BWRAP=1` job in the CI gate on `ubuntu-26.04` (bubblewrap ≥ 0.11, distribution `cargo`/`rustc`). Passed remotely |
+| Nightly fuzz CI job | WP-1.3 | Scheduled/manual workflow with predicate and dpkg targets; fails if no targets are found and uploads crash artifacts on failure. Passed remotely after the M1 merge |
+| Sandbox-capable CI job | WP-1.7, WP-2.1 | Required unprivileged `ROB_REQUIRE_BWRAP=1` job in the CI gate on `ubuntu-26.04` (bubblewrap ≥ 0.11, distribution `cargo`/`rustc`, `python3`). Passed remotely for M1. The live proxy test needs `ROB_NETWORK_TESTS=1`, which the job does not set yet |
 | Push-trigger CI | WP-1.1 | Build/test workflow triggers on pushes to `main` and PRs targeting `main` |
 | rustdoc with examples | each WP | Every public item in `robigus` and `rapt` is documented, and both crates enable `#![warn(missing_docs)]` (CI's `-D warnings` makes a gap a failure). Key entry points have doctests (graph, predicates, dpkg, features, store, export, detection, fetch, sandbox); new APIs must keep this up |
 | Workspace README | DoD | `README.md` at the workspace root gives an overview of both crates, a `tsp-analyzer` quickstart, library examples, sandbox host requirements, and the development workflow. Update it when `analyze` lands (M2) |
@@ -537,11 +680,11 @@ Tests: fixture with a known divergence between methods.
 | Store: migrations, round-trip, idempotent upsert | WP-1.4 |
 | Resume / status transitions | WP-2.3, WP-2.5 |
 | Limits → exit 5 | WP-2.3, WP-2.5 |
-| Extraction hardening | WP-1.5 |
+| Extraction hardening | WP-1.5, WP-2.6 (`.crate` archives) |
 | Path containment | WP-2.2 |
 | Sandbox escape / fail-closed | WP-1.7, WP-3.5 |
 | Integration (assert_cmd/predicates/tempfile) | WP-1.8, WP-2.5 |
-| HTTP mocking (wiremock) | WP-2.1, WP-3.6 |
+| HTTP mocking (wiremock) | WP-1.5, WP-2.1, WP-2.6 (sparse registry), WP-3.6 |
 | CI gates (fmt/clippy/doc/test/audit/deny/MSRV) | WP-1.1 |
 
 ## 9. PR slicing
@@ -558,8 +701,10 @@ Proposed slicing only, not a record of actual PRs or merge state; each eventual 
 | 6 | WP-1.6 detection | fixture tests |
 | 7 | WP-1.7 sandbox foundation | sandbox suite |
 | 8 | WP-1.8 CLI skeleton | integration tests |
-| 9 | WP-1.9 export | round-trip test; CI gate including the sandbox job green (observed); **M1 done** once a nightly fuzz run passes |
-| 10 | WP-2.1 proxy | wiremock tests |
+| 9 | WP-1.9 export | round-trip test; CI gate including the sandbox job green — **M1 done** |
+| 10 | WP-2.1 proxy | proxy unit/wiremock tests; sandbox proxy integration tests; live smoke test |
+| 10a | Spec amendment + WP-2.6 registry source input | registry wiremock and `.crate` hardening tests; redirect tests; CLI tests; live crates.io fetch |
+| 10b | WP-2.6 registry authentication | auth-required wiremock registry; credential-source tests; token redaction and scoping tests |
 | 11 | WP-2.2 cargo analyzer | snapshots |
 | 12 | WP-2.3 expansion + `analyze` + `print --why` | resume/limit tests |
 | 13 | WP-2.4 fixtures + WP-2.5 E2E | E2E green — **M2 done** |
@@ -577,8 +722,10 @@ Proposed slicing only, not a record of actual PRs or merge state; each eventual 
 | Host IPC through sandbox mounts or inherited state | Offline sandbox could reach host services | Mitigated | Private `nodev` overlays, seccomp socket/keyring policy, descriptor sanitation; regressions for sockets, FIFOs, descriptors and keyrings run in the required sandbox job |
 | Dpkg comparison/hash regressions | Hashed identities could behave incorrectly | Mitigated | UTF-8, `Eq`/`Hash`, differential, property, and fuzz-target coverage added; verify scheduled fuzz runs |
 | Local cache contents tampered after publication | Cache hit returned as verified despite modified contents | Low (trusted-cache policy) | Spec §7.2: the cache is user-owned trusted state and must not be shared with less-trusted users |
-| `cargo metadata` needs network + writable `CARGO_HOME` inside sandbox | Primary analyzer fails | Medium | WP-2.1 proxy + tmpfs `CARGO_HOME`; smoke test through proxy |
-| Proxy breaks cargo TLS | Analysis fails | Low | CONNECT passthrough after host validation — no MITM |
+| `cargo metadata` needs network + writable `CARGO_HOME` inside sandbox | Primary analyzer fails | Low (smoke test passes locally) | WP-2.1 proxy + tmpfs `CARGO_HOME`; live smoke test behind `ROB_NETWORK_TESTS=1` |
+| Proxy breaks cargo TLS | Analysis fails | Low | CONNECT passthrough after host and SNI validation — no MITM; CA bundle overlaid read-only |
+| Domain fronting or exfiltration through allowlisted hosts | Data leaves via a permitted endpoint | Medium | Documented residual risk; narrow `[network]` for untrusted analyses; every request logged |
+| Host lacks `/usr/bin/python3` | Network-enabled analysis unavailable | Low on Ubuntu | Fails closed with `SandboxError::NetworkUnavailable`; offline analysis unaffected |
 | `ON CONFLICT` vs partial unique indexes | Duplicate edges | Medium | Merge in Rust on constraint violation (WP-1.4) |
 | insta snapshot churn across environments | CI flakiness | Medium | Redactions from day one (WP-2.4); review checklist |
 | petgraph graph not serializable | Data loss on load | None by design | Store is source of truth; `load()` rebuilds the graph |
@@ -588,17 +735,24 @@ Proposed slicing only, not a record of actual PRs or merge state; each eventual 
 | CI runner lacks namespace support or a new enough bubblewrap | Sandbox job fails | Low on `ubuntu-26.04` (observed on `ubuntu-24.04`; resolved) | The required job sets `ROB_REQUIRE_BWRAP=1`, so missing support fails rather than skips; pinned to `ubuntu-26.04` with a bubblewrap ≥ 0.11 check; AppArmor restriction lifted only on the disposable VM |
 | Host bubblewrap older than 0.11 (e.g. Ubuntu 24.04's 0.9.0) | Tool unusable on that host | Medium on LTS installs | Fail closed with an explicit version diagnostic; document the requirement; the native backend (WP-3.5) is the long-term fallback |
 | Regex-based `build.rs` analysis false positives | Wrong edges | Medium | L2 confidence cap; build observation (WP-3.4) cross-checks |
+| Private registries differ from crates.io (download-URL markers, index casing, extra `config.json` fields) | Registry fetches fail or hit the wrong URL | Medium | Implement the registry protocol's full `dl` rules, not crates.io's layout (WP-2.6); `wiremock` registries for each `dl` form; permissive `config.json` parsing |
+| Registry token leaks (logs, errors, store, exports, other hosts, sandbox, core dumps) | Exposure of private source code | Medium without controls | WP-2.6 design: no token storage; per-registry host scoping; no forwarding on redirects or `http`; redacted `RegistryToken` zeroed on drop; core dumps disabled; tokens never enter the sandbox; canary-token tests across every output |
+| Credential process misbehaves or hangs | Fetch blocks or leaks environment | Low | Argument vector without a shell; cleared environment; timeout; bounded output; stdout never logged |
+| Dependencies hosted in authenticated registries | `cargo metadata` in the sandbox cannot resolve them | Medium for private-registry users | Recorded as declared-but-unresolved with a reason; in-sandbox authentication designed as a WP-2.2 follow-up |
+| Unrestricted HTTP redirects (existing tarball and registry fetches) | Downgrade to `http`, or credentials sent to another host | Medium | WP-2.6 redirect policy for all fetches: at most 5 hops, no HTTPS-to-HTTP, no `Authorization` across hosts |
+| Registry sources that are only available through git-protocol indexes | Cannot fetch from them | Low (crates.io and major registries offer sparse) | Explicit usage error suggesting the sparse URL; documented non-goal for v1 |
 
 ## 11. Definition of Done (Phase 1)
 
 - [ ] All M1–M3 work packages meet their acceptance criteria and are merged; the PR slicing above is illustrative, not a list of required PR numbers.
+- [ ] All four source inputs (git, tarball, local path, registry crate) fetch, verify, and cache as specified; registry fetches work against crates.io and against compatible private sparse registries, with and without authentication, and tokens never appear outside in-scope HTTPS `Authorization` headers.
 - [ ] `tsp-analyzer analyze` completes on positive fixtures; negative fixtures produce their expected rejection/status/exit code. `check`, `print` (incl. `--why`), and `export` work on the results.
 - [ ] Resume verified: interrupted run → re-run → all nodes `Complete`; identity mismatch → exit 3.
 - [ ] Limits verified: truncated graph → exit 5 with queryable non-`Complete` nodes.
 - [ ] Sandbox: fail-closed verified (exit 4 with diagnostics); bwrap and native backends pass the sandbox suite on a required capable runner; the allowlist proxy blocks non-allowlisted hosts. (Host-IPC isolation is fixed for bwrap and passes locally.)
 - [ ] Offline mode produces declared-but-unresolved graphs with `network_mode = "offline"`.
 - [ ] LLM sub-agents: opt-in only, anchor-verified, capped at L3, injection-resistant (tested).
-- [ ] CI green on PR and push: fmt, clippy `-D warnings`, doc, test, audit, deny, MSRV 1.93.1; nightly fuzz running. (PR CI is green; push-to-`main` and fuzz runs remain to be observed.)
+- [ ] CI green on PR and push: fmt, clippy `-D warnings`, doc, test, audit, deny, MSRV 1.93.1; nightly fuzz running. (Observed for M1; must stay green through M2/M3.)
 - [x] `robigus/Cargo.toml` carries full §18 metadata; `robigus/SECURITY.md` exists with its own reporting path (spec §17).
 - [ ] Differential and fuzz tests cover dpkg comparison; accepted-input and `Eq`/`Hash` fixes are implemented, but scheduled fuzz runs remain to be verified.
 - [x] rustdoc complete for the current public API (enforced by `missing_docs`); README quickstart. Both must be extended as M2/M3 add APIs and `analyze`.
@@ -611,3 +765,6 @@ Proposed slicing only, not a record of actual PRs or merge state; each eventual 
 - No `import` command (JSON export is lossless; import is future work).
 - No ecosystems beyond Rust/Cargo and the C/C++/assembly used by Rust projects.
 - No platforms other than `linux` expanded; unsupported architectures/platforms recorded as stubs only.
+- No git-protocol registry indexes, and no version-requirement resolution ("latest", `^1.2`) for registry source inputs; registry inputs name an exact version in a sparse registry (WP-2.6).
+- No token storage, `login`/`logout` commands, or use of Cargo's credential files, config or `CARGO_REGISTRIES_*` variables: robigus reads tokens only from its own configured sources (WP-2.6).
+- No authentication for registry dependencies resolved inside the sandbox in Phase 1 (WP-2.2 follow-up).
