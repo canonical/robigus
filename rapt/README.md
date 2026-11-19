@@ -25,6 +25,8 @@ Written in pure async Rust, `rapt` performs network requests directly against th
 
 Existing cache files need no migration: timestamps written by chrono (`+00:00` or `Z`, with or without fractional seconds) load unchanged, and are rewritten in jiff's `Z` form the next time the cache is saved. `SeriesCache::is_fresh` keeps its behavior: a cache is fresh for one hour, and a timestamp in the future counts as fresh.
 
+`rapt` uses jiff 1.x. Because `SeriesCache::updated_at` is a jiff type, code that sets or compares it must also use jiff 1.x; a `jiff` 0.2 `Timestamp` is a different type. The cache file format is unchanged.
+
 ## Installation & Build
 
 Build the project using Cargo:

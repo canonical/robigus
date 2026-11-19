@@ -17,8 +17,8 @@ rust-version = "1.93.1"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 # Timestamps (RFC 3339, UTC). Replaces the unmaintained chrono
-# (RUSTSEC-2026-0543); already in the tree through gix.
-jiff = { version = "0.2", features = ["serde"] }
+# (RUSTSEC-2026-0543). gix still pulls in jiff 0.2 separately.
+jiff = { version = "1", features = ["serde"] }
 regex = "1"
 reqwest = { version = "0.13", features = ["default"] }
 serde = { version = "1", features = ["derive"] }
