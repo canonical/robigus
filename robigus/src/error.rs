@@ -34,6 +34,45 @@ pub enum RobigusError {
     /// Project detection failed (CLI exit code 1).
     #[error(transparent)]
     Detect(#[from] DetectError),
+    /// An analyzer failed (CLI exit code 1).
+    #[error(transparent)]
+    Analyzer(#[from] AnalyzerError),
+}
+
+/// Analyzer failures (spec §7.5). Problems confined to one package — a
+/// rejected path dependency, a `cargo metadata` failure that falls back to
+/// manifest parsing — are not errors: they are recorded as failed plan rows
+/// in the analyzer's output. These variants stop the analysis of a root.
+#[derive(Debug, thiserror::Error)]
+pub enum AnalyzerError {
+    /// The analyzer has not been implemented yet.
+    #[error("analyzer not implemented: {0}")]
+    Unsupported(String),
+    /// The root's own manifest is missing, unreadable, malformed, or names
+    /// no package or workspace.
+    #[error("cannot analyze the project: {0}")]
+    Project(String),
+    /// Tool introspection was requested (allowlisted network) but no
+    /// sandbox was supplied; tools never run outside a sandbox (spec §10).
+    #[error("tool introspection requires an established sandbox")]
+    SandboxRequired,
+    /// A sandboxed tool could not be launched, supervised or recorded.
+    #[error(transparent)]
+    Sandbox(#[from] crate::sandbox::SandboxError),
+    /// A required tool is missing from the sandbox or failed to report its
+    /// version (for example `/usr/bin/cargo`).
+    #[error("toolchain unavailable: {0}")]
+    Toolchain(String),
+    /// A tool ran successfully but its output is malformed or oversized.
+    #[error("malformed tool output: {0}")]
+    ToolOutput(String),
+    /// The discovered packages cannot be represented consistently, for
+    /// example two different in-tree packages with the same identity.
+    #[error("inconsistent analysis result: {0}")]
+    Inconsistent(String),
+    /// A blocking analysis task failed to run or complete.
+    #[error("analysis task failed: {0}")]
+    Task(String),
 }
 
 /// SQLite persistence failures.

@@ -59,6 +59,19 @@ pub enum NetworkAccess {
     Allowlist(proxy::ProxyPolicy),
 }
 
+/// How the source tree is mounted at `/source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceMount {
+    /// Read-only (the default, spec §10.2).
+    #[default]
+    ReadOnly,
+    /// Writable, with every write going to a private tmpfs that is discarded
+    /// when the sandbox exits; the host tree is never modified. For tools
+    /// that insist on writing beside the sources, such as `cargo metadata`
+    /// creating a missing `Cargo.lock`.
+    Scratch,
+}
+
 /// A single sandboxed execution. `program` is an absolute path **inside** the
 /// sandbox; `source_subdir` and `log_dir` are relative paths. The log directory
 /// is under `workspace`, which is not mounted into the sandbox. Each execution
@@ -93,8 +106,11 @@ pub struct CommandSpec {
     /// Arguments passed to `program`. Recorded verbatim in the invocation
     /// record, so they must not contain secrets.
     pub args: Vec<String>,
-    /// Host directory holding the source tree; mounted read-only at `/source`.
+    /// Host directory holding the source tree; mounted at `/source` as
+    /// [`CommandSpec::source_mount`] says.
     pub source: PathBuf,
+    /// Read-only, or writable with discarded writes.
+    pub source_mount: SourceMount,
     /// Working directory relative to `source` (empty for `source` itself). It
     /// must contain no `..` and must resolve to a directory inside `source`.
     pub source_subdir: PathBuf,
@@ -243,6 +259,7 @@ struct BwrapSandbox {
 ///         program: "/usr/bin/true".into(),
 ///         args: Vec::new(),
 ///         source,
+///         source_mount: Default::default(),
 ///         source_subdir: "".into(),
 ///         env: BTreeMap::new(),
 ///         timeout: Duration::from_secs(30),
@@ -326,6 +343,7 @@ async fn probe_bwrap() -> Result<PathBuf, String> {
             &executable,
             &empty,
             &source,
+            SourceMount::ReadOnly,
             Path::new("/source"),
             &BTreeMap::new(),
             status,
@@ -538,6 +556,19 @@ const PROXY_ENV: [&str; 5] = [
 /// recreated as symlinks rather than followed.
 const RUNTIME_TREES: [&str; 4] = ["/usr", "/bin", "/lib", "/lib64"];
 
+/// Mounts `host` at `target` as a writable overlay whose upper layer is an
+/// invisible tmpfs, so writes never reach the host. Filesystems mounted in
+/// the sandbox's user namespace are `nodev`, and setuid bits cannot raise
+/// privileges there (no_new_privs, all capabilities dropped).
+fn scratch_overlay_tree(cmd: &mut Command, host: &Path, empty: &Path, target: &Path) {
+    cmd.arg("--overlay-src")
+        .arg(empty)
+        .arg("--overlay-src")
+        .arg(host)
+        .arg("--tmp-overlay")
+        .arg(target);
+}
+
 /// Mounts `host` read-only at `target` without exposing host special files.
 ///
 /// A read-only OverlayFS creates its own inodes for sockets and FIFOs, so a
@@ -591,6 +622,7 @@ fn isolated_command(
     executable: &Path,
     empty: &Path,
     source: &Path,
+    source_mount: SourceMount,
     workdir: &Path,
     env: &BTreeMap<String, String>,
     status: std::fs::File,
@@ -677,7 +709,12 @@ fn isolated_command(
             "--dir",
             "/home/sandbox",
         ]);
-        overlay_tree(&mut cmd, source, empty, Path::new("/source"));
+        match source_mount {
+            SourceMount::ReadOnly => overlay_tree(&mut cmd, source, empty, Path::new("/source")),
+            SourceMount::Scratch => {
+                scratch_overlay_tree(&mut cmd, source, empty, Path::new("/source"));
+            }
+        }
         let certificates = Path::new(CA_CERTIFICATES);
         if networked
             && std::fs::symlink_metadata(certificates).is_ok_and(|metadata| metadata.is_dir())
@@ -1007,6 +1044,7 @@ impl Sandbox for BwrapSandbox {
             &self.executable,
             &empty_layer,
             &source,
+            spec.source_mount,
             &sandbox_workdir,
             &env,
             status_file,
@@ -1208,6 +1246,7 @@ mod tests {
             program: "/bin/true".into(),
             args: Vec::new(),
             source,
+            source_mount: SourceMount::ReadOnly,
             source_subdir: PathBuf::new(),
             env: BTreeMap::new(),
             timeout: Duration::from_secs(2),

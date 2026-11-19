@@ -56,7 +56,7 @@ pub use registry::{CRATES_IO_INDEX, IndexRecord, RegistryClient, RegistrySpec};
 pub use sandbox::proxy::{Allowlist, DEFAULT_ALLOWLIST, HostName, ProxyPolicy};
 pub use sandbox::{
     CommandSpec, NetworkAccess, ProcessOutput, ProcessStatus, Sandbox, SandboxError, SandboxMode,
-    SandboxPreference, establish_sandbox,
+    SandboxPreference, SourceMount, establish_sandbox,
 };
 pub use store::{
     Analysis, AnalysisMetadata, AnalysisSnapshot, IntegrityReport, SnapshotEdge,

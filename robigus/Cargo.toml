@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 async-trait = "0.1"
+# Typed `cargo metadata` output for the Cargo analyzer (spec §8.1).
+cargo_metadata = { workspace = true }
 flate2 = { workspace = true }
 gix = { workspace = true, features = ["blocking-http-transport-reqwest"] }
 glob = { workspace = true }
@@ -25,6 +27,8 @@ ignore = { workspace = true }
 jiff = { workspace = true }
 miette = { workspace = true }
 petgraph = { workspace = true }
+# Linear-time matching for the `build.rs` scan; safe on untrusted input.
+regex = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rusqlite = { workspace = true }
 rusqlite_migration = { workspace = true }
@@ -55,6 +59,7 @@ bytes = "1.10"
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
+insta = { workspace = true }
 predicates = { workspace = true }
 proptest.workspace = true
 serde_json.workspace = true

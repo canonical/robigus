@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use robigus::{
     CommandSpec, NetworkAccess, ProcessOutput, ProcessStatus, ProxyPolicy, Sandbox, SandboxError,
-    SandboxPreference, Store, establish_sandbox,
+    SandboxPreference, SourceMount, Store, establish_sandbox,
 };
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
@@ -55,6 +55,7 @@ impl Fixture {
             program: PathBuf::from("/bin/sh"),
             args: vec!["-c".into(), script.into()],
             source,
+            source_mount: SourceMount::ReadOnly,
             source_subdir: PathBuf::new(),
             env: BTreeMap::new(),
             timeout: Duration::from_secs(10),
