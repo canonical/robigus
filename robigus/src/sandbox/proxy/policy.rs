@@ -265,7 +265,7 @@ impl ProxyPolicy {
 /// Whether `address` may be connected to after DNS resolution: only public
 /// unicast addresses, so an allowlisted name cannot be pointed at the host,
 /// its network, or cloud metadata services.
-pub(super) fn is_public(address: IpAddr) -> bool {
+pub(crate) fn is_public(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(v4) => {
             let [a, b, ..] = v4.octets();

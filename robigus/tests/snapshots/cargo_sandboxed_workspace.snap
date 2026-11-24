@@ -1,0 +1,637 @@
+---
+source: robigus/tests/cargo_analyzer.rs
+expression: "snapshot_value(&output, &src)"
+---
+{
+  "diagnostics": [],
+  "edges": [
+    {
+      "confidence": 90,
+      "evidence": [
+        {
+          "confidence": 75,
+          "detail": null,
+          "location": {
+            "end_line": 13,
+            "path": "crates/app/Cargo.toml",
+            "start_line": 13
+          },
+          "method": "manifest"
+        },
+        {
+          "confidence": 90,
+          "detail": "resolved by cargo metadata",
+          "location": null,
+          "method": "tool_output"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "app",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+        },
+        "version": {
+          "SemVer": "0.5.0"
+        }
+      },
+      "kinds": [
+        "development"
+      ],
+      "predicate": {
+        "Atom": {
+          "Cfg": {
+            "key": "target_family",
+            "value": "unix"
+          }
+        }
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "core-lib",
+        "version_req": null
+      },
+      "to": {
+        "ecosystem": "rust",
+        "name": "core-lib",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+        },
+        "version": {
+          "SemVer": "0.5.0"
+        }
+      }
+    },
+    {
+      "confidence": 90,
+      "evidence": [
+        {
+          "confidence": 75,
+          "detail": null,
+          "location": {
+            "end_line": 7,
+            "path": "crates/app/Cargo.toml",
+            "start_line": 7
+          },
+          "method": "manifest"
+        },
+        {
+          "confidence": 75,
+          "detail": null,
+          "location": {
+            "end_line": 10,
+            "path": "crates/app/Cargo.toml",
+            "start_line": 10
+          },
+          "method": "manifest"
+        },
+        {
+          "confidence": 90,
+          "detail": "resolved by cargo metadata",
+          "location": null,
+          "method": "tool_output"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "app",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+        },
+        "version": {
+          "SemVer": "0.5.0"
+        }
+      },
+      "kinds": [
+        "normal",
+        "build"
+      ],
+      "predicate": {
+        "Atom": "True"
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "core-lib",
+        "version_req": null
+      },
+      "to": {
+        "ecosystem": "rust",
+        "name": "core-lib",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+        },
+        "version": {
+          "SemVer": "0.5.0"
+        }
+      }
+    },
+    {
+      "confidence": 50,
+      "evidence": [
+        {
+          "confidence": 50,
+          "detail": "Cargo.toml package.links = \"m\"",
+          "location": {
+            "end_line": 5,
+            "path": "crates/core-lib/Cargo.toml",
+            "start_line": 5
+          },
+          "method": "build_script"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "core-lib",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+        },
+        "version": {
+          "SemVer": "0.5.0"
+        }
+      },
+      "kinds": [
+        "normal",
+        "build"
+      ],
+      "predicate": {
+        "Atom": "True"
+      },
+      "requirement": {
+        "kind": "generic",
+        "name": "m",
+        "version_req": null
+      },
+      "to": null
+    },
+    {
+      "confidence": 50,
+      "evidence": [
+        {
+          "confidence": 50,
+          "detail": "cargo:rustc-link-lib directive (shared library 'm')",
+          "location": {
+            "end_line": 1,
+            "path": "crates/core-lib/build.rs",
+            "start_line": 1
+          },
+          "method": "build_script"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "core-lib",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+        },
+        "version": {
+          "SemVer": "0.5.0"
+        }
+      },
+      "kinds": [
+        "normal"
+      ],
+      "predicate": {
+        "Atom": "True"
+      },
+      "requirement": {
+        "kind": "soname",
+        "name": "m",
+        "version_req": null
+      },
+      "to": null
+    },
+    {
+      "confidence": 90,
+      "evidence": [
+        {
+          "confidence": 75,
+          "detail": null,
+          "location": {
+            "end_line": 8,
+            "path": "crates/core-lib/Cargo.toml",
+            "start_line": 8
+          },
+          "method": "manifest"
+        },
+        {
+          "confidence": 90,
+          "detail": "resolved by cargo metadata",
+          "location": null,
+          "method": "tool_output"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "core-lib",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+        },
+        "version": {
+          "SemVer": "0.5.0"
+        }
+      },
+      "kinds": [
+        "normal"
+      ],
+      "predicate": {
+        "Atom": {
+          "Feature": {
+            "name": "extra",
+            "package": null
+          }
+        }
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "vend",
+        "version_req": null
+      },
+      "to": {
+        "ecosystem": "rust",
+        "name": "vend",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+        },
+        "version": {
+          "SemVer": "0.1.0"
+        }
+      }
+    }
+  ],
+  "expansions": [],
+  "network_mode": "allowlist",
+  "nodes": [
+    {
+      "active_features": [],
+      "conflicts": [],
+      "id": {
+        "ecosystem": "rust",
+        "name": "app",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+        },
+        "version": {
+          "SemVer": "0.5.0"
+        }
+      },
+      "path": "crates/app",
+      "provides": [],
+      "status": "Not_Started",
+      "targets": [
+        {
+          "kind": "Binary",
+          "name": "app",
+          "path": "crates/app/src/main.rs"
+        }
+      ]
+    },
+    {
+      "active_features": [
+        "extra"
+      ],
+      "conflicts": [],
+      "id": {
+        "ecosystem": "rust",
+        "name": "core-lib",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+        },
+        "version": {
+          "SemVer": "0.5.0"
+        }
+      },
+      "path": "crates/core-lib",
+      "provides": [],
+      "status": "Not_Started",
+      "targets": [
+        {
+          "kind": {
+            "RustLib": {
+              "proc_macro": false
+            }
+          },
+          "name": "core_lib",
+          "path": "crates/core-lib/src/lib.rs"
+        }
+      ]
+    },
+    {
+      "active_features": [],
+      "conflicts": [],
+      "id": {
+        "ecosystem": "rust",
+        "name": "vend",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+        },
+        "version": {
+          "SemVer": "0.1.0"
+        }
+      },
+      "path": "vendor/vend",
+      "provides": [],
+      "status": "Not_Started",
+      "targets": [
+        {
+          "kind": {
+            "RustLib": {
+              "proc_macro": false
+            }
+          },
+          "name": "vend",
+          "path": "vendor/vend/src/lib.rs"
+        }
+      ]
+    }
+  ],
+  "plan": [
+    {
+      "analyzer": "cargo",
+      "attempts": 1,
+      "build_system": null,
+      "detail": null,
+      "error": null,
+      "status": "Complete",
+      "strategy": "manifest",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "app",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+          },
+          "version": {
+            "SemVer": "0.5.0"
+          }
+        }
+      }
+    },
+    {
+      "analyzer": "cargo",
+      "attempts": 1,
+      "build_system": null,
+      "detail": "cargo metadata --format-version 1",
+      "error": null,
+      "status": "Complete",
+      "strategy": "tool_introspection",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "app",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+          },
+          "version": {
+            "SemVer": "0.5.0"
+          }
+        }
+      }
+    },
+    {
+      "analyzer": "cargo",
+      "attempts": 1,
+      "build_system": null,
+      "detail": null,
+      "error": null,
+      "status": "Complete",
+      "strategy": "manifest",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "core-lib",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+          },
+          "version": {
+            "SemVer": "0.5.0"
+          }
+        }
+      }
+    },
+    {
+      "analyzer": "cargo",
+      "attempts": 1,
+      "build_system": "build_script",
+      "detail": "scanned 'crates/core-lib/build.rs' (1 finding(s))",
+      "error": null,
+      "status": "Complete",
+      "strategy": "manifest",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "core-lib",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+          },
+          "version": {
+            "SemVer": "0.5.0"
+          }
+        }
+      }
+    },
+    {
+      "analyzer": "cargo",
+      "attempts": 1,
+      "build_system": null,
+      "detail": "cargo metadata --format-version 1",
+      "error": null,
+      "status": "Complete",
+      "strategy": "tool_introspection",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "core-lib",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+          },
+          "version": {
+            "SemVer": "0.5.0"
+          }
+        }
+      }
+    },
+    {
+      "analyzer": "cargo",
+      "attempts": 1,
+      "build_system": null,
+      "detail": null,
+      "error": null,
+      "status": "Complete",
+      "strategy": "manifest",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "vend",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+          },
+          "version": {
+            "SemVer": "0.1.0"
+          }
+        }
+      }
+    },
+    {
+      "analyzer": "cargo",
+      "attempts": 1,
+      "build_system": null,
+      "detail": "cargo metadata --format-version 1",
+      "error": null,
+      "status": "Complete",
+      "strategy": "tool_introspection",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "vend",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+          },
+          "version": {
+            "SemVer": "0.1.0"
+          }
+        }
+      }
+    }
+  ],
+  "roots": [
+    {
+      "ecosystem": "rust",
+      "name": "app",
+      "source_id": {
+        "kind": {
+          "Path": {
+            "path": "<TMP>"
+          }
+        },
+        "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+      },
+      "version": {
+        "SemVer": "0.5.0"
+      }
+    },
+    {
+      "ecosystem": "rust",
+      "name": "core-lib",
+      "source_id": {
+        "kind": {
+          "Path": {
+            "path": "<TMP>"
+          }
+        },
+        "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+      },
+      "version": {
+        "SemVer": "0.5.0"
+      }
+    },
+    {
+      "ecosystem": "rust",
+      "name": "vend",
+      "source_id": {
+        "kind": {
+          "Path": {
+            "path": "<TMP>"
+          }
+        },
+        "precise": "8267beeac1b8ae12999bcdc3a860fdf6c4cc9f24e5c2485ee17cf06a88c04e90"
+      },
+      "version": {
+        "SemVer": "0.1.0"
+      }
+    }
+  ],
+  "toolchain": {
+    "cargo": "<CARGO_VER>",
+    "rustc": "<RUSTC_VER>"
+  }
+}

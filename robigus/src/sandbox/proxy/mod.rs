@@ -65,6 +65,7 @@ mod tls;
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
+pub(crate) use policy::is_public;
 pub use policy::{Allowlist, DEFAULT_ALLOWLIST, HostName, ProxyPolicy};
 pub(crate) use server::{ProxyLog, check_listener, serve};
 

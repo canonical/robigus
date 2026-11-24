@@ -27,7 +27,7 @@ You can expect an acknowledgment within 48 hours. We follow coordinated disclosu
 
 ## Sandbox Scope
 
-Project code executed during analysis runs in a bubblewrap sandbox: unprivileged user, mount, PID, network, IPC and UTS namespaces; private read-only overlays of the source and system runtime; a seccomp socket policy; and closure of inherited descriptors. Bypasses of this boundary are security vulnerabilities.
+Project code executed during analysis runs in a bubblewrap sandbox: unprivileged user, mount, PID, network, IPC and UTS namespaces; private read-only overlays of the source and system runtime (or, for tools such as `cargo metadata` that write a lockfile beside `Cargo.toml`, a private `SourceMount::Scratch` overlay whose upper layer is an ephemeral tmpfs discarded on exit so the host source tree is never modified); a seccomp socket policy; and closure of inherited descriptors. Bypasses of this boundary — including any write reaching the host source tree — are security vulnerabilities.
 
 Network-enabled runs stay in their own network namespace. Egress is possible only through robigus's allowlisting forward proxy, whose listener is created inside the namespace and handed to robigus. The proxy enforces the host allowlist, allowed ports, `Host`/`CONNECT`/TLS SNI agreement, and refuses names that resolve to non-public addresses; TLS is relayed without interception. Reaching a host the policy forbids, or anything on the host or its network, is a security vulnerability.
 

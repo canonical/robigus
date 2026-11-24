@@ -476,26 +476,35 @@ Notes:
 
 **Spec refs:** §8.1, §4.1, §5.3, §7.6.
 
-Files: `robigus/src/analyzers/cargo.rs`.
-
-Existing foundations: Cargo marker detection, `FeatureExpr` parsing, source/cache helpers, and graph types. There is no Cargo dependency analyzer or `ProjectAnalyzer::analyze` implementation yet.
+Files: `robigus/src/analyzers/mod.rs`, `robigus/src/analyzers/cargo/{mod,build_script,cfg,lockfile,manifest,metadata}.rs`, `robigus/tests/cargo_analyzer.rs`, `robigus/tests/snapshots/*.snap`.
 
 Tasks:
 
-- [ ] Run `cargo metadata --format-version 1` **unfiltered** inside the sandbox (writable `CARGO_HOME` tmpfs, proxy env); record `tool_invocation` (argv, scrubbed env, cargo/rustc versions).
-- [ ] Map `cargo_metadata::Metadata` → nodes (workspace members as roots) and edges (`dep_kinds` → `kinds` set; `[target.'cfg(...)']` → `cfg` atoms; `optional = true` → feature predicates).
-- [ ] Use the existing `FeatureExpr` parser for `dep:foo` / `foo?/bar` in Cargo analysis; populate per-node `active_features` from the resolve graph.
-- [ ] `toml_edit` fallback for `--offline`: declared-but-unresolved edges (`to = None`), `Manifest` evidence, `network_mode = "offline"` in metadata, reduced confidence.
-- [ ] `build.rs` static scan (regex-based in M2; tree-sitter later): `cc`/`cxx`/`bindgen`/`pkg-config`/`cmake`/`meson` usage, `cargo:` directives, `links` key → `BuildScript`/`SourceScan` evidence at L2; discovered system requirements become unresolved edges.
-- [ ] Registry fetches via the registry client as fixed in WP-2.6 (checksum mandatory); git deps via `gix` at the locked rev; path deps with the containment rule — an escaping path dependency marks the node `Error`.
-- [ ] Registry identity (WP-2.6 rules): map Cargo's `source` strings with WP-2.6's shared index-URL function — crates.io's legacy `registry+https://github.com/rust-lang/crates.io-index` becomes `https://index.crates.io/`, and `sparse+…` is normalized. Set each registry node's `precise` to its checksum from `Cargo.lock` (the `checksum` field), so a crate that is both the root and a dependency is one node. A registry dependency with no lockfile checksum, or from another git-protocol index, stays declared-but-unresolved with a recorded reason.
-- [ ] Dependencies in authenticated registries: WP-2.6 tokens never enter the sandbox, so `cargo metadata` cannot read such registries. Record these dependencies as declared-but-unresolved with a reason naming the registry, and design in-sandbox authentication (for example, the host-side proxy adding the `Authorization` header for that registry's hosts) as a separate follow-up.
-- [ ] Confidence mapping per the §5.3 ladder: Manifest+Lockfile agreement L4; Manifest alone L3; SourceScan L2; ToolOutput L3–L4.
-- [ ] Determinism: sorted everything.
+- [x] Run `cargo metadata --format-version 1` **unfiltered** inside the sandbox (`SourceMount::Scratch` tmpfs-upper overlay so lockfile-less crates succeed without touching the host tree, writable `CARGO_HOME` tmpfs, proxy env); record `tool_invocation` (argv, scrubbed env, cargo/rustc versions).
+- [x] Map `cargo_metadata::Metadata` → nodes (workspace members as roots) and edges (`dep_kinds` → `kinds` set; `[target.'cfg(...)']` and named target triples → `cfg` atoms; `optional = true` → feature predicates).
+- [x] Use the existing `FeatureExpr` parser for `dep:foo` / `foo?/bar` in Cargo analysis; populate per-node `active_features` from the resolve graph.
+- [x] `toml_edit` fallback for `--offline` (`toml_edit::Document` preserving byte/line spans): declared-but-unresolved edges (`to = None`), `Manifest` evidence, `network_mode = "offline"`, reduced L3 confidence (`65`).
+- [x] `build.rs` static scan (regex-based in M2, stripping Rust comments while preserving line numbers; tree-sitter later): `cc`/`cxx`/`bindgen`/`pkg-config`/`cmake`/`meson` usage, `cargo:`/`cargo::` directives, `links` key → `BuildScript`/`SourceScan` evidence at L2 (`50`/`45`); discovered system requirements become unresolved edges.
+- [x] Registry fetches via `acquire_dependency` using the WP-2.6 registry client (checksum mandatory); git deps via `gix` at the locked rev (locating sub-packages inside multi-crate git checkouts); path deps with the lexical + symlink containment rule — an escaping path dependency records a `Failed` plan row so expansion marks the node `Error`.
+- [x] Registry identity (WP-2.6 rules): map Cargo's `source` strings with WP-2.6's shared index-URL function — crates.io's legacy `registry+https://github.com/rust-lang/crates.io-index` becomes `https://index.crates.io/`, and `sparse+…` is normalized. Set each registry node's `precise` to its checksum from `Cargo.lock` (v1 `[metadata]` and v4 `checksum` fields), so a crate that is both the root and a dependency is one node. A registry dependency with no lockfile checksum, or from another git-protocol index, stays declared-but-unresolved with a recorded reason.
+- [x] Dependencies in authenticated registries: WP-2.6 tokens never enter the sandbox, so `cargo metadata` cannot read such registries. Record these dependencies as declared-but-unresolved with a reason naming the registry; in-sandbox authentication remains a separate follow-up.
+- [x] Confidence mapping per the §5.3 ladder: Manifest+Lockfile+ToolOutput agreement L4 (`90`–`95`); Manifest or ToolOutput alone L3 (`65`–`75`); BuildScript/SourceScan L2 (`45`–`50`).
+- [x] Determinism: sorted and deduplicated nodes, targets, edges, evidence, plan rows, expansion tasks, and diagnostics; verified permutation-invariant.
 
-Tests: fixtures (features, target-specific deps, workspace, git/path deps, vendored crate); insta snapshots with redactions.
+Tests: fixtures (features, target-specific deps, workspace, git/path deps, vendored crate); insta snapshots with redactions (`<TMP>`, `<CARGO_VER>`, `<RUSTC_VER>`).
 
 Acceptance: analyzer output is deterministic; evidence respects tier caps; §8.1 rules hold.
+
+**Status: met locally.** Tests: 15 `analyzers::cargo` unit tests, 1 `SourceMount::Scratch` test in `robigus/tests/sandbox.rs`, and 10 integration + `insta` snapshot tests in `robigus/tests/cargo_analyzer.rs` (including real bubblewrap `/usr/bin/cargo metadata` runs, `wiremock` sparse-registry resolution and `401` challenge handling through the sandbox proxy, `acquire_dependency` over sparse registries and local `gix` multi-crate repos, and a `ROB_NETWORK_TESTS=1` live crates.io test). Also aligned `Configuration::for_arch`'s `target_arch` spellings with rustc (`arm`, `x86`, `powerpc64`) and added the `target` triple key.
+
+**Code-review fixes (applied):**
+- **Contained, non-blocking regular-file reader (`manifest.rs`, `metadata.rs`, `mod.rs`):** `resolve_contained_path` resolves symlinks component-by-component *before* applying `..` (blocking `escape_link/..` lexical cancellation), and `read_contained_utf8` / `is_contained_regular_file` open manifests, `Cargo.lock`, `.cargo` configs, and `build.rs` via `openat(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)`, refusing leaf symlinks and non-regular files (FIFOs, devices, sockets), enforcing `max_file_bytes` during `Read::take`, and formatting `toml_edit::TomlError` without quoting raw file text.
+- **Host dependency acquisition policy (`DependencyFetchPolicy`, `mod.rs`, `lockfile.rs`):** project-controlled git and registry dependency URLs reject credentials (redacting userinfo before formatting errors), extra query parameters, IP literals, non-default ports, and non-`https` schemes (`file://`, `ssh://`, `http://`), and `acquire_dependency` checks the host [`Allowlist`] and public-unicast DNS resolution before connecting. Local loopback/`file://` fixtures require the hidden `DependencyFetchPolicy::allow_local_for_tests()`.
+- **Authenticated-registry classification (`mod.rs`, `lockfile.rs`):** configured credential sources no longer misclassify public registries or mask timeouts, signals, path escapes, or unrelated `cargo metadata` errors; only nonzero exits whose `stderr` evidences an auth challenge (`401`/`403`/`no token found`/`auth-required`/unconfigured registry) for a referenced credentialed registry take the `Skipped` path.
+- **Resolved-edge disambiguation (`metadata.rs`):** `find_matching_resolve_dep` separates renamed vs unrenamed extern crate names, matches constrained version requirements before `*`, checks SemVer and source compatibility, and reports ambiguous ties as diagnostics rather than picking by iteration order.
+- **Lockfile & path digest verification (`metadata.rs`, `lockfile.rs`, `mod.rs`):** git dependencies require a matching commit in `Cargo.lock` (unpinned or disagreeing commits stay declared-but-unresolved), and `acquire_dependency` verifies `SourceKind::Path` tree digests against `SourceId.precise`.
+
+Regression tests cover each fix. Not yet run in CI.
 
 ### WP-2.3 — Expansion engine (L, ~5d)
 

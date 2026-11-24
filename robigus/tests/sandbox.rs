@@ -299,6 +299,38 @@ async fn source_is_read_only_and_output_and_cargo_home_are_writable() {
     assert!(!fixture.spec.source.join("subdir/new").exists());
 }
 
+#[tokio::test]
+async fn scratch_source_mount_discards_writes_without_touching_host() {
+    let Some(sandbox) = bwrap("scratch_source_mount_discards_writes_without_touching_host").await
+    else {
+        return;
+    };
+    let mut fixture = Fixture::new(
+        r#"set -eu
+        test "$(cat /source/input)" = original
+        printf rewritten > /source/input
+        printf generated > /source/Cargo.lock
+        test "$(cat /source/input)" = rewritten
+        test "$(cat /source/Cargo.lock)" = generated
+        printf ok"#,
+    )
+    .await;
+    fixture.spec.source_mount = SourceMount::Scratch;
+    std::fs::write(fixture.spec.source.join("input"), "original").expect("write source");
+
+    let output = sandbox.run(&fixture.spec).await.expect("run shell");
+    assert_success(&output);
+    assert_eq!(
+        std::fs::read_to_string(fixture.spec.source.join("input")).expect("read source"),
+        "original",
+        "scratch writes must not reach the host source tree"
+    );
+    assert!(
+        !fixture.spec.source.join("Cargo.lock").exists(),
+        "files created in the scratch mount must be discarded"
+    );
+}
+
 // A separate process supplies known host secrets without unsafe, process-global
 // environment mutation while the rest of the test suite is running.
 #[tokio::test]

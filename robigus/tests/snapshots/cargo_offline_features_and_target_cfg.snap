@@ -1,0 +1,776 @@
+---
+source: robigus/tests/cargo_analyzer.rs
+expression: "snapshot_value(&output, &src)"
+---
+{
+  "diagnostics": [],
+  "edges": [
+    {
+      "confidence": 65,
+      "evidence": [
+        {
+          "confidence": 65,
+          "detail": "offline manifest-only declaration (unresolved)",
+          "location": {
+            "end_line": 14,
+            "path": "Cargo.toml",
+            "start_line": 14
+          },
+          "method": "manifest"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "build"
+      ],
+      "predicate": {
+        "Atom": "True"
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "cc",
+        "version_req": {
+          "SemVer": "^1.0"
+        }
+      },
+      "to": null
+    },
+    {
+      "confidence": 65,
+      "evidence": [
+        {
+          "confidence": 65,
+          "detail": "offline manifest-only declaration (unresolved)",
+          "location": {
+            "end_line": 24,
+            "path": "Cargo.toml",
+            "start_line": 24
+          },
+          "method": "manifest"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "development"
+      ],
+      "predicate": {
+        "Atom": {
+          "Cfg": {
+            "key": "target",
+            "value": "aarch64-unknown-linux-gnu"
+          }
+        }
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "criterion",
+        "version_req": {
+          "SemVer": "^0.5"
+        }
+      },
+      "to": null
+    },
+    {
+      "confidence": 65,
+      "evidence": [
+        {
+          "confidence": 65,
+          "detail": "offline manifest-only declaration (unresolved)",
+          "location": {
+            "end_line": 11,
+            "path": "Cargo.toml",
+            "start_line": 11
+          },
+          "method": "manifest"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "normal"
+      ],
+      "predicate": {
+        "Atom": "True"
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "hex",
+        "version_req": {
+          "SemVer": "^0.4"
+        }
+      },
+      "to": null
+    },
+    {
+      "confidence": 65,
+      "evidence": [
+        {
+          "confidence": 65,
+          "detail": "offline manifest-only declaration (unresolved)",
+          "location": {
+            "end_line": 8,
+            "path": "Cargo.toml",
+            "start_line": 8
+          },
+          "method": "manifest"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "normal"
+      ],
+      "predicate": {
+        "Or": [
+          {
+            "Atom": {
+              "Feature": {
+                "name": "default",
+                "package": null
+              }
+            }
+          },
+          {
+            "Atom": {
+              "Feature": {
+                "name": "std",
+                "package": null
+              }
+            }
+          }
+        ]
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "itoa",
+        "version_req": {
+          "SemVer": "^1.0"
+        }
+      },
+      "to": null
+    },
+    {
+      "confidence": 65,
+      "evidence": [
+        {
+          "confidence": 65,
+          "detail": "offline manifest-only declaration (unresolved)",
+          "location": {
+            "end_line": 18,
+            "path": "Cargo.toml",
+            "start_line": 18
+          },
+          "method": "manifest"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "normal"
+      ],
+      "predicate": {
+        "Atom": {
+          "Cfg": {
+            "key": "target_family",
+            "value": "unix"
+          }
+        }
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "libc",
+        "version_req": {
+          "SemVer": "^0.2"
+        }
+      },
+      "to": null
+    },
+    {
+      "confidence": 65,
+      "evidence": [
+        {
+          "confidence": 65,
+          "detail": "offline manifest-only declaration (unresolved)",
+          "location": {
+            "end_line": 21,
+            "path": "Cargo.toml",
+            "start_line": 21
+          },
+          "method": "manifest"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "normal"
+      ],
+      "predicate": {
+        "And": [
+          {
+            "Atom": {
+              "Cfg": {
+                "key": "target_arch",
+                "value": "x86_64"
+              }
+            }
+          },
+          {
+            "Atom": {
+              "Cfg": {
+                "key": "target_os",
+                "value": "linux"
+              }
+            }
+          }
+        ]
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "linux-raw-sys",
+        "version_req": {
+          "SemVer": "^0.6"
+        }
+      },
+      "to": null
+    },
+    {
+      "confidence": 65,
+      "evidence": [
+        {
+          "confidence": 65,
+          "detail": "offline manifest-only declaration (unresolved)",
+          "location": {
+            "end_line": 15,
+            "path": "Cargo.toml",
+            "start_line": 15
+          },
+          "method": "manifest"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "build"
+      ],
+      "predicate": {
+        "Atom": "True"
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "pkg-config",
+        "version_req": {
+          "SemVer": "^0.3"
+        }
+      },
+      "to": null
+    },
+    {
+      "confidence": 65,
+      "evidence": [
+        {
+          "confidence": 65,
+          "detail": "offline manifest-only declaration (unresolved)",
+          "location": {
+            "end_line": 10,
+            "path": "Cargo.toml",
+            "start_line": 10
+          },
+          "method": "manifest"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "normal"
+      ],
+      "predicate": {
+        "Atom": {
+          "Feature": {
+            "name": "ryu",
+            "package": null
+          }
+        }
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "ryu",
+        "version_req": {
+          "SemVer": "^1.0"
+        }
+      },
+      "to": null
+    },
+    {
+      "confidence": 65,
+      "evidence": [
+        {
+          "confidence": 65,
+          "detail": "offline manifest-only declaration (unresolved); feature forwarding: derive -> serde/derive, std -> serde?/std",
+          "location": {
+            "end_line": 9,
+            "path": "Cargo.toml",
+            "start_line": 9
+          },
+          "method": "manifest"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "normal"
+      ],
+      "predicate": {
+        "Or": [
+          {
+            "Atom": {
+              "Feature": {
+                "name": "derive",
+                "package": null
+              }
+            }
+          },
+          {
+            "Atom": {
+              "Feature": {
+                "name": "serde",
+                "package": null
+              }
+            }
+          }
+        ]
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "serde",
+        "version_req": {
+          "SemVer": "^1.0"
+        }
+      },
+      "to": null
+    },
+    {
+      "confidence": 50,
+      "evidence": [
+        {
+          "confidence": 50,
+          "detail": "Cargo.toml package.links = \"z\"",
+          "location": {
+            "end_line": 5,
+            "path": "Cargo.toml",
+            "start_line": 5
+          },
+          "method": "build_script"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "normal",
+        "build"
+      ],
+      "predicate": {
+        "Atom": "True"
+      },
+      "requirement": {
+        "kind": "generic",
+        "name": "z",
+        "version_req": null
+      },
+      "to": null
+    },
+    {
+      "confidence": 45,
+      "evidence": [
+        {
+          "confidence": 45,
+          "detail": "pkg_config::probe_library(\"zlib\") in build.rs",
+          "location": {
+            "end_line": 2,
+            "path": "build.rs",
+            "start_line": 2
+          },
+          "method": "source_scan"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "normal",
+        "build"
+      ],
+      "predicate": {
+        "Atom": "True"
+      },
+      "requirement": {
+        "kind": "pkg_config",
+        "name": "zlib",
+        "version_req": null
+      },
+      "to": null
+    },
+    {
+      "confidence": 50,
+      "evidence": [
+        {
+          "confidence": 50,
+          "detail": "cargo:rustc-link-lib directive (shared library 'z')",
+          "location": {
+            "end_line": 4,
+            "path": "build.rs",
+            "start_line": 4
+          },
+          "method": "build_script"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "normal"
+      ],
+      "predicate": {
+        "Atom": "True"
+      },
+      "requirement": {
+        "kind": "soname",
+        "name": "z",
+        "version_req": null
+      },
+      "to": null
+    },
+    {
+      "confidence": 45,
+      "evidence": [
+        {
+          "confidence": 45,
+          "detail": "cc::Build::new() (cc) in build.rs",
+          "location": {
+            "end_line": 3,
+            "path": "build.rs",
+            "start_line": 3
+          },
+          "method": "source_scan"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "kinds": [
+        "build"
+      ],
+      "predicate": {
+        "Atom": "True"
+      },
+      "requirement": {
+        "kind": "tool",
+        "name": "cc",
+        "version_req": null
+      },
+      "to": null
+    }
+  ],
+  "expansions": [],
+  "network_mode": "offline",
+  "nodes": [
+    {
+      "active_features": [],
+      "conflicts": [],
+      "id": {
+        "ecosystem": "rust",
+        "name": "feat-demo",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+        },
+        "version": {
+          "SemVer": "0.2.0"
+        }
+      },
+      "path": ".",
+      "provides": [],
+      "status": "Not_Started",
+      "targets": [
+        {
+          "kind": {
+            "RustLib": {
+              "proc_macro": false
+            }
+          },
+          "name": "feat_demo",
+          "path": "src/lib.rs"
+        }
+      ]
+    }
+  ],
+  "plan": [
+    {
+      "analyzer": "cargo",
+      "attempts": 1,
+      "build_system": null,
+      "detail": null,
+      "error": null,
+      "status": "Complete",
+      "strategy": "manifest",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "feat-demo",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+          },
+          "version": {
+            "SemVer": "0.2.0"
+          }
+        }
+      }
+    },
+    {
+      "analyzer": "cargo",
+      "attempts": 1,
+      "build_system": "build_script",
+      "detail": "scanned 'build.rs' (3 finding(s))",
+      "error": null,
+      "status": "Complete",
+      "strategy": "manifest",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "feat-demo",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+          },
+          "version": {
+            "SemVer": "0.2.0"
+          }
+        }
+      }
+    },
+    {
+      "analyzer": "cargo",
+      "attempts": 0,
+      "build_system": null,
+      "detail": "offline mode (--offline): cargo metadata skipped",
+      "error": null,
+      "status": "Skipped",
+      "strategy": "tool_introspection",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "feat-demo",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+          },
+          "version": {
+            "SemVer": "0.2.0"
+          }
+        }
+      }
+    }
+  ],
+  "roots": [
+    {
+      "ecosystem": "rust",
+      "name": "feat-demo",
+      "source_id": {
+        "kind": {
+          "Path": {
+            "path": "<TMP>"
+          }
+        },
+        "precise": "08328df4ef9ad69994de8fdba3ddfbd0716362312c8d0d3b98e0751f0c9c5fb2"
+      },
+      "version": {
+        "SemVer": "0.2.0"
+      }
+    }
+  ],
+  "toolchain": {}
+}

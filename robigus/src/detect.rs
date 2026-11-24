@@ -839,8 +839,8 @@ fn project_characteristics(
 }
 
 /// The analyzer registry seam (spec §7.5). `detect` is synchronous by design:
-/// pure marker inspection over an in-memory [`ProjectTree`] with no I/O. The
-/// `analyze` method is added when the analyzers land (WP-2.2/WP-3.1).
+/// pure marker inspection over an in-memory [`ProjectTree`] with no I/O.
+#[async_trait::async_trait]
 pub trait ProjectAnalyzer: Send + Sync {
     /// The analyzer's identifier, as used in signals and plan rows.
     fn id(&self) -> AnalyzerId;
@@ -848,12 +848,19 @@ pub trait ProjectAnalyzer: Send + Sync {
     /// report the highest confidence among their markers, or
     /// [`Confidence::ZERO`] when none is present.
     fn detect(&self, tree: &ProjectTree) -> Confidence;
+    /// Discovers packages, edges, targets, plan rows, and expansion tasks for
+    /// one detected root (spec §7.5).
+    async fn analyze(
+        &self,
+        ctx: &crate::analyzers::AnalysisContext<'_>,
+    ) -> Result<crate::analyzers::AnalyzerOutput, crate::error::AnalyzerError>;
 }
 
 /// The Rust/Cargo analyzer (spec §8.1).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CargoAnalyzer;
 
+#[async_trait::async_trait]
 impl ProjectAnalyzer for CargoAnalyzer {
     fn id(&self) -> AnalyzerId {
         AnalyzerId::Cargo
@@ -862,12 +869,20 @@ impl ProjectAnalyzer for CargoAnalyzer {
     fn detect(&self, tree: &ProjectTree) -> Confidence {
         analyzer_confidence(tree, AnalyzerId::Cargo)
     }
+
+    async fn analyze(
+        &self,
+        ctx: &crate::analyzers::AnalysisContext<'_>,
+    ) -> Result<crate::analyzers::AnalyzerOutput, crate::error::AnalyzerError> {
+        crate::analyzers::cargo::analyze(ctx).await
+    }
 }
 
-/// The C/C++ analyzer (spec §8.2).
+/// The C/C++ analyzer (spec §8.2; implementation lands in WP-3.1).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CppAnalyzer;
 
+#[async_trait::async_trait]
 impl ProjectAnalyzer for CppAnalyzer {
     fn id(&self) -> AnalyzerId {
         AnalyzerId::Cpp
@@ -875,6 +890,15 @@ impl ProjectAnalyzer for CppAnalyzer {
 
     fn detect(&self, tree: &ProjectTree) -> Confidence {
         analyzer_confidence(tree, AnalyzerId::Cpp)
+    }
+
+    async fn analyze(
+        &self,
+        _ctx: &crate::analyzers::AnalysisContext<'_>,
+    ) -> Result<crate::analyzers::AnalyzerOutput, crate::error::AnalyzerError> {
+        Err(crate::error::AnalyzerError::Unsupported(
+            "cpp analyzer lands in WP-3.1".to_string(),
+        ))
     }
 }
 

@@ -4,8 +4,8 @@
 //! Analyzers report; they do not drive expansion or change node status.
 //! [`AnalyzerOutput::persist`] writes a result to the store, and expansion
 //! (WP-2.3) decides each node's status from the plan rows: a
-//! [`PlanStatus::Failed`] row with a recorded error is the cause recorded
-//! for an `Error` node (spec §5.1, §22.19).
+//! [`crate::model::PlanStatus::Failed`] row with a recorded error is the cause
+//! recorded for an `Error` node (spec §5.1, §22.19).
 
 pub mod cargo;
 
@@ -16,14 +16,17 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-pub use cargo::{BuildScriptFinding, scan_build_script};
+pub use cargo::{
+    BuildScriptFinding, DependencyFetchPolicy, ResolvedDependencySource, acquire_dependency,
+    acquire_dependency_with_policy, scan_build_script,
+};
 
 use crate::credentials::CredentialSource;
 use crate::error::StoreError;
 use crate::fetch::{FetchedSource, RegistrySource, SourceInput};
 use crate::model::{
     DependencyGraph, Edge, Evidence, GitReference, Node, PackageId, PackageVersion, PlanRow,
-    SourceKind,
+    SourceKind, Target,
 };
 use crate::predicate::Configuration;
 use crate::registry::{CRATES_IO_INDEX, RegistrySpec};
@@ -69,6 +72,11 @@ pub struct AnalysisContext<'a> {
     /// The primary configuration. For Cargo, its per-package features are
     /// requested for workspace members, on top of their defaults.
     pub configuration: &'a Configuration,
+    /// Configured Cargo registries (spec §7.2.2, §14). Dependencies hosted
+    /// in an authenticated registry cannot be resolved inside the sandbox in
+    /// Phase 1 and are recorded as declared-but-unresolved with a reason
+    /// naming the registry (spec §8.1).
+    pub registries: &'a [RegistrySpec],
     /// [`NetworkAccess::Offline`] selects static manifest analysis (spec
     /// §8.1, `--offline`); [`NetworkAccess::Allowlist`] runs tools in the
     /// sandbox behind the allowlisting proxy.
@@ -90,6 +98,7 @@ impl fmt::Debug for AnalysisContext<'_> {
             .field("source", &self.source)
             .field("root", &self.root)
             .field("configuration", &self.configuration)
+            .field("registries", &self.registries)
             .field("network", &self.network)
             .field("sandbox", &self.sandbox.map(|sandbox| sandbox.mode()))
             .field("store", &self.store)
@@ -148,21 +157,34 @@ impl ExpansionTask {
     /// packages, so the caller still has to locate this one in the checkout.
     ///
     /// Crates from registries other than crates.io get no credential
-    /// source; the caller maps the index URL to a configured registry when
-    /// one needs authentication. `None` for sources that need no fetch or
-    /// are not pinned.
+    /// source; use [`ExpansionTask::source_input_with_registries`] to match
+    /// configured registries. `None` for sources that need no fetch or are
+    /// not pinned.
     pub fn source_input(&self) -> Option<SourceInput> {
+        self.source_input_with_registries(&[])
+    }
+
+    /// Like [`ExpansionTask::source_input`], matching a registry's index URL
+    /// against `registries` so host-side fetches use its configured name and
+    /// credential source.
+    pub fn source_input_with_registries(&self, registries: &[RegistrySpec]) -> Option<SourceInput> {
         let precise = self.package.source_id.precise.clone()?;
         match &self.package.source_id.kind {
             SourceKind::CargoRegistry { index_url } => {
                 let PackageVersion::SemVer(version) = &self.package.version else {
                     return None;
                 };
-                let registry = if index_url.as_str() == CRATES_IO_INDEX {
-                    RegistrySpec::crates_io()
-                } else {
-                    RegistrySpec::new(index_url.clone(), None, CredentialSource::None)
-                };
+                let registry = registries
+                    .iter()
+                    .find(|spec| &spec.index_url == index_url)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if index_url.as_str() == CRATES_IO_INDEX {
+                            RegistrySpec::crates_io()
+                        } else {
+                            RegistrySpec::new(index_url.clone(), None, CredentialSource::None)
+                        }
+                    });
                 Some(SourceInput::Registry(RegistrySource {
                     registry,
                     name: self.package.name.clone(),
@@ -232,9 +254,9 @@ impl AnalyzerOutput {
         // Placeholder nodes for edge targets are already explicit nodes.
         self.nodes = graph.nodes().map(|(_, node)| node.clone()).collect();
         for node in &mut self.nodes {
+            node.targets.sort_by_cached_key(target_key);
             node.targets
-                .sort_by_cached_key(|target| (target.name.clone(), format!("{:?}", target.kind)));
-            node.targets.dedup();
+                .dedup_by(|left, right| target_identity(left) == target_identity(right));
         }
         self.plan.sort();
         self.plan.dedup();
@@ -328,4 +350,15 @@ fn edge_key(edge: &Edge) -> EdgeKey {
             .map(|req| req.requirement_text()),
         edge.predicate.canonical_text(),
     )
+}
+
+fn target_identity(target: &Target) -> (String, String) {
+    (
+        target.name.clone(),
+        serde_json::to_string(&target.kind).unwrap_or_default(),
+    )
+}
+
+fn target_key(target: &Target) -> ((String, String), Option<PathBuf>) {
+    (target_identity(target), target.path.clone())
 }

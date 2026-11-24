@@ -214,7 +214,7 @@ jobs:
       - name: Run required sandbox integration tests
         env:
           ROB_REQUIRE_BWRAP: "1"
-        run: cargo test --locked -p robigus --test sandbox
+        run: cargo test --locked -p robigus --test sandbox --test cargo_analyzer
 
   # Umbrella job for branch protection: point required status checks at this
   # single job instead of enumerating every job name.

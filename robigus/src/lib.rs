@@ -13,6 +13,7 @@
 // undocumented public item fails the build.
 #![warn(missing_docs)]
 
+pub mod analyzers;
 mod clock;
 pub mod credentials;
 pub mod detect;
@@ -30,6 +31,11 @@ mod sandbox_seccomp;
 pub mod solver;
 pub mod store;
 
+pub use analyzers::{
+    AnalysisContext, AnalyzerDiagnostic, AnalyzerLimits, AnalyzerOutput, BuildScriptFinding,
+    DependencyFetchPolicy, ExpansionTask, NetworkMode, ResolvedDependencySource,
+    acquire_dependency, acquire_dependency_with_policy, scan_build_script,
+};
 pub use credentials::CredentialSource;
 pub use detect::{
     CargoAnalyzer, Confidence, CppAnalyzer, DetectionDiagnostic, DetectionLimits, DetectionReport,
@@ -37,8 +43,8 @@ pub use detect::{
     TestSystem, analyzers, detect,
 };
 pub use error::{
-    ClockError, DetectError, DpkgError, FetchError, InvalidHost, PredicateError, RobigusError,
-    SandboxAttempt, SandboxUnavailable, StoreError,
+    AnalyzerError, ClockError, DetectError, DpkgError, FetchError, InvalidHost, PredicateError,
+    RobigusError, SandboxAttempt, SandboxUnavailable, StoreError,
 };
 pub use feature::{FeatureExpr, FeatureExprError};
 pub use fetch::{

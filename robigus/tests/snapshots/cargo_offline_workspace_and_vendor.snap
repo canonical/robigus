@@ -1,0 +1,287 @@
+---
+source: robigus/tests/cargo_analyzer.rs
+expression: "snapshot_value(&output, &src)"
+---
+{
+  "diagnostics": [],
+  "edges": [
+    {
+      "confidence": 65,
+      "evidence": [
+        {
+          "confidence": 65,
+          "detail": "offline manifest-only declaration (unresolved)",
+          "location": {
+            "end_line": 8,
+            "path": "crates/alpha/Cargo.toml",
+            "start_line": 8
+          },
+          "method": "manifest"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "alpha",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "ea4b2e4998d23323117b0678080468e7746a7b7310785ba158e5948daaeccff5"
+        },
+        "version": {
+          "SemVer": "1.4.0"
+        }
+      },
+      "kinds": [
+        "normal"
+      ],
+      "predicate": {
+        "Atom": "True"
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "log",
+        "version_req": {
+          "SemVer": "^0.4"
+        }
+      },
+      "to": null
+    },
+    {
+      "confidence": 65,
+      "evidence": [
+        {
+          "confidence": 65,
+          "detail": "offline manifest-only declaration (unresolved)",
+          "location": {
+            "end_line": 7,
+            "path": "crates/alpha/Cargo.toml",
+            "start_line": 7
+          },
+          "method": "manifest"
+        }
+      ],
+      "from": {
+        "ecosystem": "rust",
+        "name": "alpha",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "ea4b2e4998d23323117b0678080468e7746a7b7310785ba158e5948daaeccff5"
+        },
+        "version": {
+          "SemVer": "1.4.0"
+        }
+      },
+      "kinds": [
+        "normal"
+      ],
+      "predicate": {
+        "Atom": "True"
+      },
+      "requirement": {
+        "kind": "crate",
+        "name": "vendored-helper",
+        "version_req": {
+          "SemVer": "^0.1.0"
+        }
+      },
+      "to": null
+    }
+  ],
+  "expansions": [],
+  "network_mode": "offline",
+  "nodes": [
+    {
+      "active_features": [],
+      "conflicts": [],
+      "id": {
+        "ecosystem": "rust",
+        "name": "alpha",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "ea4b2e4998d23323117b0678080468e7746a7b7310785ba158e5948daaeccff5"
+        },
+        "version": {
+          "SemVer": "1.4.0"
+        }
+      },
+      "path": "crates/alpha",
+      "provides": [],
+      "status": "Not_Started",
+      "targets": [
+        {
+          "kind": "Binary",
+          "name": "alpha",
+          "path": "crates/alpha/src/main.rs"
+        }
+      ]
+    },
+    {
+      "active_features": [],
+      "conflicts": [],
+      "id": {
+        "ecosystem": "rust",
+        "name": "vendored-helper",
+        "source_id": {
+          "kind": {
+            "Path": {
+              "path": "<TMP>"
+            }
+          },
+          "precise": "ea4b2e4998d23323117b0678080468e7746a7b7310785ba158e5948daaeccff5"
+        },
+        "version": {
+          "SemVer": "0.1.0"
+        }
+      },
+      "path": "vendor/vendored-helper",
+      "provides": [],
+      "status": "Not_Started",
+      "targets": [
+        {
+          "kind": {
+            "RustLib": {
+              "proc_macro": false
+            }
+          },
+          "name": "vendored_helper",
+          "path": "vendor/vendored-helper/src/lib.rs"
+        }
+      ]
+    }
+  ],
+  "plan": [
+    {
+      "analyzer": "cargo",
+      "attempts": 1,
+      "build_system": null,
+      "detail": null,
+      "error": null,
+      "status": "Complete",
+      "strategy": "manifest",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "alpha",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "ea4b2e4998d23323117b0678080468e7746a7b7310785ba158e5948daaeccff5"
+          },
+          "version": {
+            "SemVer": "1.4.0"
+          }
+        }
+      }
+    },
+    {
+      "analyzer": "cargo",
+      "attempts": 0,
+      "build_system": null,
+      "detail": "offline mode (--offline): cargo metadata skipped",
+      "error": null,
+      "status": "Skipped",
+      "strategy": "tool_introspection",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "alpha",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "ea4b2e4998d23323117b0678080468e7746a7b7310785ba158e5948daaeccff5"
+          },
+          "version": {
+            "SemVer": "1.4.0"
+          }
+        }
+      }
+    },
+    {
+      "analyzer": "cargo",
+      "attempts": 1,
+      "build_system": null,
+      "detail": null,
+      "error": null,
+      "status": "Complete",
+      "strategy": "manifest",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "vendored-helper",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "ea4b2e4998d23323117b0678080468e7746a7b7310785ba158e5948daaeccff5"
+          },
+          "version": {
+            "SemVer": "0.1.0"
+          }
+        }
+      }
+    },
+    {
+      "analyzer": "cargo",
+      "attempts": 0,
+      "build_system": null,
+      "detail": "offline mode (--offline): cargo metadata skipped",
+      "error": null,
+      "status": "Skipped",
+      "strategy": "tool_introspection",
+      "subject": {
+        "package": {
+          "ecosystem": "rust",
+          "name": "vendored-helper",
+          "source_id": {
+            "kind": {
+              "Path": {
+                "path": "<TMP>"
+              }
+            },
+            "precise": "ea4b2e4998d23323117b0678080468e7746a7b7310785ba158e5948daaeccff5"
+          },
+          "version": {
+            "SemVer": "0.1.0"
+          }
+        }
+      }
+    }
+  ],
+  "roots": [
+    {
+      "ecosystem": "rust",
+      "name": "alpha",
+      "source_id": {
+        "kind": {
+          "Path": {
+            "path": "<TMP>"
+          }
+        },
+        "precise": "ea4b2e4998d23323117b0678080468e7746a7b7310785ba158e5948daaeccff5"
+      },
+      "version": {
+        "SemVer": "1.4.0"
+      }
+    }
+  ],
+  "toolchain": {}
+}
